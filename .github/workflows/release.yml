@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: linux
+            arch: x86_64
+          - target: aarch64-unknown-linux-musl
+            os: linux
+            arch: aarch64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        run: |
+          cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build release binary
+        run: |
+          cross build --release --target ${{ matrix.target }}
+          # Note: Dev mode is NOT included (requires --features dev-mode)
+
+      - name: Package binary
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar -czf connlog-agent-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz connlog-agent
+          sha256sum connlog-agent-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz > connlog-agent-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz.sha256
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: connlog-agent-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            target/${{ matrix.target }}/release/connlog-agent-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
+            target/${{ matrix.target }}/release/connlog-agent-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz.sha256
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create ${{ github.ref_name }} \
+            --title "ConnLog Agent ${{ github.ref_name }}" \
+            --notes "Release ${{ github.ref_name }}" \
+            artifacts/**/*.tar.gz \
+            artifacts/**/*.sha256
