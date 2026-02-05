@@ -9,8 +9,8 @@ pub struct Config {
     #[arg(short, long, env = "CONNLOG_TOKEN")]
     pub token: Option<String>,
 
-    /// Install agent as systemd service
-    #[arg(long)]
+    /// Install agent as systemd service and start it
+    #[arg(short, long)]
     pub install: bool,
 
     #[cfg(debug_assertions)]

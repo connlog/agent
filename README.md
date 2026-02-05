@@ -4,6 +4,7 @@ Lightweight system monitoring agent that collects metrics and sends heartbeats t
 
 ## Features
 
+- **One-command install** - Install and run with a single command
 - **Token-only setup** - Just provide a token, everything else is auto-detected
 - **Automatic system detection** - Hostname, OS, architecture detected automatically
 - **Comprehensive metrics** - CPU, memory, disk, and load average monitoring
@@ -13,37 +14,40 @@ Lightweight system monitoring agent that collects metrics and sends heartbeats t
 
 ## Quick Start
 
-### Production Installation
+### One-Command Install (Production)
 
 ```bash
-curl -fsSL https://connlog.com/install.sh | sh
+curl -fsSL https://connlog.com/install.sh | sudo sh -s -- --install --token agent_xxx
 ```
 
-This will:
-- Detect your OS and architecture
-- Download the latest release
-- Verify checksum
-- Install to `/usr/local/bin`
+This single command will:
+1. Detect your OS and architecture
+2. Download the latest release
+3. Verify checksum
+4. Install to `/usr/local/bin`
+5. Create system user `connlog-agent`
+6. Store config in `/etc/connlog/agent.conf` (600 permissions)
+7. Install and start systemd service
 
-### Running the Agent
+**That's it!** Your agent is now running and sending data to ConnLog.
 
-**Basic usage (manual):**
+### Alternative: Two-Step Install
+
+If you prefer to install the binary first:
+
+```bash
+# Step 1: Install binary
+curl -fsSL https://connlog.com/install.sh | sh
+
+# Step 2: Install as service
+sudo connlog-agent --install --token agent_xxx
+```
+
+### Running Manually (No systemd)
 
 ```bash
 connlog-agent --token agent_xxx
 ```
-
-**Install as systemd service:**
-
-```bash
-sudo connlog-agent install --token agent_xxx
-```
-
-This will:
-- Create system user `connlog-agent`
-- Store config in `/etc/connlog/agent.conf` (600 permissions)
-- Install systemd service
-- Enable and start the service
 
 ## Development
 
