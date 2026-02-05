@@ -24,6 +24,7 @@ pub struct Metrics {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct HeartbeatResponse {
     pub ok: bool,
     pub server_time: String,
@@ -32,6 +33,7 @@ pub struct HeartbeatResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct UpdateInfo {
     pub available: bool,
     pub latest_version: String,

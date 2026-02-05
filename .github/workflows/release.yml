@@ -38,7 +38,7 @@ jobs:
       - name: Build release binary
         run: |
           cross build --release --target ${{ matrix.target }}
-          # Note: Dev mode is NOT included (requires --features dev-mode)
+          # Note: Release builds connect only to https://connlog.com (no --endpoint flag)
 
       - name: Package binary
         run: |

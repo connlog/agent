@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use log::{error, info};
 use std::thread;
@@ -9,79 +9,56 @@ mod heartbeat;
 mod http;
 mod metrics;
 mod install;
-#[cfg(feature = "dev-mode")]
-mod dev;
 
-use config::{Commands, Config};
+use config::Config;
 use heartbeat::HeartbeatPayload;
 use http::ApiClient;
 use metrics::SystemMetrics;
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: u32 = 1;
+const DEFAULT_ENDPOINT: &str = "https://connlog.com";
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let config = Config::parse();
 
-    // Handle subcommands
-    match config.command {
-        Some(Commands::Install { token, platform_url }) => {
-            return install::install(&token, &platform_url);
-        }
-        Some(Commands::Uninstall) => {
-            return install::uninstall();
-        }
-        Some(Commands::Status) => {
-            return install::status();
-        }
-        #[cfg(feature = "dev-mode")]
-        Some(Commands::Dev {
-            token,
-            endpoint,
-            interval,
-            fake_metrics,
-            simulate_offline,
-            simulate_high_cpu,
-            simulate_heartbeat_drop,
-        }) => {
-            let dev_config = dev::DevConfig {
-                token,
-                endpoint,
-                interval,
-                fake_metrics,
-                simulate_offline,
-                simulate_high_cpu,
-                simulate_heartbeat_drop,
-            };
-            return dev::run(dev_config);
-        }
-        None => {
-            // Run mode - require token
-            if config.token.is_none() {
-                error!("Token is required. Use --token or set CONNLOG_TOKEN environment variable.");
-                error!("Example: connlog-agent --token agent_xxx");
-                std::process::exit(1);
-            }
-
-            let token = config.token.unwrap();
-            return run_agent(token, config.platform_url);
-        }
+    // Handle installation
+    if config.install {
+        let token = config.token.context("Token required for installation")?;
+        return install::install(&token, DEFAULT_ENDPOINT);
     }
+
+    // Run mode - require token
+    let token = config.token.context("Token is required. Use --token or set CONNLOG_TOKEN environment variable.")?;
+
+    // Determine endpoint
+    #[cfg(debug_assertions)]
+    let endpoint = config.endpoint.unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
+
+    #[cfg(not(debug_assertions))]
+    let endpoint = DEFAULT_ENDPOINT.to_string();
+
+    run_agent(token, endpoint)
 }
 
-fn run_agent(token: String, platform_url: String) -> Result<()> {
+fn run_agent(token: String, endpoint: String) -> Result<()> {
     info!("ConnLog Agent v{} starting", AGENT_VERSION);
-    info!("Platform URL: {}", platform_url);
 
-    // Never log the token - security critical
+    #[cfg(debug_assertions)]
+    info!("Endpoint: {} (debug build)", endpoint);
+
+    #[cfg(not(debug_assertions))]
+    info!("Endpoint: {}", endpoint);
+
+    // Validate token format
     if !token.starts_with("agent_") {
         error!("Invalid token format - must start with 'agent_'");
         std::process::exit(1);
     }
 
-    let client = ApiClient::new(platform_url, token);
+    let client = ApiClient::new(endpoint, token);
     let mut first_heartbeat = true;
 
     // Main loop
