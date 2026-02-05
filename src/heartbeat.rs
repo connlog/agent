@@ -46,15 +46,60 @@ pub struct UpdateInfo {
     pub download_url: Option<String>,
 }
 
+/// Server-authoritative agent configuration.
+/// All values are clamped by the server based on workspace plan.
+/// The agent MUST obey these values.
 #[derive(Debug, Deserialize, Clone)]
 pub struct AgentConfig {
+    /// Monotonic config version for change detection
+    #[serde(rename = "configVersion")]
     pub version: u32,
-    #[serde(rename = "heartbeatIntervalSecs")]
+
+    /// Server-enforced heartbeat interval (seconds)
+    #[serde(rename = "heartbeatIntervalSeconds")]
     pub heartbeat_interval_secs: u64,
-    #[serde(rename = "metricsEnabled")]
-    pub metrics_enabled: bool,
+
+    /// Number of missed heartbeats before agent is marked offline
+    #[serde(rename = "missedThreshold")]
+    pub missed_threshold: u32,
+
+    /// Which metrics to collect
+    pub metrics: MetricsConfig,
+
+    /// Maximum payload size for heartbeats (KB)
     #[serde(rename = "maxPayloadSizeKb")]
     pub max_payload_size_kb: u64,
-    #[serde(rename = "devModeAllowed")]
-    pub dev_mode_allowed: bool,
+}
+
+/// Configuration for which metrics to collect
+#[derive(Debug, Deserialize, Clone)]
+pub struct MetricsConfig {
+    pub cpu: bool,
+    pub memory: bool,
+    pub disk: bool,
+    pub load: bool,
+}
+
+impl AgentConfig {
+    /// Create safe fallback config when server is unreachable.
+    /// These are conservative defaults that won't violate any plan.
+    pub fn safe_fallback() -> Self {
+        Self {
+            version: 0,
+            heartbeat_interval_secs: 60, // Conservative default
+            missed_threshold: 3,
+            metrics: MetricsConfig {
+                cpu: true,
+                memory: true,
+                disk: true,
+                load: true,
+            },
+            max_payload_size_kb: 32,
+        }
+    }
+
+    /// Check if any metrics collection is enabled
+    pub fn any_metrics_enabled(&self) -> bool {
+        self.metrics.cpu || self.metrics.memory || self.metrics.disk || self.metrics.load
+    }
 }

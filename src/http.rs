@@ -134,9 +134,13 @@ impl ApiClient {
             anyhow::bail!("Config fetch failed with status {}: {}", status, error_text);
         }
 
-        let config: AgentConfig = response
-            .json()
-            .context("Failed to parse config response")?;
+        // Get the response text first for better error reporting
+        let response_text = response
+            .text()
+            .context("Failed to read config response body")?;
+
+        let config: AgentConfig = serde_json::from_str(&response_text)
+            .with_context(|| format!("Failed to parse config response: {}", response_text))?;
 
         Ok(config)
     }

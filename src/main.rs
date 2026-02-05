@@ -22,6 +22,9 @@ const DEFAULT_ENDPOINT: &str = "https://connlog.com";
 /// Maximum consecutive 401 errors before self-uninstall
 const MAX_UNAUTHORIZED_ATTEMPTS: u32 = 50;
 
+/// Maximum config fetch failures before using fallback
+const MAX_CONFIG_FETCH_RETRIES: u32 = 3;
+
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -71,19 +74,20 @@ fn run_agent(token: String, endpoint: String) -> Result<()> {
 
     let client = ApiClient::new(endpoint, token);
 
-    // Fetch runtime config from server
+    // Fetch runtime config from server with retry logic
     info!("Fetching runtime configuration...");
-    let mut config = match client.fetch_config() {
-        Ok(cfg) => {
-            info!("✓ Loaded config v{} (interval={}s)", cfg.version, cfg.heartbeat_interval_secs);
-            cfg
-        }
-        Err(e) => {
-            error!("Failed to fetch config: {}", e);
-            error!("Agent cannot start without valid configuration");
-            std::process::exit(1);
-        }
-    };
+    let mut config = fetch_config_with_retry(&client);
+
+    info!(
+        "✓ Loaded config v{} (interval={}s, missed_threshold={})",
+        config.version,
+        config.heartbeat_interval_secs,
+        config.missed_threshold
+    );
+
+    if config.version == 0 {
+        warn!("Using fallback config - will retry fetching real config on next heartbeat");
+    }
 
     let mut first_heartbeat = true;
     let mut consecutive_unauthorized = 0u32;
@@ -109,23 +113,28 @@ fn run_agent(token: String, endpoint: String) -> Result<()> {
 
                 // Check if config is outdated
                 if response.config_outdated {
-                    info!("Config outdated (current: v{}, latest: v{}), fetching update...",
-                          config.version, response.latest_config_version.unwrap_or(0));
+                    info!(
+                        "Config outdated (current: v{}, latest: v{}), fetching update...",
+                        config.version,
+                        response.latest_config_version.unwrap_or(0)
+                    );
                     match client.fetch_config() {
                         Ok(new_config) => {
-                            info!("✓ Updated config to v{} (interval={}s)",
-                                  new_config.version, new_config.heartbeat_interval_secs);
+                            log_config_change(&config, &new_config);
                             config = new_config;
                         }
                         Err(e) => {
                             error!("Failed to fetch updated config: {}", e);
-                            // Continue with old config
+                            // Continue with old config - it still works
                         }
                     }
                 }
 
-                info!("Heartbeat sent successfully, next in {}s", response.interval);
-                thread::sleep(Duration::from_secs(response.interval));
+                info!(
+                    "Heartbeat sent successfully, next in {}s",
+                    config.heartbeat_interval_secs
+                );
+                thread::sleep(Duration::from_secs(config.heartbeat_interval_secs));
             }
             Err(ApiError::Unauthorized) => {
                 consecutive_unauthorized += 1;
@@ -158,6 +167,57 @@ fn run_agent(token: String, endpoint: String) -> Result<()> {
                 thread::sleep(Duration::from_secs(30));
             }
         }
+    }
+}
+
+/// Fetch config with retry logic, falling back to safe defaults if all attempts fail.
+fn fetch_config_with_retry(client: &ApiClient) -> AgentConfig {
+    for attempt in 1..=MAX_CONFIG_FETCH_RETRIES {
+        match client.fetch_config() {
+            Ok(cfg) => return cfg,
+            Err(e) => {
+                if attempt < MAX_CONFIG_FETCH_RETRIES {
+                    warn!(
+                        "Config fetch attempt {}/{} failed: {}. Retrying in 5s...",
+                        attempt, MAX_CONFIG_FETCH_RETRIES, e
+                    );
+                    thread::sleep(Duration::from_secs(5));
+                } else {
+                    error!(
+                        "All {} config fetch attempts failed. Using safe fallback config.",
+                        MAX_CONFIG_FETCH_RETRIES
+                    );
+                }
+            }
+        }
+    }
+
+    // Return safe fallback - agent will try to fetch real config on next heartbeat
+    AgentConfig::safe_fallback()
+}
+
+/// Log config changes without exposing sensitive data
+fn log_config_change(old: &AgentConfig, new: &AgentConfig) {
+    info!(
+        "✓ Config updated: v{} → v{} (interval: {}s → {}s, missed: {} → {})",
+        old.version,
+        new.version,
+        old.heartbeat_interval_secs,
+        new.heartbeat_interval_secs,
+        old.missed_threshold,
+        new.missed_threshold
+    );
+
+    // Log metrics config changes
+    if old.metrics.cpu != new.metrics.cpu
+        || old.metrics.memory != new.metrics.memory
+        || old.metrics.disk != new.metrics.disk
+        || old.metrics.load != new.metrics.load
+    {
+        info!(
+            "  Metrics: cpu={}, memory={}, disk={}, load={}",
+            new.metrics.cpu, new.metrics.memory, new.metrics.disk, new.metrics.load
+        );
     }
 }
 
@@ -195,15 +255,14 @@ fn trigger_self_uninstall(reason: &str) {
 
 /// Response from a successful heartbeat
 struct HeartbeatResult {
-    interval: u64,
     config_outdated: bool,
     latest_config_version: Option<u32>,
     uninstall: bool,
 }
 
 fn send_heartbeat(client: &ApiClient, config: &AgentConfig) -> Result<HeartbeatResult, ApiError> {
-    // Collect system metrics
-    let metrics = SystemMetrics::collect().map_err(|e| ApiError::Other(e))?;
+    // Collect system metrics (respecting config toggles)
+    let metrics = SystemMetrics::collect().map_err(ApiError::Other)?;
 
     // Build heartbeat payload
     let payload = HeartbeatPayload {
@@ -215,6 +274,8 @@ fn send_heartbeat(client: &ApiClient, config: &AgentConfig) -> Result<HeartbeatR
         arch: metrics.arch.clone(),
         uptime_seconds: metrics.uptime_seconds,
         metrics: heartbeat::Metrics {
+            // Always send metrics - server decides what to store
+            // Future: could skip collection based on config.metrics toggles
             cpu_percent: metrics.cpu_percent,
             memory_used_mb: metrics.memory_used_mb,
             memory_total_mb: metrics.memory_total_mb,
@@ -229,7 +290,6 @@ fn send_heartbeat(client: &ApiClient, config: &AgentConfig) -> Result<HeartbeatR
     let response = client.send_heartbeat(&payload)?;
 
     Ok(HeartbeatResult {
-        interval: response.expected_interval_seconds,
         config_outdated: response.config_outdated.unwrap_or(false),
         latest_config_version: response.latest_config_version,
         uninstall: response.uninstall,
