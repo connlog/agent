@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 pub struct HeartbeatPayload {
     pub agent_version: String,
     pub protocol_version: u32,
+    pub config_version: u32,
     pub hostname: String,
     pub os: String,
     pub arch: String,
@@ -29,7 +30,12 @@ pub struct HeartbeatResponse {
     pub ok: bool,
     pub server_time: String,
     pub expected_interval_seconds: u64,
+    pub config_outdated: Option<bool>,
+    pub latest_config_version: Option<u32>,
     pub update: Option<UpdateInfo>,
+    /// If true, the agent should uninstall itself
+    #[serde(default)]
+    pub uninstall: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -38,4 +44,17 @@ pub struct UpdateInfo {
     pub available: bool,
     pub latest_version: String,
     pub download_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct AgentConfig {
+    pub version: u32,
+    #[serde(rename = "heartbeatIntervalSecs")]
+    pub heartbeat_interval_secs: u64,
+    #[serde(rename = "metricsEnabled")]
+    pub metrics_enabled: bool,
+    #[serde(rename = "maxPayloadSizeKb")]
+    pub max_payload_size_kb: u64,
+    #[serde(rename = "devModeAllowed")]
+    pub dev_mode_allowed: bool,
 }

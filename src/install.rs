@@ -22,13 +22,17 @@ StandardError=journal
 WantedBy=multi-user.target
 "#;
 
-pub fn install(token: &str, platform_url: &str) -> Result<()> {
+pub fn install(token: &str) -> Result<()> {
     // Check if running as root
     if !is_root() {
         anyhow::bail!("Installation requires root privileges. Please run with sudo.");
     }
 
     println!("Installing ConnLog agent as systemd service...");
+
+    // Get platform URL from environment or use default
+    let platform_url = std::env::var("CONNLOG_PLATFORM_URL")
+        .unwrap_or_else(|_| "https://connlog.com".to_string());
 
     // Create system user
     create_system_user()?;
@@ -37,7 +41,7 @@ pub fn install(token: &str, platform_url: &str) -> Result<()> {
     create_config_dir()?;
 
     // Write config file with token
-    write_config(token, platform_url)?;
+    write_config(token, &platform_url)?;
 
     // Copy binary to /usr/local/bin
     install_binary()?;
