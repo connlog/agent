@@ -2,11 +2,31 @@
 set -e
 
 # ConnLog Agent Installer
-# Usage: curl -fsSL https://connlog.com/install.sh | sh
+# Usage: curl -fsSL https://connlog.com/install.sh | sudo sh -s -- --install --token <token>
 
 REPO="connlog/connlog-agent"
 INSTALL_DIR="/usr/local/bin"
 BINARY_NAME="connlog-agent"
+
+# Parse command line arguments
+INSTALL_MODE=false
+AGENT_TOKEN=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --install)
+            INSTALL_MODE=true
+            shift
+            ;;
+        --token)
+            AGENT_TOKEN="$2"
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
 
 # Colors for output
 RED='\033[0;31m'
@@ -26,6 +46,18 @@ error() {
     echo -e "${RED}✗${NC} $1"
     exit 1
 }
+
+# Cleanup function for rollback
+cleanup() {
+    if [ $? -ne 0 ]; then
+        warn "Installation failed, cleaning up..."
+        if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then
+            rm -rf "$TMP_DIR"
+        fi
+    fi
+}
+
+trap cleanup EXIT ERR
 
 # Detect OS and architecture
 detect_platform() {
@@ -119,12 +151,44 @@ install_binary() {
     info "Installation complete!"
 }
 
-# Print next steps
+# Run agent installation
+run_agent_install() {
+    if [ -z "$AGENT_TOKEN" ]; then
+        error "Token is required for --install mode. Use: --token <your-token>"
+    fi
+
+    # Validate token format
+    if [[ ! "$AGENT_TOKEN" =~ ^agent_ ]]; then
+        error "Invalid token format. Token must start with 'agent_'"
+    fi
+
+    info "Running agent installation..."
+    
+    # Run the agent's install command
+    if ! "$INSTALL_DIR/$BINARY_NAME" install --token "$AGENT_TOKEN"; then
+        error "Agent installation failed. Check logs above for details."
+    fi
+
+    info "Agent installed and started successfully!"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    info "Installation complete!"
+    echo ""
+    echo "  • Agent is running as a systemd service"
+    echo "  • Check status: sudo systemctl status connlog-agent"
+    echo "  • View logs: sudo journalctl -u connlog-agent -f"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+}
+
+# Print next steps (manual mode)
 print_next_steps() {
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
-    info "ConnLog Agent installed successfully!"
+    info "ConnLog Agent binary installed successfully!"
     echo ""
     echo "Next steps:"
     echo ""
@@ -151,7 +215,13 @@ main() {
     get_latest_version
     download_binary
     install_binary
-    print_next_steps
+
+    # If --install flag is provided, run full installation
+    if [ "$INSTALL_MODE" = true ]; then
+        run_agent_install
+    else
+        print_next_steps
+    fi
 }
 
 main
