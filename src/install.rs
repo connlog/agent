@@ -184,17 +184,29 @@ fn write_config(token: &str, platform_url: &str) -> Result<()> {
 fn install_binary() -> Result<()> {
     let current_exe = std::env::current_exe()
         .context("Failed to get current executable path")?;
+    
+    let target_path = Path::new("/usr/local/bin/connlog-agent");
+    
+    // Check if we're already running from the target location
+    let current_canonical = fs::canonicalize(&current_exe)
+        .context("Failed to canonicalize current exe path")?;
+    let target_canonical = fs::canonicalize(target_path).ok();
+    
+    if target_canonical.as_ref() == Some(&current_canonical) {
+        println!("  Binary already installed at /usr/local/bin/connlog-agent");
+    } else {
+        // Copy binary to target location
+        fs::copy(&current_exe, target_path)
+            .context("Failed to copy binary to /usr/local/bin")?;
 
-    fs::copy(&current_exe, "/usr/local/bin/connlog-agent")
-        .context("Failed to copy binary to /usr/local/bin")?;
+        // Make executable
+        let mut perms = fs::metadata(target_path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(target_path, perms)?;
 
-    // Make executable
-    let path = Path::new("/usr/local/bin/connlog-agent");
-    let mut perms = fs::metadata(path)?.permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(path, perms)?;
-
-    println!("  Installed binary to /usr/local/bin/connlog-agent");
+        println!("  Installed binary to /usr/local/bin/connlog-agent");
+    }
+    
     Ok(())
 }
 
