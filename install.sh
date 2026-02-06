@@ -163,7 +163,7 @@ run_agent_install() {
     fi
 
     info "Running agent installation..."
-    
+
     # Run the agent's install command
     if ! "$INSTALL_DIR/$BINARY_NAME" install --token "$AGENT_TOKEN"; then
         error "Agent installation failed. Check logs above for details."
