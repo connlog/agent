@@ -10,13 +10,25 @@ After=network.target
 
 [Service]
 Type=simple
-User=connlog-agent
+User=root
 EnvironmentFile=/etc/connlog/agent.conf
 ExecStart=/usr/local/bin/connlog-agent
-Restart=always
+Restart=on-failure
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
+
+# When the agent exits with code 42, perform self-uninstall cleanup
+ExecStopPost=/bin/bash -c 'if [ -f /etc/connlog/.uninstall_requested ]; then \
+    echo "ConnLog: Uninstall marker detected, performing cleanup..."; \
+    rm -f /etc/connlog/.uninstall_requested; \
+    systemctl disable connlog-agent 2>/dev/null || true; \
+    rm -f /etc/systemd/system/connlog-agent.service; \
+    systemctl daemon-reload 2>/dev/null || true; \
+    rm -rf /etc/connlog; \
+    rm -f /usr/local/bin/connlog-agent; \
+    echo "ConnLog: Agent fully uninstalled."; \
+fi'
 
 [Install]
 WantedBy=multi-user.target
@@ -71,32 +83,39 @@ pub fn uninstall() -> Result<()> {
 
     println!("Uninstalling ConnLog agent...");
 
-    // Stop and disable service
+    // 1. Stop the service FIRST (prevents resurrection)
     let _ = Command::new("systemctl")
         .args(["stop", "connlog-agent"])
         .status();
+    println!("  Stopped service");
 
+    // 2. Disable the service (prevents boot start)
     let _ = Command::new("systemctl")
         .args(["disable", "connlog-agent"])
         .status();
+    println!("  Disabled service");
 
-    // Remove systemd service file
+    // 3. Remove systemd service file
     let _ = fs::remove_file("/etc/systemd/system/connlog-agent.service");
+    println!("  Removed service file");
 
-    // Reload systemd
+    // 4. Reload systemd (forgets the unit)
     let _ = Command::new("systemctl")
         .arg("daemon-reload")
         .status();
+    println!("  Reloaded systemd");
 
-    // Remove config
+    // 5. Remove config (includes token — security critical)
     let _ = fs::remove_dir_all("/etc/connlog");
+    println!("  Removed /etc/connlog");
 
-    // Remove binary
+    // 6. Remove binary LAST (we're running from it)
     let _ = fs::remove_file("/usr/local/bin/connlog-agent");
+    println!("  Removed binary");
 
     // Note: We don't remove the system user for safety
 
-    println!("✓ ConnLog agent uninstalled successfully!");
+    println!("\n✓ ConnLog agent uninstalled successfully!");
     println!("\nNote: System user 'connlog-agent' was preserved for safety.");
     println!("To remove: sudo userdel connlog-agent");
 
@@ -184,14 +203,14 @@ fn write_config(token: &str, platform_url: &str) -> Result<()> {
 fn install_binary() -> Result<()> {
     let current_exe = std::env::current_exe()
         .context("Failed to get current executable path")?;
-    
+
     let target_path = Path::new("/usr/local/bin/connlog-agent");
-    
+
     // Check if we're already running from the target location
     let current_canonical = fs::canonicalize(&current_exe)
         .context("Failed to canonicalize current exe path")?;
     let target_canonical = fs::canonicalize(target_path).ok();
-    
+
     if target_canonical.as_ref() == Some(&current_canonical) {
         println!("  Binary already installed at /usr/local/bin/connlog-agent");
     } else {
@@ -206,7 +225,7 @@ fn install_binary() -> Result<()> {
 
         println!("  Installed binary to /usr/local/bin/connlog-agent");
     }
-    
+
     Ok(())
 }
 

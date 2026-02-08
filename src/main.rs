@@ -221,35 +221,47 @@ fn log_config_change(old: &AgentConfig, new: &AgentConfig) {
     }
 }
 
-/// Trigger self-uninstallation of the agent
+/// Trigger self-uninstallation of the agent.
+///
+/// This writes a marker file and exits with a clean code.
+/// The systemd ExecStopPost script detects the marker and performs full cleanup:
+///   1. Disables the service
+///   2. Removes the service file
+///   3. Removes config directory
+///   4. Removes the binary
+///
+/// If NOT running under systemd, falls back to direct uninstall.
 fn trigger_self_uninstall(reason: &str) {
-    warn!("Self-uninstalling: {}", reason);
+    error!("UNINSTALL: {}", reason);
 
     // Check if we're running as a systemd service
     let is_systemd = std::env::var("INVOCATION_ID").is_ok();
 
     if is_systemd {
-        info!("Running as systemd service - attempting graceful uninstall");
+        info!("UNINSTALL: Running as systemd service — writing uninstall marker");
 
-        // Spawn uninstall process in background so we can exit cleanly
-        // The uninstall will stop the service which includes this process
-        let _ = std::process::Command::new("sh")
-            .args([
-                "-c",
-                "sleep 2 && sudo /usr/local/bin/connlog-agent --uninstall 2>/dev/null || \
-                 (sudo systemctl stop connlog-agent && sudo systemctl disable connlog-agent && \
-                  sudo rm -f /etc/systemd/system/connlog-agent.service && \
-                  sudo systemctl daemon-reload && \
-                  sudo rm -rf /etc/connlog && \
-                  sudo rm -f /usr/local/bin/connlog-agent)"
-            ])
-            .spawn();
-
-        info!("Uninstall scheduled. Agent shutting down.");
+        // Write uninstall marker file — ExecStopPost will detect this
+        match std::fs::write("/etc/connlog/.uninstall_requested", reason) {
+            Ok(_) => {
+                info!("UNINSTALL: Marker written to /etc/connlog/.uninstall_requested");
+                info!("UNINSTALL: Exiting process. systemd ExecStopPost will complete cleanup.");
+            }
+            Err(e) => {
+                error!("UNINSTALL: Failed to write marker file: {}. Attempting direct uninstall.", e);
+                // Fallback: try direct uninstall (may fail without privileges)
+                if let Err(e) = install::uninstall() {
+                    error!("UNINSTALL: Direct uninstall also failed: {}", e);
+                }
+            }
+        }
     } else {
-        info!("Not running as systemd service - just exiting");
+        info!("UNINSTALL: Not running as systemd service — performing direct uninstall");
+        if let Err(e) = install::uninstall() {
+            error!("UNINSTALL: Direct uninstall failed: {}", e);
+        }
     }
 
+    // Exit cleanly — Restart=on-failure means systemd will NOT restart us
     std::process::exit(0);
 }
 
