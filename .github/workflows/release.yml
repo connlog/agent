@@ -70,12 +70,22 @@ jobs:
         with:
           path: artifacts
 
-      - name: Create release
+      - name: Create or update release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create ${{ github.ref_name }} \
-            --title "ConnLog Agent ${{ github.ref_name }}" \
-            --notes "Release ${{ github.ref_name }}" \
-            artifacts/**/*.tar.gz \
-            artifacts/**/*.sha256
+          # Create release if it doesn't exist, otherwise just upload assets
+          if gh release view ${{ github.ref_name }} &>/dev/null; then
+            echo "Release ${{ github.ref_name }} already exists, uploading assets..."
+            gh release upload ${{ github.ref_name }} \
+              artifacts/**/*.tar.gz \
+              artifacts/**/*.sha256 \
+              --clobber
+          else
+            gh release create ${{ github.ref_name }} \
+              --title "ConnLog Agent ${{ github.ref_name }}" \
+              --notes "Release ${{ github.ref_name }}" \
+              --latest \
+              artifacts/**/*.tar.gz \
+              artifacts/**/*.sha256
+          fi
