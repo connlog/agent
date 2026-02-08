@@ -17,6 +17,10 @@ pub struct Config {
     #[arg(short, long)]
     pub uninstall: bool,
 
+    /// Show agent service status
+    #[arg(short, long)]
+    pub status: bool,
+
     #[cfg(debug_assertions)]
     /// Custom platform endpoint (debug builds only)
     #[arg(

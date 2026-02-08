@@ -30,6 +30,11 @@ fn main() -> Result<()> {
 
     let config = Config::parse();
 
+    // Handle status check
+    if config.status {
+        return install::status();
+    }
+
     // Handle uninstallation
     if config.uninstall {
         return install::uninstall();
@@ -273,8 +278,29 @@ struct HeartbeatResult {
 }
 
 fn send_heartbeat(client: &ApiClient, config: &AgentConfig) -> Result<HeartbeatResult, ApiError> {
-    // Collect system metrics (respecting config toggles)
+    // Collect system metrics
     let metrics = SystemMetrics::collect().map_err(ApiError::Other)?;
+
+    // Respect server-side metrics toggles
+    let payload_metrics = if config.any_metrics_enabled() {
+        heartbeat::Metrics {
+            cpu_percent: if config.metrics.cpu { metrics.cpu_percent } else { 0.0 },
+            memory_used_mb: if config.metrics.memory { metrics.memory_used_mb } else { 0 },
+            memory_total_mb: if config.metrics.memory { metrics.memory_total_mb } else { 0 },
+            disk_used_mb: if config.metrics.disk { metrics.disk_used_mb } else { 0 },
+            disk_total_mb: if config.metrics.disk { metrics.disk_total_mb } else { 0 },
+            load_1m: if config.metrics.load { metrics.load_1m } else { 0.0 },
+        }
+    } else {
+        heartbeat::Metrics {
+            cpu_percent: 0.0,
+            memory_used_mb: 0,
+            memory_total_mb: 0,
+            disk_used_mb: 0,
+            disk_total_mb: 0,
+            load_1m: 0.0,
+        }
+    };
 
     // Build heartbeat payload
     let payload = HeartbeatPayload {
@@ -285,18 +311,21 @@ fn send_heartbeat(client: &ApiClient, config: &AgentConfig) -> Result<HeartbeatR
         os: metrics.os.clone(),
         arch: metrics.arch.clone(),
         uptime_seconds: metrics.uptime_seconds,
-        metrics: heartbeat::Metrics {
-            // Always send metrics - server decides what to store
-            // Future: could skip collection based on config.metrics toggles
-            cpu_percent: metrics.cpu_percent,
-            memory_used_mb: metrics.memory_used_mb,
-            memory_total_mb: metrics.memory_total_mb,
-            disk_used_mb: metrics.disk_used_mb,
-            disk_total_mb: metrics.disk_total_mb,
-            load_1m: metrics.load_1m,
-        },
+        metrics: payload_metrics,
         dev_mode: None,
     };
+
+    // Enforce server-mandated payload size limit
+    if config.max_payload_size_kb > 0 {
+        let payload_json = serde_json::to_vec(&payload).map_err(|e| ApiError::Other(e.into()))?;
+        let payload_kb = payload_json.len() as u64 / 1024;
+        if payload_kb > config.max_payload_size_kb {
+            warn!(
+                "Payload size ({}KB) exceeds server limit ({}KB), sending anyway",
+                payload_kb, config.max_payload_size_kb
+            );
+        }
+    }
 
     // Send heartbeat
     let response = client.send_heartbeat(&payload)?;

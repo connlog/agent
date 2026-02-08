@@ -25,7 +25,7 @@ pub struct Metrics {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
+#[allow(dead_code)] // Fields used for deserialization, not yet read by agent
 pub struct HeartbeatResponse {
     pub ok: bool,
     pub server_time: String,
@@ -39,7 +39,7 @@ pub struct HeartbeatResponse {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
+#[allow(dead_code)] // Fields used for deserialization, not yet read by agent
 pub struct UpdateInfo {
     pub available: bool,
     pub latest_version: String,
