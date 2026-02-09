@@ -46,6 +46,10 @@ impl ApiClient {
     pub fn new(base_url: String, token: String) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
+            // SECURITY: Disable redirects to prevent token leakage.
+            // A compromised DNS/CDN could redirect to an attacker-controlled server;
+            // reqwest would follow and forward the Authorization header.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("Failed to create HTTP client");
 

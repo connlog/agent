@@ -82,6 +82,7 @@ fn run_agent(token: String, endpoint: String) -> Result<()> {
     // Fetch runtime config from server with retry logic
     info!("Fetching runtime configuration...");
     let mut config = fetch_config_with_retry(&client);
+    config.clamp();
 
     info!(
         "✓ Loaded config v{} (interval={}s, missed_threshold={})",
@@ -96,13 +97,15 @@ fn run_agent(token: String, endpoint: String) -> Result<()> {
 
     let mut first_heartbeat = true;
     let mut consecutive_unauthorized = 0u32;
+    let mut consecutive_errors = 0u32;
 
     // Main loop
     loop {
         match send_heartbeat(&client, &config) {
             Ok(response) => {
-                // Reset unauthorized counter on success
+                // Reset error counters on success
                 consecutive_unauthorized = 0;
+                consecutive_errors = 0;
 
                 if first_heartbeat {
                     info!("✓ Successfully registered with ConnLog");
@@ -125,6 +128,8 @@ fn run_agent(token: String, endpoint: String) -> Result<()> {
                     );
                     match client.fetch_config() {
                         Ok(new_config) => {
+                            let mut new_config = new_config;
+                            new_config.clamp();
                             log_config_change(&config, &new_config);
                             config = new_config;
                         }
@@ -167,9 +172,14 @@ fn run_agent(token: String, endpoint: String) -> Result<()> {
                 return Ok(());
             }
             Err(e) => {
-                error!("Heartbeat failed: {}", e);
-                // Exponential backoff on failure
-                thread::sleep(Duration::from_secs(30));
+                consecutive_errors += 1;
+                // Exponential backoff: 30, 60, 120, 240, ... capped at 3600s
+                let backoff = std::cmp::min(
+                    30 * 2u64.pow(consecutive_errors.saturating_sub(1).min(7)),
+                    3600,
+                );
+                error!("Heartbeat failed: {} (retry in {}s)", e, backoff);
+                thread::sleep(Duration::from_secs(backoff));
             }
         }
     }
@@ -246,9 +256,9 @@ fn trigger_self_uninstall(reason: &str) {
         info!("UNINSTALL: Running as systemd service — writing uninstall marker");
 
         // Write uninstall marker file — ExecStopPost will detect this
-        match std::fs::write("/etc/connlog/.uninstall_requested", reason) {
+        match std::fs::write("/run/connlog/.uninstall_requested", reason) {
             Ok(_) => {
-                info!("UNINSTALL: Marker written to /etc/connlog/.uninstall_requested");
+                info!("UNINSTALL: Marker written to /run/connlog/.uninstall_requested");
                 info!("UNINSTALL: Exiting process. systemd ExecStopPost will complete cleanup.");
             }
             Err(e) => {

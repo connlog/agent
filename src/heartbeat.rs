@@ -98,6 +98,22 @@ impl AgentConfig {
         }
     }
 
+    /// Clamp server config values to safe client-side bounds.
+    /// Prevents resource abuse from a malicious or buggy server response.
+    pub fn clamp(&mut self) {
+        // Minimum 10s heartbeat to prevent CPU/network spin
+        // Maximum 86400s (24h) to ensure eventual check-in
+        self.heartbeat_interval_secs = self.heartbeat_interval_secs.clamp(10, 86400);
+
+        // Missed threshold: at least 1, at most 100
+        self.missed_threshold = self.missed_threshold.clamp(1, 100);
+
+        // Payload size: 1KB–1MB (0 means no limit, keep as-is)
+        if self.max_payload_size_kb > 0 {
+            self.max_payload_size_kb = self.max_payload_size_kb.clamp(1, 1024);
+        }
+    }
+
     /// Check if any metrics collection is enabled
     pub fn any_metrics_enabled(&self) -> bool {
         self.metrics.cpu || self.metrics.memory || self.metrics.disk || self.metrics.load

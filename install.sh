@@ -23,7 +23,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         *)
-            shift
+            error "Unknown argument: $1"
             ;;
     esac
 done
@@ -117,8 +117,10 @@ download_binary() {
     info "Verifying checksum..."
     if command -v sha256sum &> /dev/null; then
         sha256sum -c "${ARTIFACT_NAME}.sha256" || error "Checksum verification failed"
+    elif command -v shasum &> /dev/null; then
+        shasum -a 256 -c "${ARTIFACT_NAME}.sha256" || error "Checksum verification failed"
     else
-        warn "sha256sum not found, skipping checksum verification"
+        error "Neither sha256sum nor shasum found. Cannot verify download integrity."
     fi
 
     info "Extracting binary..."

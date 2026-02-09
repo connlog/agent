@@ -6,11 +6,13 @@ use std::process::Command;
 
 const SYSTEMD_SERVICE: &str = r#"[Unit]
 Description=ConnLog Monitoring Agent
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-User=root
+User=connlog-agent
+Group=connlog-agent
 EnvironmentFile=/etc/connlog/agent.conf
 ExecStart=/usr/local/bin/connlog-agent
 Restart=on-failure
@@ -18,10 +20,35 @@ RestartSec=10
 StandardOutput=journal
 StandardError=journal
 
-# When the agent exits with code 42, perform self-uninstall cleanup
-ExecStopPost=/bin/bash -c 'if [ -f /etc/connlog/.uninstall_requested ]; then \
+# Runtime directory for uninstall marker (/run/connlog)
+RuntimeDirectory=connlog
+RuntimeDirectoryMode=0700
+
+# ── Security hardening ──────────────────────────────────
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Self-uninstall cleanup (runs as root via + prefix)
+ExecStopPost=+/bin/bash -c 'if [ -f /run/connlog/.uninstall_requested ]; then \
     echo "ConnLog: Uninstall marker detected, performing cleanup..."; \
-    rm -f /etc/connlog/.uninstall_requested; \
     systemctl disable connlog-agent 2>/dev/null || true; \
     rm -f /etc/systemd/system/connlog-agent.service; \
     systemctl daemon-reload 2>/dev/null || true; \
@@ -177,14 +204,30 @@ fn create_config_dir() -> Result<()> {
     fs::create_dir_all("/etc/connlog")
         .context("Failed to create /etc/connlog directory")?;
 
-    println!("  Created /etc/connlog directory");
+    // Set directory permissions to 0700 (root-only, prevents other users listing contents)
+    let dir_path = Path::new("/etc/connlog");
+    let mut dir_perms = fs::metadata(dir_path)?.permissions();
+    dir_perms.set_mode(0o700);
+    fs::set_permissions(dir_path, dir_perms)?;
+
+    println!("  Created /etc/connlog directory (700 root:root)");
     Ok(())
+}
+
+/// Escape a value for systemd EnvironmentFile double-quoted context.
+/// Prevents shell injection through crafted token or URL values.
+fn escape_env_value(s: &str) -> String {
+    s.replace('\\', "\\\\")
+     .replace('"', "\\\"")
+     .replace('$', "\\$")
+     .replace('`', "\\`")
 }
 
 fn write_config(token: &str, platform_url: &str) -> Result<()> {
     let config = format!(
-        "CONNLOG_TOKEN={}\nCONNLOG_PLATFORM_URL={}\n",
-        token, platform_url
+        "CONNLOG_TOKEN=\"{}\"\nCONNLOG_PLATFORM_URL=\"{}\"\n",
+        escape_env_value(token),
+        escape_env_value(platform_url),
     );
 
     fs::write("/etc/connlog/agent.conf", config)
