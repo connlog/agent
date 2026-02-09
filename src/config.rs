@@ -21,6 +21,10 @@ pub struct Config {
     #[arg(short, long)]
     pub status: bool,
 
+    /// Print the embedded systemd service file and exit (used by self-updater)
+    #[arg(long = "emit-service", hide = true)]
+    pub emit_service: bool,
+
     #[cfg(debug_assertions)]
     /// Custom platform endpoint (debug builds only)
     #[arg(

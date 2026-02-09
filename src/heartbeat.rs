@@ -38,12 +38,17 @@ pub struct HeartbeatResponse {
     pub uninstall: bool,
 }
 
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)] // Fields used for deserialization, not yet read by agent
+#[derive(Debug, Deserialize, Clone)]
 pub struct UpdateInfo {
     pub available: bool,
     pub latest_version: String,
     pub download_url: Option<String>,
+    /// URL to the Ed25519 signature file (.sig)
+    #[serde(default)]
+    pub signature_url: Option<String>,
+    /// Expected SHA-256 hex digest of the binary
+    #[serde(default)]
+    pub sha256: Option<String>,
 }
 
 /// Server-authoritative agent configuration.

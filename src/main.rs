@@ -7,8 +7,9 @@ use std::time::Duration;
 mod config;
 mod heartbeat;
 mod http;
-mod metrics;
 mod install;
+mod metrics;
+mod update;
 
 use config::Config;
 use heartbeat::{AgentConfig, HeartbeatPayload};
@@ -29,6 +30,12 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let config = Config::parse();
+
+    // Handle --emit-service (used by ExecStopPost during self-update)
+    if config.emit_service {
+        print!("{}", install::SYSTEMD_SERVICE);
+        return Ok(());
+    }
 
     // Handle status check
     if config.status {
@@ -117,6 +124,26 @@ fn run_agent(token: String, endpoint: String) -> Result<()> {
                     warn!("Received remote uninstall command from server");
                     trigger_self_uninstall("Remote uninstall requested by workspace owner");
                     return Ok(());
+                }
+
+                // Check for available update
+                if let Some(ref update_info) = response.update {
+                    match update::try_apply_update(update_info) {
+                        Ok(true) => {
+                            info!(
+                                "Update to v{} staged successfully. Restarting for update...",
+                                update_info.latest_version
+                            );
+                            // Exit cleanly — ExecStopPost will swap the binary,
+                            // refresh the service file, and restart us.
+                            std::process::exit(0);
+                        }
+                        Ok(false) => {} // Update skipped (missing fields, no key, etc.)
+                        Err(e) => {
+                            error!("Update to v{} failed: {}. Continuing with current version.",
+                                update_info.latest_version, e);
+                        }
+                    }
                 }
 
                 // Check if config is outdated
@@ -285,6 +312,7 @@ struct HeartbeatResult {
     config_outdated: bool,
     latest_config_version: Option<u32>,
     uninstall: bool,
+    update: Option<heartbeat::UpdateInfo>,
 }
 
 fn send_heartbeat(client: &ApiClient, config: &AgentConfig) -> Result<HeartbeatResult, ApiError> {
@@ -344,5 +372,6 @@ fn send_heartbeat(client: &ApiClient, config: &AgentConfig) -> Result<HeartbeatR
         config_outdated: response.config_outdated.unwrap_or(false),
         latest_config_version: response.latest_config_version,
         uninstall: response.uninstall,
+        update: response.update,
     })
 }

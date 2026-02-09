@@ -4,7 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
-const SYSTEMD_SERVICE: &str = r#"[Unit]
+pub(crate) const SYSTEMD_SERVICE: &str = r#"[Unit]
 Description=ConnLog Monitoring Agent
 After=network-online.target
 Wants=network-online.target
@@ -46,8 +46,23 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 CapabilityBoundingSet=
 AmbientCapabilities=
 
-# Self-uninstall cleanup (runs as root via + prefix)
-ExecStopPost=+/bin/bash -c 'if [ -f /run/connlog/.uninstall_requested ]; then \
+# Post-stop hook: handles self-update and self-uninstall (runs as root via + prefix)
+ExecStopPost=+/bin/bash -c '\
+if [ -f /run/connlog/.update_requested ]; then \
+    echo "ConnLog: Update marker detected, applying update..."; \
+    cp /run/connlog/connlog-agent-new /usr/local/bin/connlog-agent; \
+    chmod 755 /usr/local/bin/connlog-agent; \
+    if /usr/local/bin/connlog-agent --emit-service > /tmp/connlog-agent.service.new 2>/dev/null; then \
+        mv /tmp/connlog-agent.service.new /etc/systemd/system/connlog-agent.service; \
+        echo "ConnLog: Service file refreshed from new binary."; \
+    else \
+        echo "ConnLog: Warning — could not refresh service file, keeping existing."; \
+    fi; \
+    systemctl daemon-reload; \
+    rm -f /run/connlog/.update_requested /run/connlog/connlog-agent-new; \
+    systemctl start connlog-agent; \
+    echo "ConnLog: Update complete."; \
+elif [ -f /run/connlog/.uninstall_requested ]; then \
     echo "ConnLog: Uninstall marker detected, performing cleanup..."; \
     systemctl disable connlog-agent 2>/dev/null || true; \
     rm -f /etc/systemd/system/connlog-agent.service; \
