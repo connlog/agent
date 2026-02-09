@@ -32,19 +32,34 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install cross-compilation tools
-        run: |
-          cargo install cross --git https://github.com/cross-rs/cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Build release binary
+        env:
+          # Compile the Ed25519 public key into the binary so agents can
+          # verify update signatures. The matching private key is only
+          # used in the sign-and-release job below.
+          CONNLOG_SIGNING_PUBLIC_KEY: ${{ secrets.CONNLOG_SIGNING_PUBLIC_KEY }}
         run: |
           cross build --release --target ${{ matrix.target }}
           # Note: Release builds connect only to https://connlog.com (no --endpoint flag)
 
       - name: Package binary
         run: |
-          cd target/${{ matrix.target }}/release
-          tar -czf connlog-agent-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz connlog-agent
-          sha256sum connlog-agent-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz > connlog-agent-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz.sha256
+          VERSION="${{ github.ref_name }}"
+          OS="${{ matrix.os }}"
+          ARCH="${{ matrix.arch }}"
+          TARGET="${{ matrix.target }}"
+
+          cd target/$TARGET/release
+
+          # Tarball + checksum for install.sh
+          TAR="connlog-agent-${VERSION}-${OS}-${ARCH}.tar.gz"
+          tar -czf "$TAR" connlog-agent
+          sha256sum "$TAR" > "${TAR}.sha256"
+
+          # Also keep the raw binary available for auto-update signing
+          cp connlog-agent "connlog-agent-${VERSION}-${OS}-${ARCH}"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -53,11 +68,20 @@ jobs:
           path: |
             target/${{ matrix.target }}/release/connlog-agent-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
             target/${{ matrix.target }}/release/connlog-agent-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz.sha256
+            target/${{ matrix.target }}/release/connlog-agent-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}
 
-  release:
-    name: Create Release
+  # ── Sign & Publish ──────────────────────────────────────────
+  # This job runs in the protected "release" environment.
+  # Configure it in GitHub → Settings → Environments → release:
+  #   ✓ Required reviewers (add yourself)
+  #   ✓ Restrict to tags matching v*
+  # This means no one can publish a release without manual approval,
+  # even if they compromise a workflow or push a tag.
+  sign-and-release:
+    name: Sign & Create Release
     needs: build
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: write
 
@@ -70,22 +94,59 @@ jobs:
         with:
           path: artifacts
 
+      - name: Install signing dependencies
+        run: pip install cryptography
+
+      - name: Sign binaries
+        env:
+          CONNLOG_SIGNING_PRIVATE_KEY: ${{ secrets.CONNLOG_SIGNING_PRIVATE_KEY }}
+        run: |
+          # Sign each raw binary (not the tarballs — the agent updates with raw binaries)
+          for bin in artifacts/*/connlog-agent-${{ github.ref_name }}-*; do
+            # Skip tarballs and checksums
+            [[ "$bin" == *.tar.gz ]] && continue
+            [[ "$bin" == *.sha256 ]] && continue
+
+            echo "Signing $bin ..."
+            python3 scripts/sign-release.py "$bin" "$CONNLOG_SIGNING_PRIVATE_KEY"
+          done
+
+          echo ""
+          echo "=== Release artifacts ==="
+          find artifacts -type f | sort
+
       - name: Create or update release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Create release if it doesn't exist, otherwise just upload assets
-          if gh release view ${{ github.ref_name }} &>/dev/null; then
-            echo "Release ${{ github.ref_name }} already exists, uploading assets..."
-            gh release upload ${{ github.ref_name }} \
+          VERSION="${{ github.ref_name }}"
+          NOTES="## ConnLog Agent ${VERSION}
+
+          ### Installation
+          \`\`\`bash
+          curl -fsSL https://connlog.com/install.sh | sudo sh -s -- --install --token <your-token>
+          \`\`\`
+
+          ### Auto-update
+          Existing agents will automatically update to this version.
+          All binaries are signed with Ed25519 and verified before installation.
+
+          ### Verification
+          SHA-256 checksums and Ed25519 signatures (.sig) are attached to every binary."
+
+          if gh release view "$VERSION" &>/dev/null; then
+            echo "Release $VERSION already exists, uploading assets..."
+            gh release upload "$VERSION" \
               artifacts/**/*.tar.gz \
               artifacts/**/*.sha256 \
+              artifacts/**/*.sig \
               --clobber
           else
-            gh release create ${{ github.ref_name }} \
-              --title "ConnLog Agent ${{ github.ref_name }}" \
-              --notes "Release ${{ github.ref_name }}" \
+            gh release create "$VERSION" \
+              --title "ConnLog Agent ${VERSION}" \
+              --notes "$NOTES" \
               --latest \
               artifacts/**/*.tar.gz \
-              artifacts/**/*.sha256
+              artifacts/**/*.sha256 \
+              artifacts/**/*.sig
           fi
