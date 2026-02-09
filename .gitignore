@@ -16,3 +16,7 @@ Cargo.lock
 Thumbs.db
 
 dist/
+
+# Signing keys (never commit these)
+signing_key.hex
+signing_key.pub
