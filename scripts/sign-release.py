@@ -46,10 +46,12 @@ def main():
     sha256_digest = hashlib.sha256(binary_data).digest()
     sha256_hex = sha256_digest.hex()
 
-    # Write checksum file
+    # Write checksum file (sha256sum-compatible format: "<hash>  <filename>")
+    import os
     checksum_path = binary_path + ".sha256"
+    binary_filename = os.path.basename(binary_path)
     with open(checksum_path, "w") as f:
-        f.write(sha256_hex + "\n")
+        f.write(f"{sha256_hex}  {binary_filename}\n")
 
     # Load private key from hex seed
     private_bytes = bytes.fromhex(private_key_hex)
