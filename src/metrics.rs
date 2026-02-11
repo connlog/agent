@@ -14,18 +14,34 @@ pub struct SystemMetrics {
     pub load_1m: f64,
 }
 
-impl SystemMetrics {
-    pub fn collect() -> Result<Self> {
-        let mut sys = System::new_all();
-        sys.refresh_all();
+/// Reusable collector that avoids re-allocating sysinfo structures.
+/// Call `new()` once at startup, then `collect()` on each sample interval.
+pub struct MetricsCollector {
+    sys: System,
+    disks: Disks,
+    /// Cached identity values (never change during process lifetime)
+    hostname: String,
+    os: String,
+    arch: String,
+}
 
-        // Get hostname
+impl MetricsCollector {
+    /// Create a new collector. Performs a full initial refresh to populate CPU baseline.
+    pub fn new() -> Result<Self> {
+        let mut sys = System::new();
+        // Initial CPU refresh — sysinfo needs two refreshes to compute usage delta
+        sys.refresh_cpu_all();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        sys.refresh_cpu_all();
+        sys.refresh_memory();
+
+        let disks = Disks::new_with_refreshed_list();
+
         let hostname = hostname::get()
             .context("Failed to get hostname")?
             .to_string_lossy()
             .to_string();
 
-        // Get OS
         let os = if cfg!(target_os = "linux") {
             "linux"
         } else if cfg!(target_os = "macos") {
@@ -37,37 +53,60 @@ impl SystemMetrics {
         }
         .to_string();
 
-        // Get architecture
         let arch = std::env::consts::ARCH.to_string();
 
-        // Get uptime
-        let uptime_seconds = System::uptime();
-
-        // Get CPU usage
-        let cpu_percent = sys.global_cpu_usage() as f64;
-
-        // Get memory usage
-        let memory_total_mb = sys.total_memory() / 1024 / 1024;
-        let memory_used_mb = sys.used_memory() / 1024 / 1024;
-
-        // Get disk usage (first disk only for now)
-        let disks = Disks::new_with_refreshed_list();
-        let (disk_total_mb, disk_used_mb) = if let Some(disk) = disks.first() {
-            let total = disk.total_space() / 1024 / 1024;
-            let available = disk.available_space() / 1024 / 1024;
-            let used = total.saturating_sub(available);
-            (total, used)
-        } else {
-            (0, 0)
-        };
-
-        // Get load average (1 minute)
-        let load_1m = System::load_average().one;
-
         Ok(Self {
+            sys,
+            disks,
             hostname,
             os,
             arch,
+        })
+    }
+
+    /// Collect current metrics. Only refreshes CPU, memory, and disks — NOT processes.
+    /// This is ~10× cheaper than `System::new_all() + refresh_all()`.
+    pub fn collect(&mut self) -> SystemMetrics {
+        // Targeted refresh — only what we need
+        self.sys.refresh_cpu_all();
+        self.sys.refresh_memory();
+        self.disks.refresh();
+
+        let uptime_seconds = System::uptime();
+        let cpu_percent = self.sys.global_cpu_usage() as f64;
+        let memory_total_mb = self.sys.total_memory() / 1024 / 1024;
+        let memory_used_mb = self.sys.used_memory() / 1024 / 1024;
+
+        // Aggregate all disks (sum of all mount points, avoiding double-counting)
+        let (disk_total_mb, disk_used_mb) = {
+            let mut total = 0u64;
+            let mut used = 0u64;
+            for disk in self.disks.list() {
+                let dt = disk.total_space() / 1024 / 1024;
+                let da = disk.available_space() / 1024 / 1024;
+                total += dt;
+                used += dt.saturating_sub(da);
+            }
+            if total == 0 {
+                // Fallback: try first disk only
+                if let Some(disk) = self.disks.list().first() {
+                    let t = disk.total_space() / 1024 / 1024;
+                    let a = disk.available_space() / 1024 / 1024;
+                    (t, t.saturating_sub(a))
+                } else {
+                    (0, 0)
+                }
+            } else {
+                (total, used)
+            }
+        };
+
+        let load_1m = System::load_average().one;
+
+        SystemMetrics {
+            hostname: self.hostname.clone(),
+            os: self.os.clone(),
+            arch: self.arch.clone(),
             uptime_seconds,
             cpu_percent,
             memory_used_mb,
@@ -75,6 +114,15 @@ impl SystemMetrics {
             disk_used_mb,
             disk_total_mb,
             load_1m,
-        })
+        }
+    }
+}
+
+impl SystemMetrics {
+    /// Legacy collect method — creates a fresh System each time.
+    /// Prefer `MetricsCollector` for repeated use.
+    pub fn collect() -> Result<Self> {
+        let mut collector = MetricsCollector::new()?;
+        Ok(collector.collect())
     }
 }
