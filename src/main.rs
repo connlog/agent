@@ -9,15 +9,17 @@ mod heartbeat;
 mod http;
 mod install;
 mod metrics;
+mod sampler;
 mod update;
+mod wire;
 
 use config::Config;
 use heartbeat::{AgentConfig, HeartbeatPayload};
 use http::{ApiClient, ApiError};
-use metrics::SystemMetrics;
+use metrics::MetricsCollector;
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-const PROTOCOL_VERSION: u32 = 1;
+const PROTOCOL_VERSION: u32 = 2;
 const DEFAULT_ENDPOINT: &str = "https://connlog.com";
 
 /// Maximum consecutive 401 errors before self-uninstall
@@ -86,6 +88,11 @@ fn run_agent(token: String, endpoint: String) -> Result<()> {
 
     let client = ApiClient::new(endpoint, token);
 
+    // Initialize reusable metrics collector (avoids re-creating sysinfo each heartbeat)
+    let mut collector = MetricsCollector::new()
+        .context("Failed to initialize metrics collector")?;
+    info!("✓ Metrics collector initialized");
+
     // Fetch runtime config from server with retry logic
     info!("Fetching runtime configuration...");
     let mut config = fetch_config_with_retry(&client);
@@ -108,7 +115,7 @@ fn run_agent(token: String, endpoint: String) -> Result<()> {
 
     // Main loop
     loop {
-        match send_heartbeat(&client, &config) {
+        match send_heartbeat(&client, &config, &mut collector) {
             Ok(response) => {
                 // Reset error counters on success
                 consecutive_unauthorized = 0;
@@ -315,9 +322,9 @@ struct HeartbeatResult {
     update: Option<heartbeat::UpdateInfo>,
 }
 
-fn send_heartbeat(client: &ApiClient, config: &AgentConfig) -> Result<HeartbeatResult, ApiError> {
-    // Collect system metrics
-    let metrics = SystemMetrics::collect().map_err(ApiError::Other)?;
+fn send_heartbeat(client: &ApiClient, config: &AgentConfig, collector: &mut MetricsCollector) -> Result<HeartbeatResult, ApiError> {
+    // Collect system metrics using reusable collector
+    let metrics = collector.collect();
 
     // Respect server-side metrics toggles
     let payload_metrics = if config.any_metrics_enabled() {
