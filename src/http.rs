@@ -5,7 +5,6 @@ use reqwest::StatusCode;
 use std::time::Duration;
 
 use crate::heartbeat::{AgentConfig, HeartbeatPayload, HeartbeatResponse};
-use crate::wire;
 
 /// Error types for API calls
 #[derive(Debug)]
