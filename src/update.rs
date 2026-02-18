@@ -83,9 +83,18 @@ pub fn try_apply_update(update: &UpdateInfo) -> Result<bool> {
         return Ok(false);
     }
 
-    // Skip if we're already running this version
+    // Skip if we're already running this version or a newer one
     let current_version = env!("CARGO_PKG_VERSION");
     if update.latest_version == current_version {
+        return Ok(false);
+    }
+
+    // Reject version downgrades (prevents rollback attacks)
+    if !is_version_upgrade(current_version, &update.latest_version) {
+        warn!(
+            "UPDATE: Rejecting downgrade from v{} to v{} — only upgrades are allowed",
+            current_version, update.latest_version
+        );
         return Ok(false);
     }
 
@@ -207,6 +216,29 @@ fn perform_verified_update(
     );
 
     Ok(())
+}
+
+// ── Version comparison (avoids adding `semver` crate) ──────────
+
+/// Returns true if `new` is a strictly higher semantic version than `current`.
+/// Expects versions in the form "MAJOR.MINOR.PATCH" (no pre-release tags).
+fn is_version_upgrade(current: &str, new: &str) -> bool {
+    let parse = |v: &str| -> Option<(u64, u64, u64)> {
+        let parts: Vec<&str> = v.split('.').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        Some((
+            parts[0].parse().ok()?,
+            parts[1].parse().ok()?,
+            parts[2].parse().ok()?,
+        ))
+    };
+
+    match (parse(current), parse(new)) {
+        (Some(cur), Some(nxt)) => nxt > cur,
+        _ => false, // Reject unparseable versions
+    }
 }
 
 // ── Hex helpers (avoids adding the `hex` crate) ────────────────

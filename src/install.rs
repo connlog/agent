@@ -52,8 +52,8 @@ if [ -f /run/connlog/.update_requested ]; then \
     echo "ConnLog: Update marker detected, applying update..."; \
     cp /run/connlog/connlog-agent-new /usr/local/bin/connlog-agent; \
     chmod 755 /usr/local/bin/connlog-agent; \
-    if /usr/local/bin/connlog-agent --emit-service > /tmp/connlog-agent.service.new 2>/dev/null; then \
-        mv /tmp/connlog-agent.service.new /etc/systemd/system/connlog-agent.service; \
+    if /usr/local/bin/connlog-agent --emit-service > /run/connlog/connlog-agent.service.new 2>/dev/null; then \
+        mv /run/connlog/connlog-agent.service.new /etc/systemd/system/connlog-agent.service; \
         echo "ConnLog: Service file refreshed from new binary."; \
     else \
         echo "ConnLog: Warning — could not refresh service file, keeping existing."; \

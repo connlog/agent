@@ -1,6 +1,7 @@
 use clap::Parser;
+use std::fmt;
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(name = "connlog-agent")]
 #[command(about = "ConnLog monitoring agent", long_about = None)]
 #[command(version)]
@@ -34,6 +35,18 @@ pub struct Config {
         help = "Platform endpoint URL (debug builds only)"
     )]
     pub endpoint: Option<String>,
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .field("install", &self.install)
+            .field("uninstall", &self.uninstall)
+            .field("status", &self.status)
+            .field("emit_service", &self.emit_service)
+            .finish()
+    }
 }
 
 impl Config {

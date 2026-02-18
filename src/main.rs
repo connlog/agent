@@ -23,7 +23,10 @@ const PROTOCOL_VERSION: u32 = 2;
 const DEFAULT_ENDPOINT: &str = "https://connlog.com";
 
 /// Maximum consecutive 401 errors before self-uninstall
-const MAX_UNAUTHORIZED_ATTEMPTS: u32 = 50;
+const MAX_UNAUTHORIZED_ATTEMPTS: u32 = 10;
+
+/// Consecutive uninstall commands required from server before acting
+const UNINSTALL_CONFIRM_THRESHOLD: u32 = 3;
 
 /// Maximum config fetch failures before using fallback
 const MAX_CONFIG_FETCH_RETRIES: u32 = 3;
@@ -112,6 +115,7 @@ fn run_agent(token: String, endpoint: String) -> Result<()> {
     let mut first_heartbeat = true;
     let mut consecutive_unauthorized = 0u32;
     let mut consecutive_errors = 0u32;
+    let mut consecutive_uninstall_commands = 0u32;
 
     // Main loop
     loop {
@@ -126,11 +130,21 @@ fn run_agent(token: String, endpoint: String) -> Result<()> {
                     first_heartbeat = false;
                 }
 
-                // Check for remote uninstall command
+                // Check for remote uninstall command (require consecutive confirmations)
                 if response.uninstall {
-                    warn!("Received remote uninstall command from server");
-                    trigger_self_uninstall("Remote uninstall requested by workspace owner");
-                    return Ok(());
+                    consecutive_uninstall_commands += 1;
+                    warn!(
+                        "Received remote uninstall command ({}/{})",
+                        consecutive_uninstall_commands, UNINSTALL_CONFIRM_THRESHOLD
+                    );
+                    if consecutive_uninstall_commands >= UNINSTALL_CONFIRM_THRESHOLD {
+                        warn!("Uninstall confirmed after {} consecutive commands", UNINSTALL_CONFIRM_THRESHOLD);
+                        trigger_self_uninstall("Remote uninstall confirmed by workspace owner");
+                        return Ok(());
+                    }
+                } else {
+                    // Reset if server stops requesting uninstall
+                    consecutive_uninstall_commands = 0;
                 }
 
                 // Check for available update
