@@ -1,0 +1,2 @@
+[build.env]
+passthrough = ["CONNLOG_SIGNING_PUBLIC_KEY"]
