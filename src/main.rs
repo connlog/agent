@@ -9,9 +9,7 @@ mod heartbeat;
 mod http;
 mod install;
 mod metrics;
-mod sampler;
 mod update;
-mod wire;
 
 use config::Config;
 use heartbeat::{AgentConfig, HeartbeatPayload};

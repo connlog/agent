@@ -118,11 +118,3 @@ impl MetricsCollector {
     }
 }
 
-impl SystemMetrics {
-    /// Legacy collect method — creates a fresh System each time.
-    /// Prefer `MetricsCollector` for repeated use.
-    pub fn collect() -> Result<Self> {
-        let mut collector = MetricsCollector::new()?;
-        Ok(collector.collect())
-    }
-}
