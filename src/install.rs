@@ -316,15 +316,28 @@ fn enable_service() -> Result<()> {
 }
 
 fn start_service() -> Result<()> {
-    let status = Command::new("systemctl")
-        .args(["start", "connlog-agent"])
+    // Check if service is already running — use restart to pick up the new binary
+    let is_active = Command::new("systemctl")
+        .args(["is-active", "--quiet", "connlog-agent"])
         .status()
-        .context("Failed to start service")?;
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    let action = if is_active { "restart" } else { "start" };
+
+    let status = Command::new("systemctl")
+        .args([action, "connlog-agent"])
+        .status()
+        .with_context(|| format!("Failed to {} service", action))?;
 
     if !status.success() {
-        anyhow::bail!("Failed to start service");
+        anyhow::bail!("Failed to {} service", action);
     }
 
-    println!("  Started service");
+    if is_active {
+        println!("  Restarted service (was already running)");
+    } else {
+        println!("  Started service");
+    }
     Ok(())
 }

@@ -40,6 +40,10 @@ jobs:
           # verify update signatures. The matching private key is only
           # used in the sign-and-release job below.
           CONNLOG_SIGNING_PUBLIC_KEY: ${{ secrets.CONNLOG_SIGNING_PUBLIC_KEY }}
+          # Belt-and-suspenders: Cross.toml has passthrough, but also
+          # explicitly forward the env var via Docker --env flag in case
+          # the Cross.toml passthrough doesn't work with this cross version.
+          CROSS_CONTAINER_OPTS: "--env CONNLOG_SIGNING_PUBLIC_KEY"
         run: |
           cross build --release --target ${{ matrix.target }}
           # Note: Release builds connect only to https://connlog.com (no --endpoint flag)
