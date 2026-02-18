@@ -22,6 +22,10 @@ pub struct Config {
     #[arg(short, long)]
     pub status: bool,
 
+    /// Check for and apply the latest update from GitHub
+    #[arg(long)]
+    pub update: bool,
+
     /// Print the embedded systemd service file and exit (used by self-updater)
     #[arg(long = "emit-service", hide = true)]
     pub emit_service: bool,
@@ -44,6 +48,7 @@ impl fmt::Debug for Config {
             .field("install", &self.install)
             .field("uninstall", &self.uninstall)
             .field("status", &self.status)
+            .field("update", &self.update)
             .field("emit_service", &self.emit_service)
             .finish()
     }

@@ -45,6 +45,11 @@ fn main() -> Result<()> {
         return install::status();
     }
 
+    // Handle manual update
+    if config.update {
+        return update::run_manual_update();
+    }
+
     // Handle uninstallation
     if config.uninstall {
         return install::uninstall();
