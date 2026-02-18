@@ -147,6 +147,15 @@ fn run_agent(token: String, endpoint: String) -> Result<()> {
 
                 // Check for available update
                 if let Some(ref update_info) = response.update {
+                    info!(
+                        "UPDATE CHECK: current=v{} latest=v{} available={} has_download={} has_sig={} has_sha256={}",
+                        AGENT_VERSION,
+                        update_info.latest_version,
+                        update_info.available,
+                        update_info.download_url.is_some(),
+                        update_info.signature_url.is_some(),
+                        update_info.sha256.is_some(),
+                    );
                     match update::try_apply_update(update_info) {
                         Ok(true) => {
                             info!(
@@ -157,12 +166,16 @@ fn run_agent(token: String, endpoint: String) -> Result<()> {
                             // refresh the service file, and restart us.
                             std::process::exit(0);
                         }
-                        Ok(false) => {} // Update skipped (missing fields, no key, etc.)
+                        Ok(false) => {
+                            info!("UPDATE SKIPPED: v{} (see preceding log for reason)", update_info.latest_version);
+                        }
                         Err(e) => {
                             error!("Update to v{} failed: {}. Continuing with current version.",
                                 update_info.latest_version, e);
                         }
                     }
+                } else {
+                    info!("UPDATE CHECK: server returned no update info");
                 }
 
                 // Check if config is outdated

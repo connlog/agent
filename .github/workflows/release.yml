@@ -136,16 +136,33 @@ jobs:
 
           if gh release view "$VERSION" &>/dev/null; then
             echo "Release $VERSION already exists, uploading assets..."
+            # Upload raw binaries (extensionless files matching the naming pattern)
+            for bin in artifacts/*/connlog-agent-${VERSION}-*; do
+              [[ "$bin" == *.tar.gz ]] && continue
+              [[ "$bin" == *.sha256 ]] && continue
+              [[ "$bin" == *.sig ]] && continue
+              echo "Uploading raw binary: $bin"
+              gh release upload "$VERSION" "$bin" --clobber
+            done
             gh release upload "$VERSION" \
               artifacts/**/*.tar.gz \
               artifacts/**/*.sha256 \
               artifacts/**/*.sig \
               --clobber
           else
+            # Collect raw binaries into a temp list
+            RAW_BINS=()
+            for bin in artifacts/*/connlog-agent-${VERSION}-*; do
+              [[ "$bin" == *.tar.gz ]] && continue
+              [[ "$bin" == *.sha256 ]] && continue
+              [[ "$bin" == *.sig ]] && continue
+              RAW_BINS+=("$bin")
+            done
             gh release create "$VERSION" \
               --title "ConnLog Agent ${VERSION}" \
               --notes "$NOTES" \
               --latest \
+              "${RAW_BINS[@]}" \
               artifacts/**/*.tar.gz \
               artifacts/**/*.sha256 \
               artifacts/**/*.sig

@@ -38,6 +38,7 @@ pub fn has_signing_key() -> bool {
 /// - `Err(..)`   — update failed (download, checksum, or signature error)
 pub fn try_apply_update(update: &UpdateInfo) -> Result<bool> {
     if !update.available {
+        info!("UPDATE SKIP: available=false");
         return Ok(false);
     }
 
@@ -76,16 +77,19 @@ pub fn try_apply_update(update: &UpdateInfo) -> Result<bool> {
 
     if !has_signing_key() {
         warn!(
-            "Update v{} available but no signing key compiled into this build — skipping. \
+            "UPDATE SKIP: No signing key compiled into this build (key_hex_len={}). \
              Rebuild with CONNLOG_SIGNING_PUBLIC_KEY=<hex> to enable auto-updates.",
-            update.latest_version
+            SIGNING_PUBLIC_KEY_HEX.len()
         );
         return Ok(false);
     }
 
+    info!("UPDATE: Signing key present (first 8 chars: {}...)", &SIGNING_PUBLIC_KEY_HEX[..8]);
+
     // Skip if we're already running this version or a newer one
     let current_version = env!("CARGO_PKG_VERSION");
     if update.latest_version == current_version {
+        info!("UPDATE SKIP: already running v{}", current_version);
         return Ok(false);
     }
 
