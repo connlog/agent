@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use log::{error, info, warn};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod config;
 mod heartbeat;
@@ -120,8 +120,35 @@ fn run_agent(token: String, endpoint: String) -> Result<()> {
     let mut consecutive_errors = 0u32;
     let mut consecutive_uninstall_commands = 0u32;
 
+    /// How often the agent directly checks GitHub for a newer release.
+    /// This runs independently of platform heartbeat update info.
+    const GITHUB_CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
+    let mut last_github_check: Option<Instant> = None;
+
     // Main loop
     loop {
+        // ── Periodic direct GitHub release check ────────────────
+        let should_check_github = match last_github_check {
+            None => true,
+            Some(t) => t.elapsed() >= GITHUB_CHECK_INTERVAL,
+        };
+        if should_check_github {
+            last_github_check = Some(Instant::now());
+            info!("Checking GitHub for new agent release...");
+            match update::check_github_for_update() {
+                Ok(true) => {
+                    info!("Update staged from GitHub release. Restarting for update...");
+                    std::process::exit(0);
+                }
+                Ok(false) => {
+                    info!("No new release on GitHub (current: v{})", AGENT_VERSION);
+                }
+                Err(e) => {
+                    warn!("GitHub update check failed: {}. Will retry in 5 min.", e);
+                }
+            }
+        }
+
         match send_heartbeat(&client, &config, &mut collector) {
             Ok(response) => {
                 // Reset error counters on success

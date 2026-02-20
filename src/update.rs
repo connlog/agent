@@ -262,11 +262,7 @@ fn hex_decode(hex: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
-// ── Manual update via GitHub API ────────────────────────────────
-//
-// `connlog-agent --update` checks GitHub releases directly (no platform needed),
-// downloads the correct binary for the current arch, verifies it, and replaces
-// the installed binary in place.
+// ── GitHub release checking ─────────────────────────────────────
 
 const GITHUB_RELEASE_URL: &str =
     "https://api.github.com/repos/connlog/connlog-agent/releases/latest";
@@ -284,6 +280,120 @@ struct GitHubRelease {
 struct GitHubAsset {
     name: String,
     browser_download_url: String,
+}
+
+/// Periodically check GitHub releases for a newer version and stage an update.
+/// This runs independently of the platform heartbeat update mechanism.
+/// Designed for automatic background use (every 5 minutes from the main loop).
+///
+/// Returns:
+/// - `Ok(true)`  — update staged, caller should exit for systemd to apply it
+/// - `Ok(false)` — no update available or skipped
+/// - `Err(..)`   — check or download failed
+pub fn check_github_for_update() -> Result<bool> {
+    if !has_signing_key() {
+        return Ok(false);
+    }
+
+    let current_version = env!("CARGO_PKG_VERSION");
+
+    // Fetch latest release from GitHub
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .user_agent("connlog-agent")
+        .build()
+        .context("Failed to create HTTP client")?;
+
+    let release: GitHubRelease = client
+        .get(GITHUB_RELEASE_URL)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .context("Failed to fetch latest release from GitHub")?
+        .error_for_status()
+        .context("GitHub API returned an error")?
+        .json()
+        .context("Failed to parse GitHub release JSON")?;
+
+    if release.draft || release.prerelease {
+        return Ok(false);
+    }
+
+    let latest_version = release.tag_name.trim_start_matches('v');
+
+    if latest_version == current_version {
+        return Ok(false);
+    }
+
+    if !is_version_upgrade(current_version, latest_version) {
+        return Ok(false);
+    }
+
+    info!(
+        "UPDATE (GitHub): v{} → v{} available, preparing update...",
+        current_version, latest_version
+    );
+
+    // Find assets for our architecture
+    let arch = std::env::consts::ARCH;
+    let os = std::env::consts::OS;
+
+    let binary_name = format!("connlog-agent-{}-{}-{}", release.tag_name, os, arch);
+    let sig_name = format!("{}.sig", binary_name);
+    let sha256_name = format!("{}.sha256", binary_name);
+
+    let binary_asset = release
+        .assets
+        .iter()
+        .find(|a| a.name == binary_name)
+        .ok_or_else(|| {
+            anyhow::anyhow!("No binary found for {}-{} in release", os, arch)
+        })?;
+
+    let sig_asset = release
+        .assets
+        .iter()
+        .find(|a| a.name == sig_name)
+        .ok_or_else(|| anyhow::anyhow!("No signature file found in release"))?;
+
+    let sha256_asset = release
+        .assets
+        .iter()
+        .find(|a| a.name == sha256_name)
+        .ok_or_else(|| anyhow::anyhow!("No checksum file found in release"))?;
+
+    // Download and parse SHA-256 checksum
+    let download_client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .user_agent("connlog-agent")
+        .build()
+        .context("Failed to create download client")?;
+
+    let sha256_text = download_client
+        .get(&sha256_asset.browser_download_url)
+        .send()
+        .context("Failed to download checksum file")?
+        .error_for_status()?
+        .text()
+        .context("Failed to read checksum body")?;
+
+    let expected_sha256 = sha256_text
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Empty checksum file"))?;
+
+    if expected_sha256.len() != 64 {
+        anyhow::bail!("Invalid checksum format (length {})", expected_sha256.len());
+    }
+
+    // Use the existing verified update pipeline (download + SHA-256 + Ed25519 + stage)
+    perform_verified_update(
+        &binary_asset.browser_download_url,
+        &sig_asset.browser_download_url,
+        expected_sha256,
+        latest_version,
+    )?;
+
+    Ok(true)
 }
 
 /// Run a manual update check against GitHub and apply directly.
