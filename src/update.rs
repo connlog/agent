@@ -34,9 +34,9 @@ pub fn has_signing_key() -> bool {
 /// Attempt to apply a verified update.
 ///
 /// Returns:
-/// - `Ok(true)`  — update staged, caller should exit for systemd to apply it
-/// - `Ok(false)` — update skipped (missing fields, no signing key, etc.)
-/// - `Err(..)`   — update failed (download, checksum, or signature error)
+/// - `Ok(true)`  - update staged, caller should exit for systemd to apply it
+/// - `Ok(false)` - update skipped (missing fields, no signing key, etc.)
+/// - `Err(..)`   - update failed (download, checksum, or signature error)
 pub fn try_apply_update(update: &UpdateInfo) -> Result<bool> {
     if !update.available {
         info!("UPDATE SKIP: available=false");
@@ -47,7 +47,7 @@ pub fn try_apply_update(update: &UpdateInfo) -> Result<bool> {
         Some(url) => url,
         None => {
             info!(
-                "Update v{} available but no download URL provided — skipping",
+                "Update v{} available but no download URL provided - skipping",
                 update.latest_version
             );
             return Ok(false);
@@ -58,7 +58,7 @@ pub fn try_apply_update(update: &UpdateInfo) -> Result<bool> {
         Some(url) => url,
         None => {
             warn!(
-                "Update v{} available but no signature URL — rejecting (unsigned updates are not accepted)",
+                "Update v{} available but no signature URL - rejecting (unsigned updates are not accepted)",
                 update.latest_version
             );
             return Ok(false);
@@ -69,7 +69,7 @@ pub fn try_apply_update(update: &UpdateInfo) -> Result<bool> {
         Some(hash) => hash,
         None => {
             warn!(
-                "Update v{} available but no SHA-256 hash — skipping",
+                "Update v{} available but no SHA-256 hash - skipping",
                 update.latest_version
             );
             return Ok(false);
@@ -97,7 +97,7 @@ pub fn try_apply_update(update: &UpdateInfo) -> Result<bool> {
     // Reject version downgrades (prevents rollback attacks)
     if !is_version_upgrade(current_version, &update.latest_version) {
         warn!(
-            "UPDATE: Rejecting downgrade from v{} to v{} — only upgrades are allowed",
+            "UPDATE: Rejecting downgrade from v{} to v{} - only upgrades are allowed",
             current_version, update.latest_version
         );
         return Ok(false);
@@ -147,7 +147,7 @@ fn perform_verified_update(
     // Basic sanity check (agent binary should be >100KB)
     if binary_data.len() < 100_000 {
         anyhow::bail!(
-            "UPDATE: Downloaded file is suspiciously small ({} bytes) — aborting",
+            "UPDATE: Downloaded file is suspiciously small ({} bytes) - aborting",
             binary_data.len()
         );
     }
@@ -178,7 +178,7 @@ fn perform_verified_update(
 
     if sig_data.len() != 64 {
         anyhow::bail!(
-            "UPDATE: Invalid signature size ({} bytes, expected 64) — aborting",
+            "UPDATE: Invalid signature size ({} bytes, expected 64) - aborting",
             sig_data.len()
         );
     }
@@ -196,7 +196,7 @@ fn perform_verified_update(
         .verify(actual_hash.as_ref(), &sig_data)
         .map_err(|_| {
             anyhow::anyhow!(
-                "UPDATE: Ed25519 SIGNATURE VERIFICATION FAILED — rejecting update. \
+                "UPDATE: Ed25519 SIGNATURE VERIFICATION FAILED - rejecting update. \
                  This could indicate a tampered binary or mismatched signing key."
             )
         })?;
@@ -287,9 +287,9 @@ struct GitHubAsset {
 /// Designed for automatic background use (every 5 minutes from the main loop).
 ///
 /// Returns:
-/// - `Ok(true)`  — update staged, caller should exit for systemd to apply it
-/// - `Ok(false)` — no update available or skipped
-/// - `Err(..)`   — check or download failed
+/// - `Ok(true)`  - update staged, caller should exit for systemd to apply it
+/// - `Ok(false)` - no update available or skipped
+/// - `Err(..)`   - check or download failed
 pub fn check_github_for_update() -> Result<bool> {
     if !has_signing_key() {
         return Ok(false);
@@ -428,7 +428,7 @@ pub fn run_manual_update() -> Result<()> {
         .context("Failed to parse GitHub release JSON")?;
 
     if release.draft || release.prerelease {
-        println!("Latest release is a draft/prerelease — skipping.");
+        println!("Latest release is a draft/prerelease - skipping.");
         return Ok(());
     }
 
@@ -517,7 +517,7 @@ pub fn run_manual_update() -> Result<()> {
 
     if binary_data.len() < 100_000 {
         anyhow::bail!(
-            "Downloaded file is suspiciously small ({} bytes) — aborting",
+            "Downloaded file is suspiciously small ({} bytes) - aborting",
             binary_data.len()
         );
     }
@@ -583,7 +583,7 @@ pub fn run_manual_update() -> Result<()> {
         .verify(actual_hash.as_ref(), &sig_data)
         .map_err(|_| {
             anyhow::anyhow!(
-                "Ed25519 SIGNATURE VERIFICATION FAILED — the binary may be tampered."
+                "Ed25519 SIGNATURE VERIFICATION FAILED - the binary may be tampered."
             )
         })?;
     println!("Ed25519 signature verified ✓");

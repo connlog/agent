@@ -116,7 +116,7 @@ impl SampleBuffer {
     }
 }
 
-/// Internal sample interval — how often the agent collects raw metrics
+/// Internal sample interval - how often the agent collects raw metrics
 /// between report intervals. This is NOT the heartbeat interval.
 pub const SAMPLE_INTERVAL_SECS: u64 = 5;
 

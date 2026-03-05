@@ -74,7 +74,7 @@ pub struct MetricsSummary {
     pub sample_count: u8,
 }
 
-/// Identity information — sent once or on change
+/// Identity information - sent once or on change
 #[derive(Debug, Clone)]
 pub struct IdentityInfo {
     pub hostname: String,
@@ -86,7 +86,7 @@ pub struct IdentityInfo {
     pub uptime_absolute_secs: u32,
 }
 
-/// Community telemetry — anonymized bucketed data
+/// Community telemetry - anonymized bucketed data
 #[derive(Debug, Clone)]
 pub struct CommunityFrame {
     pub cpu_bucket: u8,

@@ -56,7 +56,7 @@ if [ -f /run/connlog/.update_requested ]; then \
         mv /run/connlog/connlog-agent.service.new /etc/systemd/system/connlog-agent.service; \
         echo "ConnLog: Service file refreshed from new binary."; \
     else \
-        echo "ConnLog: Warning — could not refresh service file, keeping existing."; \
+        echo "ConnLog: Warning - could not refresh service file, keeping existing."; \
     fi; \
     systemctl daemon-reload; \
     rm -f /run/connlog/.update_requested /run/connlog/connlog-agent-new; \
@@ -147,7 +147,7 @@ pub fn uninstall() -> Result<()> {
         .status();
     println!("  Reloaded systemd");
 
-    // 5. Remove config (includes token — security critical)
+    // 5. Remove config (includes token - security critical)
     let _ = fs::remove_dir_all("/etc/connlog");
     println!("  Removed /etc/connlog");
 
@@ -316,7 +316,7 @@ fn enable_service() -> Result<()> {
 }
 
 fn start_service() -> Result<()> {
-    // Check if service is already running — use restart to pick up the new binary
+    // Check if service is already running - use restart to pick up the new binary
     let is_active = Command::new("systemctl")
         .args(["is-active", "--quiet", "connlog-agent"])
         .status()

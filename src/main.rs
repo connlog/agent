@@ -194,7 +194,7 @@ fn run_agent(token: String, endpoint: String) -> Result<()> {
                                 "Update to v{} staged successfully. Restarting for update...",
                                 update_info.latest_version
                             );
-                            // Exit cleanly — ExecStopPost will swap the binary,
+                            // Exit cleanly - ExecStopPost will swap the binary,
                             // refresh the service file, and restart us.
                             std::process::exit(0);
                         }
@@ -344,9 +344,9 @@ fn trigger_self_uninstall(reason: &str) {
     let is_systemd = std::env::var("INVOCATION_ID").is_ok();
 
     if is_systemd {
-        info!("UNINSTALL: Running as systemd service — writing uninstall marker");
+        info!("UNINSTALL: Running as systemd service - writing uninstall marker");
 
-        // Write uninstall marker file — ExecStopPost will detect this
+        // Write uninstall marker file - ExecStopPost will detect this
         match std::fs::write("/run/connlog/.uninstall_requested", reason) {
             Ok(_) => {
                 info!("UNINSTALL: Marker written to /run/connlog/.uninstall_requested");
@@ -361,13 +361,13 @@ fn trigger_self_uninstall(reason: &str) {
             }
         }
     } else {
-        info!("UNINSTALL: Not running as systemd service — performing direct uninstall");
+        info!("UNINSTALL: Not running as systemd service - performing direct uninstall");
         if let Err(e) = install::uninstall() {
             error!("UNINSTALL: Direct uninstall failed: {}", e);
         }
     }
 
-    // Exit cleanly — Restart=on-failure means systemd will NOT restart us
+    // Exit cleanly - Restart=on-failure means systemd will NOT restart us
     std::process::exit(0);
 }
 

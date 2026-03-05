@@ -29,7 +29,7 @@ impl MetricsCollector {
     /// Create a new collector. Performs a full initial refresh to populate CPU baseline.
     pub fn new() -> Result<Self> {
         let mut sys = System::new();
-        // Initial CPU refresh — sysinfo needs two refreshes to compute usage delta
+        // Initial CPU refresh - sysinfo needs two refreshes to compute usage delta
         sys.refresh_cpu_all();
         std::thread::sleep(std::time::Duration::from_millis(200));
         sys.refresh_cpu_all();
@@ -64,10 +64,10 @@ impl MetricsCollector {
         })
     }
 
-    /// Collect current metrics. Only refreshes CPU, memory, and disks — NOT processes.
+    /// Collect current metrics. Only refreshes CPU, memory, and disks - NOT processes.
     /// This is ~10× cheaper than `System::new_all() + refresh_all()`.
     pub fn collect(&mut self) -> SystemMetrics {
-        // Targeted refresh — only what we need
+        // Targeted refresh - only what we need
         self.sys.refresh_cpu_all();
         self.sys.refresh_memory();
         self.disks.refresh();
