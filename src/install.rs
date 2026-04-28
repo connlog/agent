@@ -85,8 +85,8 @@ pub fn install(token: &str) -> Result<()> {
     println!("Installing ConnLog agent as systemd service...");
 
     // Get platform URL from environment or use default
-    let platform_url = std::env::var("CONNLOG_PLATFORM_URL")
-        .unwrap_or_else(|_| "https://connlog.com".to_string());
+    let platform_url =
+        std::env::var("CONNLOG_PLATFORM_URL").unwrap_or_else(|_| "https://connlog.com".to_string());
 
     // Create system user
     create_system_user()?;
@@ -142,9 +142,7 @@ pub fn uninstall() -> Result<()> {
     println!("  Removed service file");
 
     // 4. Reload systemd (forgets the unit)
-    let _ = Command::new("systemctl")
-        .arg("daemon-reload")
-        .status();
+    let _ = Command::new("systemctl").arg("daemon-reload").status();
     println!("  Reloaded systemd");
 
     // 5. Remove config (includes token - security critical)
@@ -187,11 +185,9 @@ fn is_root() -> bool {
 
 fn create_system_user() -> Result<()> {
     // Check if user already exists
-    let output = Command::new("id")
-        .arg("connlog-agent")
-        .output();
+    let output = Command::new("id").arg("connlog-agent").output();
 
-    if output.is_ok() && output.unwrap().status.success() {
+    if output.map(|o| o.status.success()).unwrap_or(false) {
         println!("  User 'connlog-agent' already exists");
         return Ok(());
     }
@@ -201,7 +197,8 @@ fn create_system_user() -> Result<()> {
         .args([
             "--system",
             "--no-create-home",
-            "--shell", "/usr/sbin/nologin",
+            "--shell",
+            "/usr/sbin/nologin",
             "connlog-agent",
         ])
         .status()
@@ -216,14 +213,15 @@ fn create_system_user() -> Result<()> {
 }
 
 fn create_config_dir() -> Result<()> {
-    fs::create_dir_all("/etc/connlog")
-        .context("Failed to create /etc/connlog directory")?;
+    fs::create_dir_all("/etc/connlog").context("Failed to create /etc/connlog directory")?;
 
     // Set directory permissions to 0700 (root-only, prevents other users listing contents)
     let dir_path = Path::new("/etc/connlog");
-    let mut dir_perms = fs::metadata(dir_path)?.permissions();
+    let mut dir_perms = fs::metadata(dir_path)
+        .context("Failed to read /etc/connlog metadata")?
+        .permissions();
     dir_perms.set_mode(0o700);
-    fs::set_permissions(dir_path, dir_perms)?;
+    fs::set_permissions(dir_path, dir_perms).context("Failed to set /etc/connlog permissions")?;
 
     println!("  Created /etc/connlog directory (700 root:root)");
     Ok(())
@@ -233,9 +231,9 @@ fn create_config_dir() -> Result<()> {
 /// Prevents shell injection through crafted token or URL values.
 fn escape_env_value(s: &str) -> String {
     s.replace('\\', "\\\\")
-     .replace('"', "\\\"")
-     .replace('$', "\\$")
-     .replace('`', "\\`")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
+        .replace('`', "\\`")
 }
 
 fn write_config(token: &str, platform_url: &str) -> Result<()> {
@@ -245,41 +243,44 @@ fn write_config(token: &str, platform_url: &str) -> Result<()> {
         escape_env_value(platform_url),
     );
 
-    fs::write("/etc/connlog/agent.conf", config)
-        .context("Failed to write config file")?;
+    fs::write("/etc/connlog/agent.conf", config).context("Failed to write config file")?;
 
     // Set permissions to 600 (root-only)
     let path = Path::new("/etc/connlog/agent.conf");
-    let mut perms = fs::metadata(path)?.permissions();
+    let mut perms = fs::metadata(path)
+        .context("Failed to read /etc/connlog/agent.conf metadata")?
+        .permissions();
     perms.set_mode(0o600);
-    fs::set_permissions(path, perms)?;
+    fs::set_permissions(path, perms)
+        .context("Failed to set /etc/connlog/agent.conf permissions")?;
 
     println!("  Wrote config to /etc/connlog/agent.conf (600 root:root)");
     Ok(())
 }
 
 fn install_binary() -> Result<()> {
-    let current_exe = std::env::current_exe()
-        .context("Failed to get current executable path")?;
+    let current_exe = std::env::current_exe().context("Failed to get current executable path")?;
 
     let target_path = Path::new("/usr/local/bin/connlog-agent");
 
     // Check if we're already running from the target location
-    let current_canonical = fs::canonicalize(&current_exe)
-        .context("Failed to canonicalize current exe path")?;
+    let current_canonical =
+        fs::canonicalize(&current_exe).context("Failed to canonicalize current exe path")?;
     let target_canonical = fs::canonicalize(target_path).ok();
 
     if target_canonical.as_ref() == Some(&current_canonical) {
         println!("  Binary already installed at /usr/local/bin/connlog-agent");
     } else {
         // Copy binary to target location
-        fs::copy(&current_exe, target_path)
-            .context("Failed to copy binary to /usr/local/bin")?;
+        fs::copy(&current_exe, target_path).context("Failed to copy binary to /usr/local/bin")?;
 
         // Make executable
-        let mut perms = fs::metadata(target_path)?.permissions();
+        let mut perms = fs::metadata(target_path)
+            .context("Failed to read installed binary metadata")?
+            .permissions();
         perms.set_mode(0o755);
-        fs::set_permissions(target_path, perms)?;
+        fs::set_permissions(target_path, perms)
+            .context("Failed to set installed binary permissions")?;
 
         println!("  Installed binary to /usr/local/bin/connlog-agent");
     }
@@ -340,4 +341,143 @@ fn start_service() -> Result<()> {
         println!("  Started service");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── escape_env_value ────────────────────────────────────────
+    //
+    // SECURITY: This function defends against shell-injection through a crafted
+    // bearer token or platform URL when `/etc/connlog/agent.env` is sourced by
+    // systemd. A regression here is a remote-code-execution vector. Tests pin
+    // the four metacharacters that matter in a double-quoted shell context.
+
+    #[test]
+    fn escape_passes_through_safe_input() {
+        assert_eq!(escape_env_value("agent_abc123"), "agent_abc123");
+        assert_eq!(
+            escape_env_value("https://example.com"),
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn escape_neutralises_command_substitution() {
+        // Without escaping, `$(rm -rf /)` could be interpreted by a downstream
+        // shell context. After escaping, every `$` must be preceded by `\`,
+        // which systemd's EnvironmentFile parser stores as a literal `$`.
+        let escaped = escape_env_value("$(rm -rf /)");
+        assert!(
+            escaped.contains("\\$("),
+            "every $ must be backslash-escaped, got: {}",
+            escaped
+        );
+        assert!(
+            !escaped.contains("\\$\\$"),
+            "escape function must not double-escape $, got: {}",
+            escaped
+        );
+    }
+
+    #[test]
+    fn escape_neutralises_backticks() {
+        let escaped = escape_env_value("`whoami`");
+        assert!(escaped.contains("\\`"));
+        assert!(!escaped.starts_with('`'));
+    }
+
+    #[test]
+    fn escape_neutralises_double_quote_then_command() {
+        // Classic break-out: close the quote, run a command, reopen the quote.
+        // After escaping, every literal `"` in the input must be backslash-escaped
+        // so it cannot terminate the surrounding double-quoted env value.
+        let escaped = escape_env_value("x\"; rm -rf /; echo \"y\"");
+        // Count unescaped quotes — there must be zero. We do this by removing
+        // every \" pair and checking no bare " remains.
+        let stripped = escaped.replace("\\\"", "");
+        assert!(
+            !stripped.contains('"'),
+            "every \" must be backslash-escaped, got: {}",
+            escaped
+        );
+    }
+
+    #[test]
+    fn escape_neutralises_backslash() {
+        // Backslash must be doubled FIRST so it doesn't accidentally escape a
+        // following quote we were trying to escape.
+        let escaped = escape_env_value("\\\"");
+        // Original: \"  →  expected: \\\"  (backslash doubled, quote escaped)
+        assert_eq!(escaped, "\\\\\\\"");
+    }
+
+    #[test]
+    fn escape_keeps_metacharacters_neutralised_after_round_trip() {
+        // Running the escaper twice must keep every metacharacter neutralised.
+        // The output WILL grow (backslashes double on each pass), but every
+        // active metacharacter must remain preceded by an escape.
+        let once = escape_env_value("$(echo)");
+        let twice = escape_env_value(&once);
+        // After a second pass, the original `$` is still escaped (now via
+        // `\\\$` since the first-pass `\` was itself doubled).
+        assert!(
+            twice.contains("\\$"),
+            "$ must remain escaped after second pass, got: {}",
+            twice
+        );
+        // No bare unescaped quote characters either.
+        assert!(
+            !twice.replace("\\\"", "").contains('"'),
+            "no unescaped quote may survive, got: {}",
+            twice
+        );
+    }
+
+    // ── SYSTEMD_SERVICE invariants ──────────────────────────────
+    //
+    // The systemd unit is a string blob. These tests pin the security and
+    // self-update properties that, if broken, would silently leave production
+    // agents unable to update or expose them to privilege escalation.
+
+    #[test]
+    fn systemd_unit_runs_as_unprivileged_user() {
+        assert!(SYSTEMD_SERVICE.contains("User=connlog-agent"));
+        assert!(SYSTEMD_SERVICE.contains("Group=connlog-agent"));
+        assert!(SYSTEMD_SERVICE.contains("NoNewPrivileges=yes"));
+    }
+
+    #[test]
+    fn systemd_unit_keeps_self_update_hook() {
+        // ExecStopPost is what completes the self-update. If this disappears,
+        // the entire auto-update mechanism silently breaks.
+        assert!(
+            SYSTEMD_SERVICE.contains("ExecStopPost"),
+            "ExecStopPost is required for self-update to work"
+        );
+        assert!(SYSTEMD_SERVICE.contains("/run/connlog/.update_requested"));
+        assert!(SYSTEMD_SERVICE.contains("/run/connlog/.uninstall_requested"));
+        assert!(SYSTEMD_SERVICE.contains("systemctl daemon-reload"));
+    }
+
+    #[test]
+    fn systemd_unit_hardening_flags_present() {
+        // These are the systemd sandboxing knobs we depend on. Removing any of
+        // them weakens the agent's blast radius if compromised.
+        for flag in [
+            "ProtectSystem=strict",
+            "ProtectHome=yes",
+            "PrivateTmp=yes",
+            "ProtectKernelModules=yes",
+            "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX",
+            "CapabilityBoundingSet=",
+        ] {
+            assert!(
+                SYSTEMD_SERVICE.contains(flag),
+                "systemd hardening flag missing: {}",
+                flag
+            );
+        }
+    }
 }

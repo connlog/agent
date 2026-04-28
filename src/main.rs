@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use log::{error, info, warn};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 mod config;
 mod heartbeat;
@@ -57,21 +57,30 @@ fn main() -> Result<()> {
 
     // Handle installation
     if config.install {
-        let token = config.token.clone().context("Token required for installation")?;
+        let token = config
+            .token
+            .clone()
+            .context("Token required for installation")?;
         return install::install(&token);
     }
 
     // Run mode - require token
-    let token = config.token.clone().context("Token is required. Use --token or set CONNLOG_TOKEN environment variable.")?;
+    let token = config
+        .token
+        .clone()
+        .context("Token is required. Use --token or set CONNLOG_TOKEN environment variable.")?;
 
     // Determine endpoint
     #[cfg(debug_assertions)]
-    let endpoint = config.endpoint.clone()
+    let endpoint = config
+        .endpoint
+        .clone()
         .or_else(|| config.get_platform_url())
         .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
 
     #[cfg(not(debug_assertions))]
-    let endpoint = config.get_platform_url()
+    let endpoint = config
+        .get_platform_url()
         .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
 
     run_agent(token, endpoint)
@@ -92,11 +101,11 @@ fn run_agent(token: String, endpoint: String) -> Result<()> {
         std::process::exit(1);
     }
 
-    let client = ApiClient::new(endpoint, token);
+    let client = ApiClient::new(endpoint, token).context("Failed to initialize HTTP client")?;
 
     // Initialize reusable metrics collector (avoids re-creating sysinfo each heartbeat)
-    let mut collector = MetricsCollector::new()
-        .context("Failed to initialize metrics collector")?;
+    let mut collector =
+        MetricsCollector::new().context("Failed to initialize metrics collector")?;
     info!("✓ Metrics collector initialized");
 
     // Fetch runtime config from server with retry logic
@@ -106,9 +115,7 @@ fn run_agent(token: String, endpoint: String) -> Result<()> {
 
     info!(
         "✓ Loaded config v{} (interval={}s, missed_threshold={})",
-        config.version,
-        config.heartbeat_interval_secs,
-        config.missed_threshold
+        config.version, config.heartbeat_interval_secs, config.missed_threshold
     );
 
     if config.version == 0 {
@@ -120,35 +127,22 @@ fn run_agent(token: String, endpoint: String) -> Result<()> {
     let mut consecutive_errors = 0u32;
     let mut consecutive_uninstall_commands = 0u32;
 
-    /// How often the agent directly checks GitHub for a newer release.
-    /// This runs independently of platform heartbeat update info.
-    const GITHUB_CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
-    let mut last_github_check: Option<Instant> = None;
+    // ── Update strategy ──────────────────────────────────────────
+    //
+    // Updates are delivered exclusively via the platform heartbeat response
+    // (`response.update`). The platform does its own cached check against the
+    // upstream release source and proxies the binary/signature/sha256 from an
+    // in-house URL, so:
+    //   - the agent never talks to api.github.com
+    //   - a fleet of N agents produces O(1) upstream traffic, not O(N)
+    //   - all artifact fetches go to a single TLS-pinned platform domain
+    //
+    // Ed25519 + SHA-256 verification is unchanged: the agent still verifies
+    // the signed hash against its compiled-in public key, so the platform
+    // proxy is untrusted by design.
 
     // Main loop
     loop {
-        // ── Periodic direct GitHub release check ────────────────
-        let should_check_github = match last_github_check {
-            None => true,
-            Some(t) => t.elapsed() >= GITHUB_CHECK_INTERVAL,
-        };
-        if should_check_github {
-            last_github_check = Some(Instant::now());
-            info!("Checking GitHub for new agent release...");
-            match update::check_github_for_update() {
-                Ok(true) => {
-                    info!("Update staged from GitHub release. Restarting for update...");
-                    std::process::exit(0);
-                }
-                Ok(false) => {
-                    info!("No new release on GitHub (current: v{})", AGENT_VERSION);
-                }
-                Err(e) => {
-                    warn!("GitHub update check failed: {}. Will retry in 5 min.", e);
-                }
-            }
-        }
-
         match send_heartbeat(&client, &config, &mut collector) {
             Ok(response) => {
                 // Reset error counters on success
@@ -168,7 +162,10 @@ fn run_agent(token: String, endpoint: String) -> Result<()> {
                         consecutive_uninstall_commands, UNINSTALL_CONFIRM_THRESHOLD
                     );
                     if consecutive_uninstall_commands >= UNINSTALL_CONFIRM_THRESHOLD {
-                        warn!("Uninstall confirmed after {} consecutive commands", UNINSTALL_CONFIRM_THRESHOLD);
+                        warn!(
+                            "Uninstall confirmed after {} consecutive commands",
+                            UNINSTALL_CONFIRM_THRESHOLD
+                        );
                         trigger_self_uninstall("Remote uninstall confirmed by workspace owner");
                         return Ok(());
                     }
@@ -199,11 +196,16 @@ fn run_agent(token: String, endpoint: String) -> Result<()> {
                             std::process::exit(0);
                         }
                         Ok(false) => {
-                            info!("UPDATE SKIPPED: v{} (see preceding log for reason)", update_info.latest_version);
+                            info!(
+                                "UPDATE SKIPPED: v{} (see preceding log for reason)",
+                                update_info.latest_version
+                            );
                         }
                         Err(e) => {
-                            error!("Update to v{} failed: {}. Continuing with current version.",
-                                update_info.latest_version, e);
+                            error!(
+                                "Update to v{} failed: {}. Continuing with current version.",
+                                update_info.latest_version, e
+                            );
                         }
                     }
                 } else {
@@ -249,7 +251,9 @@ fn run_agent(token: String, endpoint: String) -> Result<()> {
                         "Token rejected {} consecutive times. Agent will self-uninstall to prevent zombie pings.",
                         MAX_UNAUTHORIZED_ATTEMPTS
                     );
-                    trigger_self_uninstall("Token rejected too many times (likely deleted or revoked)");
+                    trigger_self_uninstall(
+                        "Token rejected too many times (likely deleted or revoked)",
+                    );
                     return Ok(());
                 }
 
@@ -353,7 +357,10 @@ fn trigger_self_uninstall(reason: &str) {
                 info!("UNINSTALL: Exiting process. systemd ExecStopPost will complete cleanup.");
             }
             Err(e) => {
-                error!("UNINSTALL: Failed to write marker file: {}. Attempting direct uninstall.", e);
+                error!(
+                    "UNINSTALL: Failed to write marker file: {}. Attempting direct uninstall.",
+                    e
+                );
                 // Fallback: try direct uninstall (may fail without privileges)
                 if let Err(e) = install::uninstall() {
                     error!("UNINSTALL: Direct uninstall also failed: {}", e);
@@ -379,19 +386,47 @@ struct HeartbeatResult {
     update: Option<heartbeat::UpdateInfo>,
 }
 
-fn send_heartbeat(client: &ApiClient, config: &AgentConfig, collector: &mut MetricsCollector) -> Result<HeartbeatResult, ApiError> {
+fn send_heartbeat(
+    client: &ApiClient,
+    config: &AgentConfig,
+    collector: &mut MetricsCollector,
+) -> Result<HeartbeatResult, ApiError> {
     // Collect system metrics using reusable collector
     let metrics = collector.collect();
 
     // Respect server-side metrics toggles
     let payload_metrics = if config.any_metrics_enabled() {
         heartbeat::Metrics {
-            cpu_percent: if config.metrics.cpu { metrics.cpu_percent } else { 0.0 },
-            memory_used_mb: if config.metrics.memory { metrics.memory_used_mb } else { 0 },
-            memory_total_mb: if config.metrics.memory { metrics.memory_total_mb } else { 0 },
-            disk_used_mb: if config.metrics.disk { metrics.disk_used_mb } else { 0 },
-            disk_total_mb: if config.metrics.disk { metrics.disk_total_mb } else { 0 },
-            load_1m: if config.metrics.load { metrics.load_1m } else { 0.0 },
+            cpu_percent: if config.metrics.cpu {
+                metrics.cpu_percent
+            } else {
+                0.0
+            },
+            memory_used_mb: if config.metrics.memory {
+                metrics.memory_used_mb
+            } else {
+                0
+            },
+            memory_total_mb: if config.metrics.memory {
+                metrics.memory_total_mb
+            } else {
+                0
+            },
+            disk_used_mb: if config.metrics.disk {
+                metrics.disk_used_mb
+            } else {
+                0
+            },
+            disk_total_mb: if config.metrics.disk {
+                metrics.disk_total_mb
+            } else {
+                0
+            },
+            load_1m: if config.metrics.load {
+                metrics.load_1m
+            } else {
+                0.0
+            },
         }
     } else {
         heartbeat::Metrics {

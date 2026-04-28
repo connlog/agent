@@ -44,26 +44,32 @@ pub struct ApiClient {
 }
 
 impl ApiClient {
-    pub fn new(base_url: String, token: String) -> Self {
+    pub fn new(base_url: String, token: String) -> Result<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
             // SECURITY: Disable redirects to prevent token leakage.
             // A compromised DNS/CDN could redirect to an attacker-controlled server;
             // reqwest would follow and forward the Authorization header.
             .redirect(reqwest::redirect::Policy::none())
+            // Identify ourselves on the server side. Server-side metrics + abuse
+            // dashboards can group by this; aids debugging without leaking secrets.
+            .user_agent(concat!("connlog-agent/", env!("CARGO_PKG_VERSION")))
             .build()
-            .expect("Failed to create HTTP client");
+            .context("Failed to create HTTP client")?;
 
-        Self {
+        Ok(Self {
             client,
             base_url,
             token,
             use_binary: true, // Protocol v2 by default
-        }
+        })
     }
 
     /// Send heartbeat using binary wire format (protocol v2) or JSON (protocol v1 fallback)
-    pub fn send_heartbeat(&self, payload: &HeartbeatPayload) -> Result<HeartbeatResponse, ApiError> {
+    pub fn send_heartbeat(
+        &self,
+        payload: &HeartbeatPayload,
+    ) -> Result<HeartbeatResponse, ApiError> {
         if self.use_binary {
             self.send_heartbeat_binary(payload)
         } else {
@@ -72,31 +78,19 @@ impl ApiClient {
     }
 
     /// Protocol v2: Binary wire format (32 bytes)
-    fn send_heartbeat_binary(&self, payload: &HeartbeatPayload) -> Result<HeartbeatResponse, ApiError> {
+    fn send_heartbeat_binary(
+        &self,
+        payload: &HeartbeatPayload,
+    ) -> Result<HeartbeatResponse, ApiError> {
         let url = format!("{}/api/agents/heartbeat", self.base_url);
 
-        // Encode to simple 32-byte binary format (metrics only, identity in headers)
-        let mut binary_payload = [0u8; 32];
-
-        // Encode uptime as u64 at offset 0
-        binary_payload[0..8].copy_from_slice(&payload.uptime_seconds.to_le_bytes());
-
-        // Encode metrics (scaled to integers for compact storage)
-        let cpu_x100 = (payload.metrics.cpu_percent * 100.0) as u16;
-        binary_payload[8..10].copy_from_slice(&cpu_x100.to_le_bytes());
-        binary_payload[10..12].copy_from_slice(&cpu_x100.to_le_bytes()); // cpu_max (same as avg for now)
-
-        binary_payload[12..16].copy_from_slice(&(payload.metrics.memory_used_mb as u32).to_le_bytes());
-        binary_payload[16..20].copy_from_slice(&(payload.metrics.memory_total_mb as u32).to_le_bytes());
-        binary_payload[20..24].copy_from_slice(&(payload.metrics.disk_used_mb as u32).to_le_bytes());
-        binary_payload[24..28].copy_from_slice(&(payload.metrics.disk_total_mb as u32).to_le_bytes());
-
-        let load_x100 = (payload.metrics.load_1m * 100.0) as u16;
-        binary_payload[28..30].copy_from_slice(&load_x100.to_le_bytes());
-        binary_payload[30..32].copy_from_slice(&load_x100.to_le_bytes()); // load_max (same as avg for now)
+        let binary_payload = encode_heartbeat_v2(payload);
 
         let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        );
         headers.insert(
             "X-Agent-Version",
             HeaderValue::from_str(&payload.agent_version)
@@ -114,26 +108,22 @@ impl ApiClient {
         );
         headers.insert(
             "X-Hostname",
-            HeaderValue::from_str(&payload.hostname)
-                .context("Failed to create hostname header")?,
+            HeaderValue::from_str(&payload.hostname).context("Failed to create hostname header")?,
         );
         headers.insert(
             "X-OS",
-            HeaderValue::from_str(&payload.os)
-                .context("Failed to create OS header")?,
+            HeaderValue::from_str(&payload.os).context("Failed to create OS header")?,
         );
         headers.insert(
             "X-Arch",
-            HeaderValue::from_str(&payload.arch)
-                .context("Failed to create arch header")?,
+            HeaderValue::from_str(&payload.arch).context("Failed to create arch header")?,
         );
 
         // SECURITY: Never log the token
         let auth_value = format!("Bearer {}", self.token);
         headers.insert(
             AUTHORIZATION,
-            HeaderValue::from_str(&auth_value)
-                .context("Failed to create authorization header")?,
+            HeaderValue::from_str(&auth_value).context("Failed to create authorization header")?,
         );
 
         let response = self
@@ -173,7 +163,10 @@ impl ApiClient {
     }
 
     /// Protocol v1: JSON format (fallback)
-    fn send_heartbeat_json(&self, payload: &HeartbeatPayload) -> Result<HeartbeatResponse, ApiError> {
+    fn send_heartbeat_json(
+        &self,
+        payload: &HeartbeatPayload,
+    ) -> Result<HeartbeatResponse, ApiError> {
         let url = format!("{}/api/agents/heartbeat", self.base_url);
 
         let mut headers = HeaderMap::new();
@@ -183,8 +176,7 @@ impl ApiClient {
         let auth_value = format!("Bearer {}", self.token);
         headers.insert(
             AUTHORIZATION,
-            HeaderValue::from_str(&auth_value)
-                .context("Failed to create authorization header")?,
+            HeaderValue::from_str(&auth_value).context("Failed to create authorization header")?,
         );
 
         let response = self
@@ -232,8 +224,7 @@ impl ApiClient {
         let auth_value = format!("Bearer {}", self.token);
         headers.insert(
             AUTHORIZATION,
-            HeaderValue::from_str(&auth_value)
-                .context("Failed to create authorization header")?,
+            HeaderValue::from_str(&auth_value).context("Failed to create authorization header")?,
         );
 
         let response = self
@@ -260,5 +251,188 @@ impl ApiClient {
             .with_context(|| format!("Failed to parse config response: {}", response_text))?;
 
         Ok(config)
+    }
+}
+
+/// Encode a heartbeat payload into the 32-byte protocol v2 binary wire frame.
+///
+/// Frame layout (little-endian):
+/// | Offset | Size | Field                        |
+/// |--------|------|------------------------------|
+/// | 0      | 8    | uptime_seconds (u64 LE)      |
+/// | 8      | 2    | cpu_percent × 100 (u16 LE)   |
+/// | 10     | 2    | cpu_max × 100 (u16 LE)       |
+/// | 12     | 4    | memory_used_mb (u32 LE)      |
+/// | 16     | 4    | memory_total_mb (u32 LE)     |
+/// | 20     | 4    | disk_used_mb (u32 LE)        |
+/// | 24     | 4    | disk_total_mb (u32 LE)       |
+/// | 28     | 2    | load_1m × 100 (u16 LE)       |
+/// | 30     | 2    | load_max × 100 (u16 LE)      |
+///
+/// Identity metadata (hostname, OS, arch, versions) is carried in HTTP headers,
+/// not in this frame. cpu_max and load_max mirror cpu_avg/load_avg for now
+/// (single-sample path; multi-sample aggregation via `sampler.rs` is not yet integrated).
+pub(crate) fn encode_heartbeat_v2(payload: &HeartbeatPayload) -> [u8; 32] {
+    let mut frame = [0u8; 32];
+
+    // [0..8] uptime_seconds as u64 LE
+    frame[0..8].copy_from_slice(&payload.uptime_seconds.to_le_bytes());
+
+    // [8..10] cpu_percent × 100 as u16 LE
+    let cpu_x100 = (payload.metrics.cpu_percent * 100.0) as u16;
+    frame[8..10].copy_from_slice(&cpu_x100.to_le_bytes());
+    // [10..12] cpu_max mirrors cpu_avg (no multi-sample aggregation yet)
+    frame[10..12].copy_from_slice(&cpu_x100.to_le_bytes());
+
+    // [12..16] memory_used_mb as u32 LE
+    frame[12..16].copy_from_slice(&(payload.metrics.memory_used_mb as u32).to_le_bytes());
+    // [16..20] memory_total_mb as u32 LE
+    frame[16..20].copy_from_slice(&(payload.metrics.memory_total_mb as u32).to_le_bytes());
+    // [20..24] disk_used_mb as u32 LE
+    frame[20..24].copy_from_slice(&(payload.metrics.disk_used_mb as u32).to_le_bytes());
+    // [24..28] disk_total_mb as u32 LE
+    frame[24..28].copy_from_slice(&(payload.metrics.disk_total_mb as u32).to_le_bytes());
+
+    // [28..30] load_1m × 100 as u16 LE
+    let load_x100 = (payload.metrics.load_1m * 100.0) as u16;
+    frame[28..30].copy_from_slice(&load_x100.to_le_bytes());
+    // [30..32] load_max mirrors load_avg (no multi-sample aggregation yet)
+    frame[30..32].copy_from_slice(&load_x100.to_le_bytes());
+
+    frame
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::heartbeat::{HeartbeatPayload, Metrics};
+
+    fn make_payload(
+        uptime: u64,
+        cpu: f64,
+        mem_used: u64,
+        mem_total: u64,
+        disk_used: u64,
+        disk_total: u64,
+        load: f64,
+    ) -> HeartbeatPayload {
+        HeartbeatPayload {
+            // SECURITY/CORRECTNESS: derive from CARGO_PKG_VERSION so this test never
+            // silently rots when Cargo.toml is bumped. Hardcoding a string here was a
+            // footgun: bumping the crate version would have left the test asserting an
+            // outdated value if anything actually inspected agent_version.
+            agent_version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol_version: 2,
+            config_version: 0,
+            hostname: "test-host".to_string(),
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            uptime_seconds: uptime,
+            metrics: Metrics {
+                cpu_percent: cpu,
+                memory_used_mb: mem_used,
+                memory_total_mb: mem_total,
+                disk_used_mb: disk_used,
+                disk_total_mb: disk_total,
+                load_1m: load,
+            },
+            dev_mode: None,
+        }
+    }
+
+    /// Frame must always be exactly 32 bytes — platform validates `bytes.length !== 32`.
+    #[test]
+    fn test_frame_is_32_bytes() {
+        let payload = make_payload(12345, 12.5, 1024, 8192, 20480, 100000, 0.42);
+        let frame = encode_heartbeat_v2(&payload);
+        assert_eq!(
+            frame.len(),
+            32,
+            "Protocol v2 frame must be exactly 32 bytes"
+        );
+    }
+
+    /// Decode and verify each field at its documented byte offset.
+    #[test]
+    fn test_frame_field_offsets() {
+        let payload = make_payload(
+            0x0102030405060708u64, // uptime - distinctive value
+            12.5,                  // cpu    → 1250 as u16
+            1024,                  // mem_used
+            8192,                  // mem_total
+            20480,                 // disk_used
+            100000,                // disk_total
+            0.42,                  // load   → 42 as u16
+        );
+        let frame = encode_heartbeat_v2(&payload);
+
+        // [0..8] uptime_seconds little-endian u64
+        let uptime = u64::from_le_bytes(frame[0..8].try_into().unwrap());
+        assert_eq!(uptime, 0x0102030405060708u64);
+
+        // [8..10] cpu_percent × 100 as u16 LE
+        let cpu_x100 = u16::from_le_bytes(frame[8..10].try_into().unwrap());
+        assert_eq!(cpu_x100, 1250, "12.5% × 100 = 1250");
+
+        // [10..12] cpu_max mirrors cpu_avg in single-sample path
+        let cpu_max_x100 = u16::from_le_bytes(frame[10..12].try_into().unwrap());
+        assert_eq!(cpu_max_x100, cpu_x100, "cpu_max must mirror cpu_avg");
+
+        // [12..16] memory_used_mb as u32 LE
+        let mem_used = u32::from_le_bytes(frame[12..16].try_into().unwrap());
+        assert_eq!(mem_used, 1024);
+
+        // [16..20] memory_total_mb as u32 LE
+        let mem_total = u32::from_le_bytes(frame[16..20].try_into().unwrap());
+        assert_eq!(mem_total, 8192);
+
+        // [20..24] disk_used_mb as u32 LE
+        let disk_used = u32::from_le_bytes(frame[20..24].try_into().unwrap());
+        assert_eq!(disk_used, 20480);
+
+        // [24..28] disk_total_mb as u32 LE
+        let disk_total = u32::from_le_bytes(frame[24..28].try_into().unwrap());
+        assert_eq!(disk_total, 100000);
+
+        // [28..30] load_1m × 100 as u16 LE
+        let load_x100 = u16::from_le_bytes(frame[28..30].try_into().unwrap());
+        assert_eq!(load_x100, 42, "0.42 × 100 = 42");
+
+        // [30..32] load_max mirrors load_avg
+        let load_max_x100 = u16::from_le_bytes(frame[30..32].try_into().unwrap());
+        assert_eq!(load_max_x100, load_x100, "load_max must mirror load_avg");
+    }
+
+    /// Zero-metric payload (metrics disabled) should encode cleanly.
+    #[test]
+    fn test_frame_zero_metrics() {
+        let payload = make_payload(0, 0.0, 0, 0, 0, 0, 0.0);
+        let frame = encode_heartbeat_v2(&payload);
+        assert_eq!(
+            frame, [0u8; 32],
+            "All-zero metrics must produce an all-zero frame"
+        );
+    }
+
+    /// Verify that high uptime values encode without truncation.
+    #[test]
+    fn test_frame_large_uptime() {
+        let uptime = u64::MAX / 2;
+        let payload = make_payload(uptime, 0.0, 0, 0, 0, 0, 0.0);
+        let frame = encode_heartbeat_v2(&payload);
+        let decoded = u64::from_le_bytes(frame[0..8].try_into().unwrap());
+        assert_eq!(decoded, uptime);
+    }
+
+    /// Max CPU (100%) and high load encode correctly without overflow.
+    #[test]
+    fn test_frame_max_cpu_load() {
+        // 100.0 × 100 = 10000, well within u16 range (max 65535)
+        let payload = make_payload(0, 100.0, 0, 0, 0, 0, 99.99);
+        let frame = encode_heartbeat_v2(&payload);
+        let cpu_x100 = u16::from_le_bytes(frame[8..10].try_into().unwrap());
+        assert_eq!(cpu_x100, 10000, "100% × 100 = 10000");
+        let load_x100 = u16::from_le_bytes(frame[28..30].try_into().unwrap());
+        assert_eq!(load_x100, 9999, "99.99 × 100 = 9999");
     }
 }

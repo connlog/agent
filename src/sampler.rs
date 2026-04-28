@@ -1,8 +1,25 @@
-//! Local metric sample aggregation.
+//! Local metric sample aggregation for the binary wire protocol.
 //!
-//! The agent collects raw metric samples at a fixed internal rate (every 5 seconds)
-//! and aggregates them into a summary (min/max/avg) before sending to the platform.
-//! This reduces payload count while preserving alerting fidelity.
+//! ## Purpose
+//!
+//! The agent is designed to collect raw metric samples at a sub-heartbeat rate
+//! (every [`SAMPLE_INTERVAL_SECS`] seconds, currently 5s) and aggregate them into a
+//! [`MetricsSummary`](crate::wire::MetricsSummary) before encoding them into the binary
+//! wire frame via [`wire::encode_frame`](crate::wire::encode_frame).
+//!
+//! This gives the platform richer statistical information (min/max/avg per heartbeat
+//! window) without increasing the heartbeat payload count.
+//!
+//! ## Integration status
+//!
+//! `SampleBuffer` is **not yet wired into the main agent loop**. The current main loop
+//! in `main.rs` calls `MetricsCollector::collect()` once per heartbeat and sends the
+//! single sample directly via `http::ApiClient`. The binary frame built in
+//! `http::send_heartbeat_binary` uses a simpler inline encoding (not `wire::encode_frame`).
+//!
+//! To integrate: collect samples at `SAMPLE_INTERVAL_SECS` intervals between heartbeats,
+//! push each into a `SampleBuffer`, then call `drain_summary()` at heartbeat time and
+//! pass the result to `wire::encode_frame`. See `wire.rs` for the frame layout.
 
 use crate::metrics::SystemMetrics;
 use crate::wire::MetricsSummary;
@@ -48,6 +65,11 @@ impl SampleBuffer {
     /// How many samples are buffered
     pub fn len(&self) -> usize {
         self.samples.len()
+    }
+
+    /// Returns true if no samples are buffered
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
     }
 
     /// Drain all samples and produce an aggregated summary.

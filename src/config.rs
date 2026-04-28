@@ -60,3 +60,37 @@ impl Config {
         std::env::var("CONNLOG_PLATFORM_URL").ok()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SECURITY-CRITICAL: the bearer token must NEVER appear in any rendered
+    /// `Config`. Regressing this would leak tokens into journalctl, panics, etc.
+    /// Lifted to a hard test so a careless `#[derive(Debug)]` swap can't sneak
+    /// past review.
+    #[test]
+    fn debug_redacts_token() {
+        let cfg = Config::parse_from(["connlog-agent", "--token", "agent_super_secret_xyz"]);
+        let rendered = format!("{:?}", cfg);
+        assert!(
+            !rendered.contains("agent_super_secret_xyz"),
+            "Debug must NEVER include the raw token, got: {}",
+            rendered
+        );
+        assert!(
+            rendered.contains("REDACTED"),
+            "Expected [REDACTED] marker, got: {}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn debug_handles_missing_token_without_panic() {
+        let cfg = Config::parse_from(["connlog-agent", "--status"]);
+        let rendered = format!("{:?}", cfg);
+        // Either "None" or absence of REDACTED is fine — the only thing that's
+        // not fine is a panic or a leaked token (and there's no token here).
+        assert!(rendered.contains("token"));
+    }
+}
