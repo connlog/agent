@@ -18,4 +18,11 @@ dist/
 
 # Signing keys (never commit these)
 signing_key.hex
+
+# AI assistant scratch (private, never commit)
+CLAUDE.md
+AGENTS.md
+.claude/
+.cursor/
+.aider*
 signing_key.pub
