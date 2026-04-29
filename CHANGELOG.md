@@ -8,6 +8,23 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 
 ## [Unreleased]
 
+## [1.0.1] — 2026-04-29
+
+### Changed
+
+- **Self-uninstall threshold:** raised `MAX_UNAUTHORIZED_ATTEMPTS` from `10` to
+  `50`. Only true `401 Unauthorized` responses count toward this counter —
+  network failures, DNS errors, machine-down scenarios, and other transport
+  errors are tracked separately in `consecutive_errors` and never trigger
+  self-uninstall. This guarantees the agent only removes itself when the
+  platform has authoritatively rejected the token (deleted agent, deleted
+  workspace, revoked auth) and not because the host is briefly offline.
+- **Tighter 401 backoff:** replaced the old exponential `60 × n` capped at
+  3600 s with a linear `30 + 10 × n` capped at 120 s. A `401` is cheap on the
+  platform side, so there's no reason to back off for hours; at the cap, 50
+  attempts now complete in ≈ 95 minutes (down from ≈ 21 hours), so a revoked
+  agent disappears from a host within ~1.5 h instead of nearly a day.
+
 ## [1.0.0] — 2026-04-28
 
 First **stable** release. The wire protocol, update mechanism, and CLI are now

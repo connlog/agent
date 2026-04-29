@@ -20,8 +20,15 @@ const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: u32 = 2;
 const DEFAULT_ENDPOINT: &str = "https://connlog.com";
 
-/// Maximum consecutive 401 errors before self-uninstall
-const MAX_UNAUTHORIZED_ATTEMPTS: u32 = 10;
+/// Maximum consecutive 401 errors before self-uninstall.
+///
+/// Only counts genuine `401 Unauthorized` responses from the platform — network
+/// errors, DNS failures, machine-down scenarios, etc. are tracked separately in
+/// `consecutive_errors` and never trigger self-uninstall. This guarantees the
+/// agent only removes itself when the platform has authoritatively rejected the
+/// token (deleted agent, deleted workspace, revoked auth) — not when the host
+/// is offline or the platform is briefly unreachable.
+const MAX_UNAUTHORIZED_ATTEMPTS: u32 = 50;
 
 /// Consecutive uninstall commands required from server before acting
 const UNINSTALL_CONFIRM_THRESHOLD: u32 = 3;
@@ -257,8 +264,13 @@ fn run_agent(token: String, endpoint: String) -> Result<()> {
                     return Ok(());
                 }
 
-                // Exponential backoff for unauthorized - wait longer each time
-                let backoff = std::cmp::min(60 * consecutive_unauthorized as u64, 3600);
+                // Linear backoff for unauthorized — start at 30 s, ramp by 10 s per
+                // attempt, cap at 120 s. A 401 is cheap on the server (the token
+                // lookup is indexed, no work done), so there's no reason to back
+                // off for hours; we just want enough spacing to absorb a brief
+                // platform glitch. At the cap, 50 attempts ≈ 95 minutes total
+                // before self-uninstall.
+                let backoff = std::cmp::min(30 + 10 * consecutive_unauthorized as u64, 120);
                 thread::sleep(Duration::from_secs(backoff));
             }
             Err(ApiError::Decommissioned) => {
