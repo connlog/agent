@@ -57,11 +57,6 @@ fn main() -> Result<()> {
         return update::run_manual_update();
     }
 
-    // Handle force update (bypasses Ed25519 signing-key check)
-    if config.force_update {
-        return update::run_force_update();
-    }
-
     // Handle uninstallation
     if config.uninstall {
         return install::uninstall();

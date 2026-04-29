@@ -26,12 +26,6 @@ pub struct Config {
     #[arg(long)]
     pub update: bool,
 
-    /// Force-apply the latest update, bypassing the compiled-in Ed25519 signing-key check.
-    /// Use this to bootstrap agents that were built without CONNLOG_SIGNING_PUBLIC_KEY.
-    /// SHA-256 integrity is still verified. Requires root (writes to /usr/local/bin).
-    #[arg(long = "force-update")]
-    pub force_update: bool,
-
     /// Print the embedded systemd service file and exit (used by self-updater)
     #[arg(long = "emit-service", hide = true)]
     pub emit_service: bool,
@@ -55,7 +49,6 @@ impl fmt::Debug for Config {
             .field("uninstall", &self.uninstall)
             .field("status", &self.status)
             .field("update", &self.update)
-            .field("force_update", &self.force_update)
             .field("emit_service", &self.emit_service)
             .finish()
     }

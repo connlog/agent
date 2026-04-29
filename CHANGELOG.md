@@ -8,6 +8,21 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 
 ## [Unreleased]
 
+## [1.1.1] — 2026-04-29
+
+### Removed
+
+- **`--force-update` CLI flag** and `update::run_force_update()`. The
+  heartbeat-driven force-update path (`update.forceUpdate=true` from the
+  platform) is the single, audited way to bypass the Ed25519 check, and it
+  is gated by workspace-owner auth on the dashboard. Carrying a parallel
+  CLI flag duplicated the bypass surface for no real-world benefit and made
+  the trust boundary harder to reason about.
+
+The heartbeat path is unchanged: `try_apply_update(&UpdateInfo, force: bool)`
+still skips Ed25519 only when the platform sets `force_update=true`, and
+SHA-256 integrity is always verified.
+
 ## [1.1.0] — 2026-04-29
 
 ### Added
