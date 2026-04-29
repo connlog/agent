@@ -8,6 +8,29 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 
 ## [Unreleased]
 
+## [1.1.2] — 2026-04-29
+
+### Added
+
+- **`423 Locked` (`AGENT_DISABLED`) handling.** The platform now distinguishes
+  between a *disabled* agent (reversible, returns `423`) and a *decommissioned*
+  agent (permanent, returns `410 Gone`). The agent recognises the new status
+  in both the binary and JSON heartbeat code paths via a new
+  `ApiError::Disabled` variant.
+
+  When a heartbeat is rejected with `423`, the agent:
+
+  - logs the disabled state clearly (no error spam),
+  - resets the consecutive-unauthorized and consecutive-error counters so a
+    later re-enable doesn't immediately trip the self-uninstall threshold,
+  - sleeps for a fixed 5-minute backoff regardless of the configured
+    heartbeat interval, and
+  - **does not self-uninstall** — `trigger_self_uninstall()` remains reserved
+    for `410 Gone` / `WORKSPACE_DISABLED` / repeated `401 Unauthorized`.
+
+  Re-enabling the agent from the dashboard restores normal operation on the
+  next heartbeat cycle without manual intervention on the host.
+
 ## [1.1.1] — 2026-04-29
 
 ### Removed
