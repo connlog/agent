@@ -35,11 +35,16 @@ pub fn has_signing_key() -> bool {
 
 /// Attempt to apply a verified update from the platform heartbeat response.
 ///
+/// `force` bypasses the `has_signing_key()` guard — use only when the platform
+/// has explicitly set `force_update: true` in the heartbeat response (one-shot
+/// flag gated by workspace-owner auth, so it is no less trusted than the rest
+/// of the heartbeat payload).  SHA-256 integrity is always checked regardless.
+///
 /// Returns:
 /// - `Ok(true)`  - update staged, caller should exit for systemd to apply it
 /// - `Ok(false)` - update skipped (missing fields, no signing key, etc.)
 /// - `Err(..)`   - update failed (download, checksum, or signature error)
-pub fn try_apply_update(update: &UpdateInfo) -> Result<bool> {
+pub fn try_apply_update(update: &UpdateInfo, force: bool) -> Result<bool> {
     if !update.available {
         info!("UPDATE SKIP: available=false");
         return Ok(false);
@@ -79,12 +84,20 @@ pub fn try_apply_update(update: &UpdateInfo) -> Result<bool> {
     };
 
     if !has_signing_key() {
-        warn!(
-            "UPDATE SKIP: No signing key compiled into this build (key_hex_len={}). \
-             Rebuild with CONNLOG_SIGNING_PUBLIC_KEY=<hex> to enable auto-updates.",
-            SIGNING_PUBLIC_KEY_HEX.len()
-        );
-        return Ok(false);
+        if force {
+            warn!(
+                "UPDATE FORCE: No signing key compiled — skipping Ed25519 verification. \
+                 SHA-256 integrity is still checked. This was explicitly authorised by \
+                 the workspace owner via the platform."
+            );
+        } else {
+            warn!(
+                "UPDATE SKIP: No signing key compiled into this build (key_hex_len={}). \
+                 Rebuild with CONNLOG_SIGNING_PUBLIC_KEY=<hex> to enable auto-updates.",
+                SIGNING_PUBLIC_KEY_HEX.len()
+            );
+            return Ok(false);
+        }
     }
 
     info!(
@@ -125,6 +138,7 @@ pub fn try_apply_update(update: &UpdateInfo) -> Result<bool> {
         signature_url,
         expected_sha256,
         &update.latest_version,
+        force && !has_signing_key(),
     )?;
 
     Ok(true)
@@ -333,21 +347,26 @@ fn stage_verified_update(
     signature_url: &str,
     expected_sha256: &str,
     version: &str,
+    skip_ed25519: bool,
 ) -> Result<()> {
     // 1. Download binary
     let binary_data = download_binary(client, download_url)?;
     info!("UPDATE: Downloaded {} bytes", binary_data.len());
 
-    // 2. Verify SHA-256
+    // 2. Verify SHA-256 (always — this is the last integrity check when skip_ed25519 is true)
     let hash = verify_sha256(&binary_data, expected_sha256)?;
     info!("UPDATE: SHA-256 checksum verified ✓");
 
-    // 3. Download Ed25519 signature
-    let sig_data = download_signature(client, signature_url)?;
+    if skip_ed25519 {
+        warn!("UPDATE: Ed25519 verification SKIPPED (force-update mode, no signing key compiled in)");
+    } else {
+        // 3. Download Ed25519 signature
+        let sig_data = download_signature(client, signature_url)?;
 
-    // 4. Verify Ed25519 signature
-    verify_ed25519(&hash, &sig_data)?;
-    info!("UPDATE: Ed25519 signature verified ✓");
+        // 4. Verify Ed25519 signature
+        verify_ed25519(&hash, &sig_data)?;
+        info!("UPDATE: Ed25519 signature verified ✓");
+    }
 
     // 5. Write staged binary
     fs::write(STAGED_BINARY, &binary_data).context("Failed to write staged binary")?;
@@ -526,6 +545,7 @@ pub fn check_github_for_update() -> Result<bool> {
         &sig_asset.browser_download_url,
         &expected_sha256,
         &latest_version,
+        false,
     )?;
 
     Ok(true)
@@ -606,6 +626,95 @@ pub fn run_manual_update() -> Result<()> {
     reload_service_if_active()?;
 
     println!("\n✓ Updated to v{}", latest_version);
+    Ok(())
+}
+
+/// Force-apply the latest GitHub release, bypassing the Ed25519 signing-key guard.
+///
+/// Use this to bootstrap agents compiled without `CONNLOG_SIGNING_PUBLIC_KEY`.
+/// SHA-256 integrity is still verified. Requires root.
+pub fn run_force_update() -> Result<()> {
+    let current_version = env!("CARGO_PKG_VERSION");
+    println!("ConnLog Agent v{} (force-update mode)", current_version);
+    println!();
+    println!("WARNING: Ed25519 signature verification will be SKIPPED.");
+    println!("         SHA-256 integrity check is still performed.");
+    println!("         Only use this on a trusted network to recover agents");
+    println!("         that were built without a compiled-in signing key.");
+    println!();
+    println!("Checking for updates...");
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .user_agent("connlog-agent")
+        .build()
+        .context("Failed to create HTTP client")?;
+
+    let (latest_version, release) = match fetch_github_release_if_newer(&client)? {
+        Some(r) => r,
+        None => {
+            println!("Already up to date (or latest release is a draft/prerelease).");
+            return Ok(());
+        }
+    };
+
+    println!("Latest version: v{}", latest_version);
+    println!(
+        "Update available: v{} → v{}",
+        current_version, latest_version
+    );
+
+    let (binary_name, sig_name, sha256_name) = asset_names(&release.tag_name);
+    // sha256 is mandatory; sig is optional in force mode
+    let sha256_asset = release
+        .assets
+        .iter()
+        .find(|a| a.name == sha256_name)
+        .ok_or_else(|| anyhow::anyhow!("No checksum file ({}) found in release", sha256_name))?;
+    let binary_asset = release
+        .assets
+        .iter()
+        .find(|a| a.name == binary_name)
+        .ok_or_else(|| anyhow::anyhow!("No binary found for {} in release", binary_name))?;
+    // Signature is best-effort — we warn if absent but proceed
+    let sig_asset = release.assets.iter().find(|a| a.name == sig_name);
+
+    println!("Downloading {}...", binary_name);
+
+    let dl_client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .user_agent("connlog-agent")
+        .build()
+        .context("Failed to create download client")?;
+
+    let binary_data = download_binary(&dl_client, &binary_asset.browser_download_url)?;
+    println!("Downloaded {} bytes", binary_data.len());
+
+    let expected_sha256 = download_sha256(&dl_client, &sha256_asset.browser_download_url)?;
+    let hash = verify_sha256(&binary_data, &expected_sha256)?;
+    println!("SHA-256 verified ✓");
+
+    if has_signing_key() {
+        // If the key is compiled in, do the full verification anyway
+        if let Some(sig) = sig_asset {
+            let sig_data = download_signature(&dl_client, &sig.browser_download_url)?;
+            verify_ed25519(&hash, &sig_data)?;
+            println!("Ed25519 signature verified ✓");
+        } else {
+            println!("WARNING: No .sig file in release — Ed25519 skipped (no sig asset).");
+        }
+    } else {
+        println!("WARNING: Ed25519 SKIPPED — no signing key compiled into this build.");
+    }
+
+    atomic_replace(&binary_data, INSTALLED_BINARY)?;
+    println!("Binary replaced at {}", INSTALLED_BINARY);
+
+    reload_service_if_active()?;
+
+    println!("\n✓ Force-updated to v{}", latest_version);
+    println!("  The new binary has the signing key compiled in.");
+    println!("  Future updates will be automatic.");
     Ok(())
 }
 

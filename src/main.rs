@@ -57,6 +57,11 @@ fn main() -> Result<()> {
         return update::run_manual_update();
     }
 
+    // Handle force update (bypasses Ed25519 signing-key check)
+    if config.force_update {
+        return update::run_force_update();
+    }
+
     // Handle uninstallation
     if config.uninstall {
         return install::uninstall();
@@ -192,7 +197,7 @@ fn run_agent(token: String, endpoint: String) -> Result<()> {
                         update_info.signature_url.is_some(),
                         update_info.sha256.is_some(),
                     );
-                    match update::try_apply_update(update_info) {
+                    match update::try_apply_update(update_info, update_info.force_update) {
                         Ok(true) => {
                             info!(
                                 "Update to v{} staged successfully. Restarting for update...",

@@ -49,6 +49,10 @@ pub struct UpdateInfo {
     /// Expected SHA-256 hex digest of the binary
     #[serde(default)]
     pub sha256: Option<String>,
+    /// When true, bypass the compiled-in signing-key check for this update.
+    /// Set by the platform when a workspace owner explicitly requests a force update.
+    #[serde(default)]
+    pub force_update: bool,
 }
 
 /// Server-authoritative agent configuration.

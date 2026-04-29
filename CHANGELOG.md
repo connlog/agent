@@ -8,6 +8,37 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-04-29
+
+### Added
+
+- **Force-update mode** for bootstrapping agents that were compiled without a
+  `CONNLOG_SIGNING_PUBLIC_KEY`. Two entry points:
+  - **`--force-update` CLI flag** (`sudo connlog-agent --force-update`) —
+    fetches the latest GitHub release, verifies its SHA-256, and atomically
+    replaces the installed binary while skipping Ed25519 verification. Useful
+    for self-recovery on a single host.
+  - **Platform-driven force-update** — the heartbeat response may now carry
+    `update.forceUpdate: true`. When set, the agent applies the update on the
+    next heartbeat cycle even if no signing key is compiled in. The flag is
+    one-shot: the platform clears `pendingForceUpdate` once the request has
+    been delivered. SHA-256 integrity is always verified — only the Ed25519
+    check is bypassed, and only when explicitly authorised by the workspace.
+
+### Changed
+
+- `update::try_apply_update` now takes an explicit `force: bool` argument so
+  call sites are forced to opt in to the bypass; the GitHub-poll path
+  (`check_github_for_update`) always passes `false`.
+- `stage_verified_update` gained a `skip_ed25519` parameter; when `true` the
+  signature download and verification are skipped and a prominent warning is
+  logged.
+
+### Wire contract
+
+- `UpdateInfo` (heartbeat → agent) gains an optional `forceUpdate: bool` field.
+  Defaults to `false` and is backward-compatible with older platforms.
+
 ## [1.0.1] — 2026-04-29
 
 ### Changed
