@@ -13,6 +13,10 @@ pub enum ApiError {
     Unauthorized,
     /// Agent has been marked for uninstall (410 Gone)
     Decommissioned,
+    /// Agent is currently disabled in ConnLog (423 Locked).
+    /// Reversible: the agent should back off heartbeats and keep polling
+    /// `/api/agents/config` infrequently. Do NOT self-uninstall.
+    Disabled,
     /// Other HTTP error
     HttpError { status: u16, message: String },
     /// Network or other error
@@ -24,6 +28,7 @@ impl std::fmt::Display for ApiError {
         match self {
             ApiError::Unauthorized => write!(f, "Unauthorized (invalid token)"),
             ApiError::Decommissioned => write!(f, "Agent has been decommissioned"),
+            ApiError::Disabled => write!(f, "Agent is disabled in ConnLog"),
             ApiError::HttpError { status, message } => write!(f, "HTTP {} - {}", status, message),
             ApiError::Other(e) => write!(f, "{}", e),
         }
@@ -145,6 +150,10 @@ impl ApiClient {
             return Err(ApiError::Decommissioned);
         }
 
+        if status == StatusCode::LOCKED {
+            return Err(ApiError::Disabled);
+        }
+
         if !status.is_success() {
             let error_text = response
                 .text()
@@ -196,6 +205,10 @@ impl ApiClient {
 
         if status == StatusCode::GONE {
             return Err(ApiError::Decommissioned);
+        }
+
+        if status == StatusCode::LOCKED {
+            return Err(ApiError::Disabled);
         }
 
         if !status.is_success() {

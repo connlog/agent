@@ -278,6 +278,25 @@ fn run_agent(token: String, endpoint: String) -> Result<()> {
                 trigger_self_uninstall("Agent was decommissioned by the server");
                 return Ok(());
             }
+            Err(ApiError::Disabled) => {
+                // 423 Locked: the agent has been DISABLED in ConnLog.
+                // This is reversible — the user (or downgrade flow) can re-enable
+                // the agent at any time. We must NOT self-uninstall, must NOT
+                // touch the install on disk, and must NOT spam the server.
+                //
+                // Strategy: long fixed backoff (5 min) regardless of the
+                // configured heartbeat interval, until the server starts
+                // accepting heartbeats again. We also reset the unauthorized
+                // counter so re-enable doesn't immediately trip self-uninstall.
+                consecutive_unauthorized = 0;
+                consecutive_errors = 0;
+                const DISABLED_BACKOFF_SECS: u64 = 300;
+                warn!(
+                    "Agent is disabled in ConnLog (423 Locked). Backing off for {}s before checking again. Re-enable from the dashboard.",
+                    DISABLED_BACKOFF_SECS
+                );
+                thread::sleep(Duration::from_secs(DISABLED_BACKOFF_SECS));
+            }
             Err(e) => {
                 consecutive_errors += 1;
                 // Exponential backoff: 30, 60, 120, 240, ... capped at 3600s
