@@ -11,16 +11,29 @@ env:
 jobs:
   build:
     name: Build ${{ matrix.target }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
             os: linux
             arch: x86_64
+            runner: ubuntu-latest
+            ext: ''
+            use_cross: true
           - target: aarch64-unknown-linux-musl
             os: linux
             arch: aarch64
+            runner: ubuntu-latest
+            ext: ''
+            use_cross: true
+          - target: x86_64-pc-windows-msvc
+            os: windows
+            arch: x86_64
+            runner: windows-latest
+            ext: '.exe'
+            use_cross: false
 
     steps:
       - name: Checkout code
@@ -32,23 +45,25 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install cross-compilation tools
+        if: matrix.use_cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Build release binary
+      - name: Build release binary (Linux, cross)
+        if: matrix.use_cross
         env:
-          # Compile the Ed25519 public key into the binary so agents can
-          # verify update signatures. The matching private key is only
-          # used in the sign-and-release job below.
           CONNLOG_SIGNING_PUBLIC_KEY: ${{ secrets.CONNLOG_SIGNING_PUBLIC_KEY }}
-          # Belt-and-suspenders: Cross.toml has passthrough, but also
-          # explicitly forward the env var via Docker --env flag in case
-          # the Cross.toml passthrough doesn't work with this cross version.
           CROSS_CONTAINER_OPTS: "--env CONNLOG_SIGNING_PUBLIC_KEY"
-        run: |
-          cross build --release --target ${{ matrix.target }}
-          # Note: Release builds connect only to https://connlog.com (no --endpoint flag)
+        run: cross build --release --target ${{ matrix.target }}
 
-      - name: Package binary
+      - name: Build release binary (Windows, native)
+        if: ${{ !matrix.use_cross }}
+        shell: pwsh
+        env:
+          CONNLOG_SIGNING_PUBLIC_KEY: ${{ secrets.CONNLOG_SIGNING_PUBLIC_KEY }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package binary (Linux)
+        if: matrix.os == 'linux'
         run: |
           VERSION="${{ github.ref_name }}"
           OS="${{ matrix.os }}"
@@ -57,15 +72,36 @@ jobs:
 
           cd target/$TARGET/release
 
-          # Tarball + checksum for install.sh
           TAR="connlog-agent-${VERSION}-${OS}-${ARCH}.tar.gz"
           tar -czf "$TAR" connlog-agent
           sha256sum "$TAR" > "${TAR}.sha256"
 
-          # Also keep the raw binary available for auto-update signing
+          # Raw binary used by the auto-update path.
           cp connlog-agent "connlog-agent-${VERSION}-${OS}-${ARCH}"
 
-      - name: Upload artifacts
+      - name: Package binary (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}"
+          $arch    = "${{ matrix.arch }}"
+          $target  = "${{ matrix.target }}"
+          $base    = "connlog-agent-$version-windows-$arch"
+
+          Set-Location "target\$target\release"
+
+          # Raw .exe used by the auto-update path. Auto-update verifies via
+          # Ed25519 + SHA-256 (Authenticode signing is a separate, optional
+          # step — see WINDOWS.md).
+          Copy-Item connlog-agent.exe "$base.exe"
+
+          # SHA-256 checksum in sha256sum(1)-compatible format so the agent
+          # parser handles Linux + Windows artefacts identically.
+          $hash = (Get-FileHash "$base.exe" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $base.exe`n" | Out-File -Encoding ascii -NoNewline "$base.exe.sha256"
+
+      - name: Upload artifacts (Linux)
+        if: matrix.os == 'linux'
         uses: actions/upload-artifact@v4
         with:
           name: connlog-agent-${{ matrix.os }}-${{ matrix.arch }}
@@ -73,6 +109,15 @@ jobs:
             target/${{ matrix.target }}/release/connlog-agent-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
             target/${{ matrix.target }}/release/connlog-agent-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz.sha256
             target/${{ matrix.target }}/release/connlog-agent-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}
+
+      - name: Upload artifacts (Windows)
+        if: matrix.os == 'windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: connlog-agent-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            target/${{ matrix.target }}/release/connlog-agent-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}.exe
+            target/${{ matrix.target }}/release/connlog-agent-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}.exe.sha256
 
   # ── Sign & Publish ──────────────────────────────────────────
   # This job runs in the protected "release" environment.

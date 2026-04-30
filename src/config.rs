@@ -30,6 +30,11 @@ pub struct Config {
     #[arg(long = "emit-service", hide = true)]
     pub emit_service: bool,
 
+    /// Internal: process was launched by the Windows SCM. Hand off to the
+    /// service dispatcher instead of running interactively.
+    #[arg(long = "run-service", hide = true)]
+    pub run_service: bool,
+
     #[cfg(debug_assertions)]
     /// Custom platform endpoint (debug builds only)
     #[arg(
@@ -50,6 +55,7 @@ impl fmt::Debug for Config {
             .field("status", &self.status)
             .field("update", &self.update)
             .field("emit_service", &self.emit_service)
+            .field("run_service", &self.run_service)
             .finish()
     }
 }
@@ -58,6 +64,31 @@ impl Config {
     pub fn get_platform_url(&self) -> Option<String> {
         // Check environment variable set by systemd service
         std::env::var("CONNLOG_PLATFORM_URL").ok()
+    }
+
+    /// Build a Config out of band — used by the Windows service dispatcher
+    /// which loads the token from the DPAPI-encrypted on-disk config rather
+    /// than from CLI flags.
+    #[cfg(windows)]
+    pub fn for_service(token: String, platform_url: String) -> Self {
+        // Stash the URL in env so `get_platform_url()` finds it (keeps the
+        // existing endpoint-resolution code path unchanged).
+        // SAFETY: set_var is unsafe in std 1.78+ but we're early in the
+        // service start-up before any threads exist.
+        unsafe {
+            std::env::set_var("CONNLOG_PLATFORM_URL", &platform_url);
+        }
+        Self {
+            token: Some(token),
+            install: false,
+            uninstall: false,
+            status: false,
+            update: false,
+            emit_service: false,
+            run_service: true,
+            #[cfg(debug_assertions)]
+            endpoint: None,
+        }
     }
 }
 

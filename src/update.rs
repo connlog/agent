@@ -4,10 +4,12 @@ use ring::digest::{self, Digest};
 use ring::signature;
 use serde::Deserialize;
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
 use crate::heartbeat::UpdateInfo;
+use crate::platform::{INSTALLED_BINARY, STAGED_BINARY, UPDATE_MARKER};
 
 /// Ed25519 public key (hex) for verifying update signatures.
 ///
@@ -22,9 +24,6 @@ const SIGNING_PUBLIC_KEY_HEX: &str = match option_env!("CONNLOG_SIGNING_PUBLIC_K
 
 const PLACEHOLDER_KEY: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
-const STAGED_BINARY: &str = "/run/connlog/connlog-agent-new";
-const UPDATE_MARKER: &str = "/run/connlog/.update_requested";
-const INSTALLED_BINARY: &str = "/usr/local/bin/connlog-agent";
 const GITHUB_RELEASE_URL: &str =
     "https://api.github.com/repos/connlog/connlog-agent/releases/latest";
 
@@ -319,12 +318,15 @@ fn atomic_replace(data: &[u8], path: &str) -> Result<()> {
     fs::write(&tmp, data)
         .with_context(|| format!("Failed to write {}. Are you running as root?", tmp))?;
 
-    let mut perms = fs::metadata(&tmp)
-        .with_context(|| format!("Failed to read metadata for {}", tmp))?
-        .permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&tmp, perms)
-        .with_context(|| format!("Failed to set permissions on {}", tmp))?;
+    #[cfg(unix)]
+    {
+        let mut perms = fs::metadata(&tmp)
+            .with_context(|| format!("Failed to read metadata for {}", tmp))?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&tmp, perms)
+            .with_context(|| format!("Failed to set permissions on {}", tmp))?;
+    }
 
     fs::rename(&tmp, path).with_context(|| format!("Failed to rename {} → {}", tmp, path))?;
 
@@ -358,7 +360,9 @@ fn stage_verified_update(
     info!("UPDATE: SHA-256 checksum verified ✓");
 
     if skip_ed25519 {
-        warn!("UPDATE: Ed25519 verification SKIPPED (force-update mode, no signing key compiled in)");
+        warn!(
+            "UPDATE: Ed25519 verification SKIPPED (force-update mode, no signing key compiled in)"
+        );
     } else {
         // 3. Download Ed25519 signature
         let sig_data = download_signature(client, signature_url)?;
@@ -371,11 +375,15 @@ fn stage_verified_update(
     // 5. Write staged binary
     fs::write(STAGED_BINARY, &binary_data).context("Failed to write staged binary")?;
 
-    let mut perms = fs::metadata(STAGED_BINARY)
-        .context("Failed to read staged binary metadata")?
-        .permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(STAGED_BINARY, perms).context("Failed to set staged binary permissions")?;
+    #[cfg(unix)]
+    {
+        let mut perms = fs::metadata(STAGED_BINARY)
+            .context("Failed to read staged binary metadata")?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(STAGED_BINARY, perms)
+            .context("Failed to set staged binary permissions")?;
+    }
 
     // 6. Write update marker
     let marker = format!("version={}\n", version);
@@ -383,7 +391,7 @@ fn stage_verified_update(
 
     info!(
         "UPDATE: Binary staged at {} and marker written. \
-         Exiting for systemd ExecStopPost to complete the update.",
+         Exiting for supervisor to complete the update.",
         STAGED_BINARY
     );
 

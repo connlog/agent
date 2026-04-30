@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use log::{error, info, warn};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -9,7 +11,12 @@ mod heartbeat;
 mod http;
 mod install;
 mod metrics;
+mod platform;
+mod service;
 mod update;
+
+#[cfg(test)]
+mod simulation;
 
 use config::Config;
 use heartbeat::{AgentConfig, HeartbeatPayload};
@@ -39,9 +46,21 @@ const MAX_CONFIG_FETCH_RETRIES: u32 = 3;
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    // Windows SCM dispatch — must happen BEFORE anything that touches stdio
+    // assuming a console session. The SCM launches the binary with
+    // `--run-service` (see install/windows.rs); detecting it via raw argv lets
+    // us hand off without parsing the rest of the CLI.
+    #[cfg(windows)]
+    {
+        let raw_args: Vec<String> = std::env::args().collect();
+        if service::is_service_invocation(&raw_args) {
+            return service::run_service();
+        }
+    }
+
     let config = Config::parse();
 
-    // Handle --emit-service (used by ExecStopPost during self-update)
+    // Handle --emit-service (used by ExecStopPost during self-update on Linux)
     if config.emit_service {
         print!("{}", install::SYSTEMD_SERVICE);
         return Ok(());
@@ -90,10 +109,40 @@ fn main() -> Result<()> {
         .get_platform_url()
         .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
 
-    run_agent(token, endpoint)
+    // Interactive run — no shutdown signal, loop forever. The service path
+    // (Windows) builds its own AtomicBool and calls `run_agent_with_shutdown`
+    // directly.
+    run_agent_with_shutdown_inner(token, endpoint, Arc::new(AtomicBool::new(false)))
 }
 
-fn run_agent(token: String, endpoint: String) -> Result<()> {
+/// Public entry used by the Windows service dispatcher. Builds an endpoint
+/// from the same Config-driven precedence as the interactive path.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn run_agent_with_shutdown(cfg: Config, stop: Arc<AtomicBool>) -> Result<()> {
+    let token = cfg
+        .token
+        .clone()
+        .context("Token missing in service config (corrupt agent.conf?)")?;
+
+    #[cfg(debug_assertions)]
+    let endpoint = cfg
+        .endpoint
+        .clone()
+        .or_else(|| cfg.get_platform_url())
+        .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
+    #[cfg(not(debug_assertions))]
+    let endpoint = cfg
+        .get_platform_url()
+        .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
+
+    run_agent_with_shutdown_inner(token, endpoint, stop)
+}
+
+fn run_agent_with_shutdown_inner(
+    token: String,
+    endpoint: String,
+    stop: Arc<AtomicBool>,
+) -> Result<()> {
     info!("ConnLog Agent v{} starting", AGENT_VERSION);
 
     #[cfg(debug_assertions)]
@@ -148,8 +197,27 @@ fn run_agent(token: String, endpoint: String) -> Result<()> {
     // the signed hash against its compiled-in public key, so the platform
     // proxy is untrusted by design.
 
+    // Cooperative sleep helper: returns Err(()) if shutdown was requested
+    // mid-sleep, otherwise Ok(()). Sleeps in 500 ms ticks so a Windows STOP
+    // is observed in <1 s even with a long heartbeat interval.
+    let stop_for_sleep = Arc::clone(&stop);
+    let interruptible_sleep = move |total_secs: u64| -> Result<(), ()> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(total_secs);
+        while std::time::Instant::now() < deadline {
+            if stop_for_sleep.load(Ordering::SeqCst) {
+                return Err(());
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+        Ok(())
+    };
+
     // Main loop
     loop {
+        if stop.load(Ordering::SeqCst) {
+            info!("Shutdown requested (service stop) — exiting agent loop");
+            return Ok(());
+        }
         match send_heartbeat(&client, &config, &mut collector) {
             Ok(response) => {
                 // Reset error counters on success
@@ -244,7 +312,9 @@ fn run_agent(token: String, endpoint: String) -> Result<()> {
                     "Heartbeat sent successfully, next in {}s",
                     config.heartbeat_interval_secs
                 );
-                thread::sleep(Duration::from_secs(config.heartbeat_interval_secs));
+                if interruptible_sleep(config.heartbeat_interval_secs).is_err() {
+                    return Ok(());
+                }
             }
             Err(ApiError::Unauthorized) => {
                 consecutive_unauthorized += 1;
@@ -271,7 +341,9 @@ fn run_agent(token: String, endpoint: String) -> Result<()> {
                 // platform glitch. At the cap, 50 attempts ≈ 95 minutes total
                 // before self-uninstall.
                 let backoff = std::cmp::min(30 + 10 * consecutive_unauthorized as u64, 120);
-                thread::sleep(Duration::from_secs(backoff));
+                if interruptible_sleep(backoff).is_err() {
+                    return Ok(());
+                }
             }
             Err(ApiError::Decommissioned) => {
                 warn!("Agent has been decommissioned (410 Gone). Self-uninstalling...");
@@ -295,7 +367,9 @@ fn run_agent(token: String, endpoint: String) -> Result<()> {
                     "Agent is disabled in ConnLog (423 Locked). Backing off for {}s before checking again. Re-enable from the dashboard.",
                     DISABLED_BACKOFF_SECS
                 );
-                thread::sleep(Duration::from_secs(DISABLED_BACKOFF_SECS));
+                if interruptible_sleep(DISABLED_BACKOFF_SECS).is_err() {
+                    return Ok(());
+                }
             }
             Err(e) => {
                 consecutive_errors += 1;
@@ -305,7 +379,9 @@ fn run_agent(token: String, endpoint: String) -> Result<()> {
                     3600,
                 );
                 error!("Heartbeat failed: {} (retry in {}s)", e, backoff);
-                thread::sleep(Duration::from_secs(backoff));
+                if interruptible_sleep(backoff).is_err() {
+                    return Ok(());
+                }
             }
         }
     }
@@ -375,37 +451,46 @@ fn log_config_change(old: &AgentConfig, new: &AgentConfig) {
 fn trigger_self_uninstall(reason: &str) {
     error!("UNINSTALL: {}", reason);
 
-    // Check if we're running as a systemd service
-    let is_systemd = std::env::var("INVOCATION_ID").is_ok();
+    // Linux: prefer the marker-file path so systemd's ExecStopPost can do the
+    // actual root-only cleanup. Windows: write the marker too — the install
+    // flow's recovery action will spawn the elevated cleanup helper. In both
+    // cases, fall back to a direct in-process uninstall if the marker write
+    // fails (only succeeds when we're running with privilege).
+    #[cfg(unix)]
+    let is_supervised = std::env::var("INVOCATION_ID").is_ok();
+    #[cfg(windows)]
+    let is_supervised = true; // Windows agent always runs as a service
 
-    if is_systemd {
-        info!("UNINSTALL: Running as systemd service - writing uninstall marker");
-
-        // Write uninstall marker file - ExecStopPost will detect this
-        match std::fs::write("/run/connlog/.uninstall_requested", reason) {
+    if is_supervised {
+        info!("UNINSTALL: Running under supervisor — writing uninstall marker");
+        match std::fs::write(platform::UNINSTALL_MARKER, reason) {
             Ok(_) => {
-                info!("UNINSTALL: Marker written to /run/connlog/.uninstall_requested");
-                info!("UNINSTALL: Exiting process. systemd ExecStopPost will complete cleanup.");
+                info!(
+                    "UNINSTALL: Marker written to {}",
+                    platform::UNINSTALL_MARKER
+                );
+                info!("UNINSTALL: Exiting process. Supervisor will complete cleanup.");
             }
             Err(e) => {
                 error!(
                     "UNINSTALL: Failed to write marker file: {}. Attempting direct uninstall.",
                     e
                 );
-                // Fallback: try direct uninstall (may fail without privileges)
                 if let Err(e) = install::uninstall() {
                     error!("UNINSTALL: Direct uninstall also failed: {}", e);
                 }
             }
         }
     } else {
-        info!("UNINSTALL: Not running as systemd service - performing direct uninstall");
+        info!("UNINSTALL: No supervisor detected — performing direct uninstall");
         if let Err(e) = install::uninstall() {
             error!("UNINSTALL: Direct uninstall failed: {}", e);
         }
     }
 
-    // Exit cleanly - Restart=on-failure means systemd will NOT restart us
+    // Exit cleanly — supervisor's restart policy is configured to NOT restart
+    // us after a clean exit (Restart=on-failure on systemd, no auto-restart
+    // after delete on Windows once the marker is processed).
     std::process::exit(0);
 }
 

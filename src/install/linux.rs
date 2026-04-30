@@ -4,7 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
-pub(crate) const SYSTEMD_SERVICE: &str = r#"[Unit]
+pub const SYSTEMD_SERVICE: &str = r#"[Unit]
 Description=ConnLog Monitoring Agent
 After=network-online.target
 Wants=network-online.target

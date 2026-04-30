@@ -128,15 +128,24 @@ impl MetricsCollector {
 
                 // Skip snap loop mounts on Linux — they're packaged apps, not
                 // user storage, and inflate totals dramatically.
+                #[cfg(target_os = "linux")]
                 if mount.starts_with("/snap/") || mount.starts_with("/var/snap/") {
                     continue;
                 }
                 // Skip docker/overlay/container scratch dirs that occasionally
                 // show up as named devices.
+                #[cfg(unix)]
                 if mount.starts_with("/var/lib/docker/")
                     || mount.starts_with("/var/lib/containers/")
                     || mount.starts_with("/run/")
                 {
+                    continue;
+                }
+                // Skip Windows network (UNC) shares — those are remote
+                // storage, not local capacity. Local fixed drives mount as
+                // letters (e.g. `C:\`).
+                #[cfg(windows)]
+                if mount.starts_with(r"\\") {
                     continue;
                 }
 
