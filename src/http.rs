@@ -46,6 +46,10 @@ pub struct ApiClient {
     base_url: String,
     token: String,
     use_binary: bool,
+    /// SHA-256 hash of the host's stable machine identifier. `None` when no
+    /// source is available (e.g. an unsupported OS); platform falls back to
+    /// hostname binding in that case.
+    machine_id: Option<String>,
 }
 
 impl ApiClient {
@@ -67,6 +71,7 @@ impl ApiClient {
             base_url,
             token,
             use_binary: true, // Protocol v2 by default
+            machine_id: crate::identity::machine_id(),
         })
     }
 
@@ -124,6 +129,13 @@ impl ApiClient {
             HeaderValue::from_str(&payload.arch).context("Failed to create arch header")?,
         );
 
+        if let Some(mid) = &self.machine_id {
+            headers.insert(
+                "X-Machine-Id",
+                HeaderValue::from_str(mid).context("Failed to create machine-id header")?,
+            );
+        }
+
         // SECURITY: Never log the token
         let auth_value = format!("Bearer {}", self.token);
         headers.insert(
@@ -180,6 +192,13 @@ impl ApiClient {
 
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        if let Some(mid) = &self.machine_id {
+            headers.insert(
+                "X-Machine-Id",
+                HeaderValue::from_str(mid).context("Failed to create machine-id header")?,
+            );
+        }
 
         // SECURITY: Never log the token
         let auth_value = format!("Bearer {}", self.token);

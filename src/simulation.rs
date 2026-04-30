@@ -215,6 +215,21 @@ fn heartbeat_200_parses_response() {
     assert_eq!(req.header("X-Arch"), Some("x86_64"));
     assert_eq!(req.header("Content-Type"), Some("application/octet-stream"));
 
+    // X-Machine-Id is sent whenever the agent could read a stable ID. CI
+    // runners always have /etc/machine-id (Linux) or a MachineGuid (Windows),
+    // so we expect a 64-char lowercase hex hash here. If we ever run this
+    // test on a host without one we'd want to know — assert presence + shape.
+    let machine_id = req
+        .header("X-Machine-Id")
+        .expect("X-Machine-Id header must be present on supported OS");
+    assert_eq!(machine_id.len(), 64, "machine-id must be sha256 hex");
+    assert!(
+        machine_id
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+        "machine-id must be lowercase hex"
+    );
+
     // Binary frame is 32 bytes exactly (protocol v2).
     assert_eq!(req.body.len(), 32, "v2 wire frame must be exactly 32 bytes");
 }

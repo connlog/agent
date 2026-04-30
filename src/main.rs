@@ -9,6 +9,7 @@ use std::time::Duration;
 mod config;
 mod heartbeat;
 mod http;
+mod identity;
 mod install;
 mod metrics;
 mod platform;
