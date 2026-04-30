@@ -66,6 +66,26 @@ impl Config {
         std::env::var("CONNLOG_PLATFORM_URL").ok()
     }
 
+    /// Resolve the platform endpoint using the same precedence on every code
+    /// path (interactive run + Windows service dispatcher):
+    ///   1. `--endpoint` CLI flag (debug builds only)
+    ///   2. `CONNLOG_PLATFORM_URL` env (set by systemd / DPAPI config)
+    ///   3. `default` (the compiled-in `DEFAULT_ENDPOINT`)
+    pub fn resolve_endpoint(&self, default: &str) -> String {
+        #[cfg(debug_assertions)]
+        {
+            self.endpoint
+                .clone()
+                .or_else(|| self.get_platform_url())
+                .unwrap_or_else(|| default.to_string())
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            self.get_platform_url()
+                .unwrap_or_else(|| default.to_string())
+        }
+    }
+
     /// Build a Config out of band — used by the Windows service dispatcher
     /// which loads the token from the DPAPI-encrypted on-disk config rather
     /// than from CLI flags.

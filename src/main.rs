@@ -96,18 +96,7 @@ fn main() -> Result<()> {
         .clone()
         .context("Token is required. Use --token or set CONNLOG_TOKEN environment variable.")?;
 
-    // Determine endpoint
-    #[cfg(debug_assertions)]
-    let endpoint = config
-        .endpoint
-        .clone()
-        .or_else(|| config.get_platform_url())
-        .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
-
-    #[cfg(not(debug_assertions))]
-    let endpoint = config
-        .get_platform_url()
-        .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
+    let endpoint = config.resolve_endpoint(DEFAULT_ENDPOINT);
 
     // Interactive run — no shutdown signal, loop forever. The service path
     // (Windows) builds its own AtomicBool and calls `run_agent_with_shutdown`
@@ -123,18 +112,7 @@ pub(crate) fn run_agent_with_shutdown(cfg: Config, stop: Arc<AtomicBool>) -> Res
         .token
         .clone()
         .context("Token missing in service config (corrupt agent.conf?)")?;
-
-    #[cfg(debug_assertions)]
-    let endpoint = cfg
-        .endpoint
-        .clone()
-        .or_else(|| cfg.get_platform_url())
-        .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
-    #[cfg(not(debug_assertions))]
-    let endpoint = cfg
-        .get_platform_url()
-        .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
-
+    let endpoint = cfg.resolve_endpoint(DEFAULT_ENDPOINT);
     run_agent_with_shutdown_inner(token, endpoint, stop)
 }
 

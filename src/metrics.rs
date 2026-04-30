@@ -42,16 +42,10 @@ impl MetricsCollector {
             .to_string_lossy()
             .to_string();
 
-        let os = if cfg!(target_os = "linux") {
-            "linux"
-        } else if cfg!(target_os = "macos") {
-            "macos"
-        } else if cfg!(target_os = "windows") {
-            "windows"
-        } else {
-            "unknown"
-        }
-        .to_string();
+        // `std::env::consts::OS` returns the lowercase target OS string
+        // ("linux" / "windows" / "macos" / ...) at compile time — exactly the
+        // values the platform expects in the `X-OS` heartbeat header.
+        let os = std::env::consts::OS.to_string();
 
         let arch = std::env::consts::ARCH.to_string();
 

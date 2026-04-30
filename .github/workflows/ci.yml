@@ -1,0 +1,62 @@
+name: CI
+
+# Validates pushes to canary/main and all PRs. The release workflow only runs
+# on tag push, so without this we'd discover Windows compile failures only
+# after tagging — which would leave a half-published GitHub release.
+
+on:
+  push:
+    branches: [canary, main]
+  pull_request:
+    branches: [canary, main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  fmt-clippy-test:
+    name: ${{ matrix.os }} / fmt + clippy + test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            runner: ubuntu-latest
+          - os: windows
+            runner: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ matrix.os }}-cargo-
+
+      - name: cargo fmt --check
+        # Run on Linux only; rustfmt output is platform-independent and re-running
+        # it on Windows just doubles the wall time.
+        if: matrix.os == 'linux'
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --all-targets
+
+      - name: cargo build --release
+        run: cargo build --release
