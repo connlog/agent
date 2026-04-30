@@ -370,7 +370,7 @@ pub(crate) fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>> {
         CryptProtectData, CRYPTPROTECT_LOCAL_MACHINE, CRYPT_INTEGER_BLOB,
     };
 
-    let mut input = CRYPT_INTEGER_BLOB {
+    let input = CRYPT_INTEGER_BLOB {
         cbData: data.len() as u32,
         pbData: data.as_ptr() as *mut u8,
     };
@@ -381,7 +381,7 @@ pub(crate) fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>> {
 
     let ok = unsafe {
         CryptProtectData(
-            &mut input,
+            &input,
             std::ptr::null(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -408,7 +408,7 @@ pub(crate) fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>> {
         CryptUnprotectData, CRYPTPROTECT_LOCAL_MACHINE, CRYPT_INTEGER_BLOB,
     };
 
-    let mut input = CRYPT_INTEGER_BLOB {
+    let input = CRYPT_INTEGER_BLOB {
         cbData: data.len() as u32,
         pbData: data.as_ptr() as *mut u8,
     };
@@ -419,7 +419,7 @@ pub(crate) fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>> {
 
     let ok = unsafe {
         CryptUnprotectData(
-            &mut input,
+            &input,
             std::ptr::null_mut(),
             std::ptr::null(),
             std::ptr::null_mut(),
@@ -442,7 +442,7 @@ pub(crate) fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>> {
 const B64_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 fn base64_encode(input: &[u8]) -> String {
-    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let b0 = chunk[0];
         let b1 = chunk.get(1).copied().unwrap_or(0);
@@ -471,7 +471,7 @@ pub(crate) fn base64_decode(input: &str) -> Result<Vec<u8>> {
     }
     let stripped: String = input.chars().filter(|c| !c.is_whitespace()).collect();
     let bytes = stripped.as_bytes();
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         anyhow::bail!("invalid base64 length");
     }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);

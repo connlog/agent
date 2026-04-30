@@ -6,7 +6,7 @@
 //!   - Config:        C:\ProgramData\ConnLog\Agent\agent.conf
 //!   - Logs:          C:\ProgramData\ConnLog\Agent\logs\
 //!   - Markers:       C:\ProgramData\ConnLog\Agent\.update_requested
-//!                    C:\ProgramData\ConnLog\Agent\.uninstall_requested
+//!     and            C:\ProgramData\ConnLog\Agent\.uninstall_requested
 //!
 //! `C:\Program Files` is the conventional read-only location for installed
 //! binaries; `C:\ProgramData` is the writable per-machine application data
