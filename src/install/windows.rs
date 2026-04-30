@@ -367,14 +367,14 @@ fn schedule_delete_on_reboot(path: &str) {
 pub(crate) fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>> {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Cryptography::{
-        CryptProtectData, CRYPTOAPI_BLOB, CRYPTPROTECT_LOCAL_MACHINE,
+        CryptProtectData, CRYPT_INTEGER_BLOB, CRYPTPROTECT_LOCAL_MACHINE,
     };
 
-    let mut input = CRYPTOAPI_BLOB {
+    let mut input = CRYPT_INTEGER_BLOB {
         cbData: data.len() as u32,
         pbData: data.as_ptr() as *mut u8,
     };
-    let mut output = CRYPTOAPI_BLOB {
+    let mut output = CRYPT_INTEGER_BLOB {
         cbData: 0,
         pbData: std::ptr::null_mut(),
     };
@@ -405,14 +405,14 @@ pub(crate) fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>> {
 pub(crate) fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>> {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Cryptography::{
-        CryptUnprotectData, CRYPTOAPI_BLOB, CRYPTPROTECT_LOCAL_MACHINE,
+        CryptUnprotectData, CRYPT_INTEGER_BLOB, CRYPTPROTECT_LOCAL_MACHINE,
     };
 
-    let mut input = CRYPTOAPI_BLOB {
+    let mut input = CRYPT_INTEGER_BLOB {
         cbData: data.len() as u32,
         pbData: data.as_ptr() as *mut u8,
     };
-    let mut output = CRYPTOAPI_BLOB {
+    let mut output = CRYPT_INTEGER_BLOB {
         cbData: 0,
         pbData: std::ptr::null_mut(),
     };

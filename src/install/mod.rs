@@ -8,8 +8,11 @@ mod linux;
 #[cfg(unix)]
 pub use linux::{install, status, uninstall, SYSTEMD_SERVICE};
 
+// `pub(crate)` so the Windows service module can reach the DPAPI helpers
+// (`dpapi_unprotect`, `base64_decode`) without us having to re-export every
+// internal symbol through this façade.
 #[cfg(windows)]
-mod windows;
+pub(crate) mod windows;
 #[cfg(windows)]
 pub use windows::{install, status, uninstall};
 
