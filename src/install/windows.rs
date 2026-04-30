@@ -367,7 +367,7 @@ fn schedule_delete_on_reboot(path: &str) {
 pub(crate) fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>> {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Cryptography::{
-        CryptProtectData, CRYPT_INTEGER_BLOB, CRYPTPROTECT_LOCAL_MACHINE,
+        CryptProtectData, CRYPTPROTECT_LOCAL_MACHINE, CRYPT_INTEGER_BLOB,
     };
 
     let mut input = CRYPT_INTEGER_BLOB {
@@ -405,7 +405,7 @@ pub(crate) fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>> {
 pub(crate) fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>> {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Cryptography::{
-        CryptUnprotectData, CRYPT_INTEGER_BLOB, CRYPTPROTECT_LOCAL_MACHINE,
+        CryptUnprotectData, CRYPTPROTECT_LOCAL_MACHINE, CRYPT_INTEGER_BLOB,
     };
 
     let mut input = CRYPT_INTEGER_BLOB {
