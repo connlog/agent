@@ -77,18 +77,84 @@ impl MetricsCollector {
         let memory_total_mb = self.sys.total_memory() / 1024 / 1024;
         let memory_used_mb = self.sys.used_memory() / 1024 / 1024;
 
-        // Aggregate all disks (sum of all mount points, avoiding double-counting)
+        // Aggregate all "real" disks. Linux mounts the same physical device
+        // under many paths (overlayfs, bind mounts, snap loop devices, docker
+        // layers, etc.) — naive summing double/triple counts space. We
+        // dedupe by device name and skip pseudo / virtual filesystems so the
+        // numbers match what `df -h` shows for actual storage.
         let (disk_total_mb, disk_used_mb) = {
+            use std::collections::HashSet;
             let mut total = 0u64;
             let mut used = 0u64;
+            let mut seen: HashSet<String> = HashSet::new();
+
             for disk in self.disks.list() {
+                let fs = disk.file_system().to_string_lossy().to_lowercase();
+                // Skip pseudo / virtual / overlay filesystems that don't
+                // represent real storage capacity.
+                if matches!(
+                    fs.as_str(),
+                    "tmpfs"
+                        | "devtmpfs"
+                        | "overlay"
+                        | "overlayfs"
+                        | "squashfs"
+                        | "proc"
+                        | "sysfs"
+                        | "cgroup"
+                        | "cgroup2"
+                        | "debugfs"
+                        | "tracefs"
+                        | "fusectl"
+                        | "ramfs"
+                        | "mqueue"
+                        | "pstore"
+                        | "autofs"
+                        | "binfmt_misc"
+                        | "configfs"
+                        | "hugetlbfs"
+                        | "nsfs"
+                        | "rpc_pipefs"
+                        | "selinuxfs"
+                        | "securityfs"
+                        | "bpf"
+                        | "iso9660"
+                ) {
+                    continue;
+                }
+
+                let name = disk.name().to_string_lossy().to_string();
+                let mount = disk.mount_point().to_string_lossy().to_string();
+
+                // Skip snap loop mounts on Linux — they're packaged apps, not
+                // user storage, and inflate totals dramatically.
+                if mount.starts_with("/snap/") || mount.starts_with("/var/snap/") {
+                    continue;
+                }
+                // Skip docker/overlay/container scratch dirs that occasionally
+                // show up as named devices.
+                if mount.starts_with("/var/lib/docker/")
+                    || mount.starts_with("/var/lib/containers/")
+                    || mount.starts_with("/run/")
+                {
+                    continue;
+                }
+
+                // Dedupe by device name (e.g. /dev/nvme0n1p2). Same physical
+                // device mounted at multiple paths = count only once.
+                let dedupe_key = if name.is_empty() { mount.clone() } else { name };
+                if !seen.insert(dedupe_key) {
+                    continue;
+                }
+
                 let dt = disk.total_space() / 1024 / 1024;
                 let da = disk.available_space() / 1024 / 1024;
                 total += dt;
                 used += dt.saturating_sub(da);
             }
+
             if total == 0 {
-                // Fallback: try first disk only
+                // Fallback: first disk only — better than reporting zero.
                 if let Some(disk) = self.disks.list().first() {
                     let t = disk.total_space() / 1024 / 1024;
                     let a = disk.available_space() / 1024 / 1024;
