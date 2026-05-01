@@ -26,6 +26,16 @@ pub struct Config {
     #[arg(long)]
     pub update: bool,
 
+    /// Diagnostic: fetch + print the agent config from the platform without
+    /// starting the heartbeat loop. Exits non-zero on auth/network failure.
+    #[arg(long = "check-config")]
+    pub check_config: bool,
+
+    /// Diagnostic: send exactly one heartbeat and print the platform's
+    /// response, then exit. Exits non-zero on auth/network failure.
+    #[arg(long = "test-heartbeat")]
+    pub test_heartbeat: bool,
+
     /// Print the embedded systemd service file and exit (used by self-updater)
     #[arg(long = "emit-service", hide = true)]
     pub emit_service: bool,
@@ -54,6 +64,8 @@ impl fmt::Debug for Config {
             .field("uninstall", &self.uninstall)
             .field("status", &self.status)
             .field("update", &self.update)
+            .field("check_config", &self.check_config)
+            .field("test_heartbeat", &self.test_heartbeat)
             .field("emit_service", &self.emit_service)
             .field("run_service", &self.run_service)
             .finish()
@@ -104,6 +116,8 @@ impl Config {
             uninstall: false,
             status: false,
             update: false,
+            check_config: false,
+            test_heartbeat: false,
             emit_service: false,
             run_service: true,
             #[cfg(debug_assertions)]

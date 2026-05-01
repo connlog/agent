@@ -77,6 +77,28 @@ fn main() -> Result<()> {
         return update::run_manual_update();
     }
 
+    // Diagnostic commands — both require a token but never start the heartbeat
+    // loop. They make running `connlog-agent --check-config` or
+    // `--test-heartbeat` from a shell a fast way to confirm an install before
+    // declaring it healthy.
+    if config.check_config {
+        let token = config
+            .token
+            .clone()
+            .context("Token required for --check-config")?;
+        let endpoint = config.resolve_endpoint(DEFAULT_ENDPOINT);
+        return run_check_config(token, endpoint);
+    }
+
+    if config.test_heartbeat {
+        let token = config
+            .token
+            .clone()
+            .context("Token required for --test-heartbeat")?;
+        let endpoint = config.resolve_endpoint(DEFAULT_ENDPOINT);
+        return run_test_heartbeat(token, endpoint);
+    }
+
     // Handle uninstallation
     if config.uninstall {
         return install::uninstall();
@@ -392,6 +414,77 @@ fn fetch_config_with_retry(client: &ApiClient) -> AgentConfig {
     AgentConfig::safe_fallback()
 }
 
+/// Diagnostic: fetch the agent config from the platform and print the parsed
+/// fields. Token comes from CLI/env; endpoint from `resolve_endpoint`. Never
+/// touches the heartbeat loop and never prints the token.
+fn run_check_config(token: String, endpoint: String) -> Result<()> {
+    if !token.starts_with("agent_") {
+        anyhow::bail!("Token does not start with 'agent_' — refusing to call platform");
+    }
+    let client = ApiClient::new(endpoint.clone(), token).context("ApiClient init failed")?;
+    println!("Endpoint: {endpoint}");
+    println!("Fetching /api/agents/config...");
+    let mut cfg = client
+        .fetch_config()
+        .context("Config fetch failed — check token, network, and platform URL")?;
+    cfg.clamp();
+    println!("✓ Config fetched");
+    println!("  version:                  {}", cfg.version);
+    println!(
+        "  heartbeat_interval_secs:  {}",
+        cfg.heartbeat_interval_secs
+    );
+    println!("  missed_threshold:         {}", cfg.missed_threshold);
+    println!(
+        "  metrics:                  cpu={} memory={} disk={} load={}",
+        cfg.metrics.cpu, cfg.metrics.memory, cfg.metrics.disk, cfg.metrics.load
+    );
+    Ok(())
+}
+
+/// Diagnostic: collect one metrics sample, send a single heartbeat, and print
+/// the platform's response. Useful as a smoke test after install or after a
+/// config change. Never enters the retry loop and never prints the token.
+fn run_test_heartbeat(token: String, endpoint: String) -> Result<()> {
+    if !token.starts_with("agent_") {
+        anyhow::bail!("Token does not start with 'agent_' — refusing to call platform");
+    }
+    let client = ApiClient::new(endpoint.clone(), token).context("ApiClient init failed")?;
+    let mut collector = MetricsCollector::new().context("Metrics collector init failed")?;
+    let mut cfg = match client.fetch_config() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Config fetch failed ({e}); using safe fallback for the test heartbeat");
+            AgentConfig::safe_fallback()
+        }
+    };
+    cfg.clamp();
+
+    println!("Endpoint: {endpoint}");
+    println!("Sending one heartbeat...");
+    match send_heartbeat(&client, &cfg, &mut collector) {
+        Ok(result) => {
+            println!("✓ Heartbeat accepted");
+            println!("  config_outdated:        {}", result.config_outdated);
+            if let Some(v) = result.latest_config_version {
+                println!("  latest_config_version:  {v}");
+            }
+            println!("  uninstall:              {}", result.uninstall);
+            match result.update {
+                Some(u) if u.available => {
+                    println!(
+                        "  update_available:       yes → {} (force={})",
+                        u.latest_version, u.force_update
+                    );
+                }
+                _ => println!("  update_available:       no"),
+            }
+            Ok(())
+        }
+        Err(e) => Err(anyhow::anyhow!("Heartbeat failed: {e}")),
+    }
+}
+
 /// Log config changes without exposing sensitive data
 fn log_config_change(old: &AgentConfig, new: &AgentConfig) {
     info!(
@@ -486,8 +579,24 @@ fn send_heartbeat(
     config: &AgentConfig,
     collector: &mut MetricsCollector,
 ) -> Result<HeartbeatResult, ApiError> {
-    // Collect system metrics using reusable collector
-    let metrics = collector.collect();
+    // Collect system metrics. Isolated against panics inside `sysinfo` —
+    // the heartbeat MUST keep going even if a metric source briefly explodes
+    // (issue #2 V1 hardening). On failure we log once and send zero metrics
+    // so the platform still records the agent as alive.
+    let metrics = match collector.collect() {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(
+                "Metrics collection failed ({e}); sending heartbeat with zero metrics so liveness still reaches the platform"
+            );
+            let (hostname, os, arch) = collector.identity();
+            let mut fallback = metrics::SystemMetrics::unavailable();
+            fallback.hostname = hostname.to_string();
+            fallback.os = os.to_string();
+            fallback.arch = arch.to_string();
+            fallback
+        }
+    };
 
     // Respect server-side metrics toggles
     let payload_metrics = if config.any_metrics_enabled() {

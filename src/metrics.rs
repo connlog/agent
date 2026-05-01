@@ -1,4 +1,5 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use std::panic::{self, AssertUnwindSafe};
 use sysinfo::{Disks, System};
 
 pub struct SystemMetrics {
@@ -14,6 +15,30 @@ pub struct SystemMetrics {
     pub load_1m: f64,
 }
 
+impl SystemMetrics {
+    /// Zero-valued sample used when [`MetricsCollector::collect`] fails.
+    ///
+    /// The heartbeat path falls back to this so the agent still reports
+    /// liveness when `sysinfo` panics or returns garbage. Identity fields stay
+    /// blank because the caller has the cached real values from
+    /// [`MetricsCollector`] — callers that build a heartbeat payload override
+    /// hostname/os/arch from the live collector.
+    pub fn unavailable() -> Self {
+        Self {
+            hostname: String::new(),
+            os: String::new(),
+            arch: String::new(),
+            uptime_seconds: 0,
+            cpu_percent: 0.0,
+            memory_used_mb: 0,
+            memory_total_mb: 0,
+            disk_used_mb: 0,
+            disk_total_mb: 0,
+            load_1m: 0.0,
+        }
+    }
+}
+
 /// Reusable collector that avoids re-allocating sysinfo structures.
 /// Call `new()` once at startup, then `collect()` on each sample interval.
 pub struct MetricsCollector {
@@ -26,6 +51,13 @@ pub struct MetricsCollector {
 }
 
 impl MetricsCollector {
+    /// Cached identity values (hostname, os, arch). Populated once at
+    /// construction and never mutated — safe to read on the fallback path
+    /// when [`Self::collect`] fails.
+    pub fn identity(&self) -> (&str, &str, &str) {
+        (&self.hostname, &self.os, &self.arch)
+    }
+
     /// Create a new collector. Performs a full initial refresh to populate CPU baseline.
     pub fn new() -> Result<Self> {
         let mut sys = System::new();
@@ -60,7 +92,29 @@ impl MetricsCollector {
 
     /// Collect current metrics. Only refreshes CPU, memory, and disks - NOT processes.
     /// This is ~10× cheaper than `System::new_all() + refresh_all()`.
-    pub fn collect(&mut self) -> SystemMetrics {
+    ///
+    /// Internally calls [`Self::collect_inner`] inside `catch_unwind`. A panic
+    /// from `sysinfo` (e.g. a syscall returning unexpected bytes on a quirky
+    /// kernel) MUST NOT crash the daemon — the heartbeat loop is the agent's
+    /// only job, and it has to keep beating even when metric collection is
+    /// momentarily broken. The caller decides what to send (zeros, last-known,
+    /// or skip-this-tick) based on the `Err`.
+    pub fn collect(&mut self) -> Result<SystemMetrics> {
+        // sysinfo's internal state isn't UnwindSafe, but a panic across the
+        // boundary doesn't logically poison anything we care about (CPU/mem
+        // refreshes are idempotent; the next tick re-refreshes from scratch).
+        // AssertUnwindSafe is the documented escape hatch for this case.
+        let result = panic::catch_unwind(AssertUnwindSafe(|| self.collect_inner()));
+        match result {
+            Ok(metrics) => Ok(metrics),
+            Err(payload) => {
+                let msg = panic_message(&payload);
+                Err(anyhow!("metrics collection panicked: {msg}"))
+            }
+        }
+    }
+
+    fn collect_inner(&mut self) -> SystemMetrics {
         // Targeted refresh - only what we need
         self.sys.refresh_cpu_all();
         self.sys.refresh_memory();
@@ -184,5 +238,60 @@ impl MetricsCollector {
             disk_total_mb,
             load_1m,
         }
+    }
+}
+
+/// Best-effort extraction of a panic payload's message.
+///
+/// `catch_unwind` returns the payload as `Box<dyn Any + Send>`. The two common
+/// shapes are `&'static str` (from `panic!("literal")`) and `String` (from
+/// `panic!("{}", val)`); anything else collapses to `"<non-string panic>"`.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic>".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collect_returns_ok_under_normal_conditions() {
+        let mut c = MetricsCollector::new().expect("collector init must work in tests");
+        let metrics = c
+            .collect()
+            .expect("collect must succeed in a healthy test env");
+        // Don't pin exact values — just sanity-check shape so a regression in
+        // the panic-isolation wrapper that swallowed real data would fail here.
+        assert!(!metrics.hostname.is_empty());
+        assert!(!metrics.os.is_empty());
+        assert!(!metrics.arch.is_empty());
+        assert!(
+            metrics.memory_total_mb > 0,
+            "test host should report memory"
+        );
+    }
+
+    #[test]
+    fn panic_message_extracts_static_str() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("static panic");
+        assert_eq!(panic_message(&payload), "static panic");
+    }
+
+    #[test]
+    fn panic_message_extracts_owned_string() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(String::from("owned panic"));
+        assert_eq!(panic_message(&payload), "owned panic");
+    }
+
+    #[test]
+    fn panic_message_falls_back_for_unknown_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(42_u32);
+        assert_eq!(panic_message(&payload), "<non-string panic>");
     }
 }
