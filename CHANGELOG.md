@@ -8,6 +8,48 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-05-01
+
+### Added
+
+- **Panic isolation around metrics collection.** `MetricsCollector::collect()`
+  now returns `Result` and wraps the inner sysinfo refresh in
+  `panic::catch_unwind`. A panic from `sysinfo` (quirky kernels, syscall
+  surprises) can no longer kill the daemon — the heartbeat loop falls back to
+  a zero-valued sample with cached identity and keeps reporting liveness.
+- **`--check-config` diagnostic.** Validates the bearer token, fetches the
+  agent config from the platform, and prints version / interval /
+  missed_threshold / metric toggles. Exits non-zero on any failure — scriptable
+  in install smoke tests.
+- **`--test-heartbeat` diagnostic.** Sends exactly one heartbeat and prints
+  the platform's response (config_outdated, uninstall, update). Used as a
+  post-install verification step in `install.sh`.
+- **Structured log lines.** Daemon logs are now formatted as
+  `<ts> level=info component=<module> <message>` so operators can
+  `grep component=heartbeat` / `grep level=error` without regex acrobatics.
+  No new dependency.
+- **Heartbeat sleep jitter.** Sleeps between heartbeats are now spread by
+  ±10% so a fleet installed at the same minute doesn't hammer the platform
+  on the same second every interval.
+- **Tighter HTTP timeouts.** `connect_timeout` is now an explicit 5 s in
+  addition to the existing 10 s overall request timeout, with a unit test
+  pinning both bounds against accidental relaxations.
+- **Extra systemd hardening.** `ProtectProc=invisible`, `ProcSubset=pid`,
+  `RemoveIPC=yes`, `UMask=0077`, and a `SystemCallFilter` that allows
+  `@system-service` while denying privileged / mount / module / debug /
+  raw-io / reboot / swap / cpu-emulation / obsolete syscalls.
+- **CI binary-size budget.** The Linux release build now fails CI if the
+  unstripped binary exceeds 12 MiB — a regression guard against accidental
+  `tokio` / `serde_yaml` / heavy-derive dependencies.
+
+### Removed
+
+- `src/wire.rs` and `src/sampler.rs`. Both were exploratory work, never
+  declared in `main.rs`, and explicitly disabled for V1 by `CLAUDE.md §0.3`.
+  The encoder used by every heartbeat lives in `http.rs::encode_heartbeat_v2`
+  and is fully tested. The pre-cut tree is preserved on
+  `archive/pre-v1-scope-cut-2026-04-30`.
+
 ## [1.1.2] — 2026-04-29
 
 ### Added

@@ -52,10 +52,21 @@ pub struct ApiClient {
     machine_id: Option<String>,
 }
 
+/// Total per-request timeout (connect + read + write). Tight on purpose: the
+/// daemon must never block the heartbeat loop on a hung connection. Pinned by
+/// a regression test below so a careless `Client::builder()` change can't
+/// silently lift it.
+pub(crate) const REQUEST_TIMEOUT_SECS: u64 = 10;
+
+/// TCP+TLS connect timeout. Half the total budget — we want the agent to fail
+/// fast on a black-holed route and reach the retry/back-off path quickly.
+pub(crate) const CONNECT_TIMEOUT_SECS: u64 = 5;
+
 impl ApiClient {
     pub fn new(base_url: String, token: String) -> Result<Self> {
         let client = Client::builder()
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+            .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
             // SECURITY: Disable redirects to prevent token leakage.
             // A compromised DNS/CDN could redirect to an attacker-controlled server;
             // reqwest would follow and forward the Authorization header.
@@ -303,7 +314,7 @@ impl ApiClient {
 ///
 /// Identity metadata (hostname, OS, arch, versions) is carried in HTTP headers,
 /// not in this frame. cpu_max and load_max mirror cpu_avg/load_avg for now
-/// (single-sample path; multi-sample aggregation via `sampler.rs` is not yet integrated).
+/// (single-sample path — min/max fields mirror the average sample).
 pub(crate) fn encode_heartbeat_v2(payload: &HeartbeatPayload) -> [u8; 32] {
     let mut frame = [0u8; 32];
 
@@ -338,6 +349,25 @@ pub(crate) fn encode_heartbeat_v2(payload: &HeartbeatPayload) -> [u8; 32] {
 mod tests {
     use super::*;
     use crate::heartbeat::{HeartbeatPayload, Metrics};
+
+    /// REGRESSION: a careless `.timeout(Duration::from_secs(60))` would let a
+    /// hung connection block the heartbeat loop for a full minute, which then
+    /// stacks under back-off. Pin the budget so the next reviewer sees the
+    /// intent before raising it.
+    #[test]
+    fn http_timeouts_are_tight_enough_for_heartbeat_loop() {
+        const _: () = {
+            assert!(
+                REQUEST_TIMEOUT_SECS <= 15,
+                "total request timeout must stay tight (<=15s) so the heartbeat loop never blocks"
+            );
+            assert!(
+                CONNECT_TIMEOUT_SECS <= REQUEST_TIMEOUT_SECS,
+                "connect timeout must not exceed total request timeout"
+            );
+            assert!(CONNECT_TIMEOUT_SECS >= 3);
+        };
+    }
 
     fn make_payload(
         uptime: u64,

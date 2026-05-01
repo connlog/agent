@@ -45,6 +45,13 @@ SystemCallArchitectures=native
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 CapabilityBoundingSet=
 AmbientCapabilities=
+# Additional sandboxing — recommended by `systemd-analyze security`.
+ProtectProc=invisible
+ProcSubset=pid
+RemoveIPC=yes
+UMask=0077
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @debug @cpu-emulation @obsolete @raw-io @reboot @swap @module
 
 # Post-stop hook: handles self-update and self-uninstall (runs as root via + prefix)
 ExecStopPost=+/bin/bash -c '\
@@ -472,6 +479,11 @@ mod tests {
             "ProtectKernelModules=yes",
             "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX",
             "CapabilityBoundingSet=",
+            "ProtectProc=invisible",
+            "ProcSubset=pid",
+            "RemoveIPC=yes",
+            "UMask=0077",
+            "SystemCallFilter=@system-service",
         ] {
             assert!(
                 SYSTEMD_SERVICE.contains(flag),

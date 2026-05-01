@@ -44,8 +44,59 @@ const UNINSTALL_CONFIRM_THRESHOLD: u32 = 3;
 /// Maximum config fetch failures before using fallback
 const MAX_CONFIG_FETCH_RETRIES: u32 = 3;
 
+/// Heartbeat sleep jitter, ±10%. Spreads the thundering herd when N agents
+/// installed at the same minute would otherwise all hit the platform on the
+/// same second every interval.
+const HEARTBEAT_JITTER_PCT: u64 = 10;
+
+/// Initialise the logger with a structured, grep-friendly line format:
+///
+///     <ISO-8601> level=info component=heartbeat <message>
+///
+/// `component=` is derived from the log target (`module_path!()`), trimmed to
+/// the last segment so `connlog_agent::http` becomes `component=http`. This
+/// keeps `journalctl -u connlog-agent | grep component=http` working without
+/// adding any logging dependency.
+fn init_logger() {
+    use std::io::Write;
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format(|buf, record| {
+            let ts = buf.timestamp();
+            let target = record.target();
+            let component = target.rsplit("::").next().unwrap_or(target);
+            writeln!(
+                buf,
+                "{ts} level={level} component={component} {msg}",
+                level = record.level().to_string().to_lowercase(),
+                msg = record.args(),
+            )
+        })
+        .init();
+}
+
+/// Apply ±`HEARTBEAT_JITTER_PCT`% jitter to a sleep duration. Source of
+/// entropy is `SystemTime` nanos — no `rand` dependency required, no
+/// cryptographic strength needed (we only want to spread the herd).
+fn jittered(secs: u64) -> u64 {
+    if secs == 0 {
+        return 0;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let span = (secs * HEARTBEAT_JITTER_PCT) / 100;
+    if span == 0 {
+        return secs;
+    }
+    // Map nanos into [-span, +span], applied to secs.
+    let offset = (nanos % (2 * span + 1)) as i64 - span as i64;
+    let jittered = secs as i64 + offset;
+    jittered.max(1) as u64
+}
+
 fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    init_logger();
 
     // Windows SCM dispatch — must happen BEFORE anything that touches stdio
     // assuming a console session. The SCM launches the binary with
@@ -313,7 +364,7 @@ fn run_agent_with_shutdown_inner(
                     "Heartbeat sent successfully, next in {}s",
                     config.heartbeat_interval_secs
                 );
-                if interruptible_sleep(config.heartbeat_interval_secs).is_err() {
+                if interruptible_sleep(jittered(config.heartbeat_interval_secs)).is_err() {
                     return Ok(());
                 }
             }
@@ -677,4 +728,37 @@ fn send_heartbeat(
         uninstall: response.uninstall,
         update: response.update,
     })
+}
+
+#[cfg(test)]
+mod jitter_tests {
+    use super::{jittered, HEARTBEAT_JITTER_PCT};
+
+    #[test]
+    fn jittered_zero_stays_zero() {
+        assert_eq!(jittered(0), 0);
+    }
+
+    #[test]
+    fn jittered_stays_within_bounds() {
+        let base = 60u64;
+        let span = (base * HEARTBEAT_JITTER_PCT) / 100;
+        // Run a few times — the entropy source is SystemTime nanos so values
+        // genuinely vary across calls. Every result must lie inside [base-span,
+        // base+span] and never drop below 1.
+        for _ in 0..20 {
+            let v = jittered(base);
+            assert!(v >= base - span, "{v} < {} - {span}", base);
+            assert!(v <= base + span, "{v} > {} + {span}", base);
+            assert!(v >= 1);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn jittered_floor_is_one() {
+        // For very short intervals the span rounds to 0 — the result is
+        // returned unchanged, which is fine: spreading a 1s herd is moot.
+        assert_eq!(jittered(1), 1);
+    }
 }

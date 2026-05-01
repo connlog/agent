@@ -60,3 +60,20 @@ jobs:
 
       - name: cargo build --release
         run: cargo build --release
+
+      - name: Binary size budget
+        # Hard ceiling on release binary size. Static-linked musl + ring puts
+        # us around 6-8 MiB today; 12 MiB leaves headroom but flags regressions
+        # like an accidental tokio/serde_yaml/syn-heavy dep before they ship.
+        # Bump deliberately and explain why in the commit if you must.
+        if: matrix.os == 'linux'
+        run: |
+          set -e
+          BIN="target/release/connlog-agent"
+          BUDGET_BYTES=$((12 * 1024 * 1024))
+          SIZE=$(stat -c '%s' "$BIN")
+          printf 'binary=%s size=%s bytes (budget=%s bytes / 12 MiB)\n' "$BIN" "$SIZE" "$BUDGET_BYTES"
+          if [ "$SIZE" -gt "$BUDGET_BYTES" ]; then
+            echo "::error::Release binary exceeds 12 MiB budget ($SIZE bytes). Investigate before bumping the budget."
+            exit 1
+          fi

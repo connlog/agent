@@ -172,6 +172,22 @@ run_agent_install() {
     fi
 
     info "Agent installed and started successfully!"
+
+    # Post-install smoke tests — these confirm the install actually works
+    # before declaring success. Both run in-process against the platform; a
+    # green pair means token + endpoint + heartbeat path are all healthy.
+    info "Verifying platform connectivity (--check-config)..."
+    if ! CONNLOG_TOKEN="$AGENT_TOKEN" "$INSTALL_DIR/$BINARY_NAME" --check-config; then
+        warn "Smoke test '--check-config' failed. Service is installed but"
+        warn "couldn't reach the platform. Run it manually for details:"
+        warn "  sudo CONNLOG_TOKEN=<token> $BINARY_NAME --check-config"
+    fi
+
+    info "Sending one test heartbeat (--test-heartbeat)..."
+    if ! CONNLOG_TOKEN="$AGENT_TOKEN" "$INSTALL_DIR/$BINARY_NAME" --test-heartbeat; then
+        warn "Smoke test '--test-heartbeat' failed. Check the platform side"
+        warn "for the agent — the service will keep retrying."
+    fi
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
