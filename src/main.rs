@@ -7,6 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 mod config;
+mod defaults;
 mod heartbeat;
 mod http;
 mod identity;
@@ -20,13 +21,13 @@ mod update;
 mod simulation;
 
 use config::Config;
+use defaults::{CONFIG_FETCH_RETRY_DELAY_SECS, DEFAULT_ENDPOINT, DISABLED_BACKOFF_SECS};
 use heartbeat::{AgentConfig, HeartbeatPayload};
 use http::{ApiClient, ApiError};
 use metrics::MetricsCollector;
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: u32 = 2;
-const DEFAULT_ENDPOINT: &str = "https://connlog.com";
 
 /// Maximum consecutive 401 errors before self-uninstall.
 ///
@@ -93,6 +94,19 @@ fn jittered(secs: u64) -> u64 {
     let offset = (nanos % (2 * span + 1)) as i64 - span as i64;
     let jittered = secs as i64 + offset;
     jittered.max(1) as u64
+}
+
+/// Validate that a bearer token has the `agent_` prefix the platform requires.
+///
+/// Three call sites used to inline this check with three slightly-different
+/// error messages. Centralising it removes the drift hazard and gives both
+/// the daemon and the diagnostic CLI paths a single place to evolve the
+/// prefix rules from.
+fn validate_token_prefix(token: &str) -> Result<()> {
+    if !token.starts_with("agent_") {
+        anyhow::bail!("Invalid token format — must start with 'agent_'");
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -204,8 +218,8 @@ fn run_agent_with_shutdown_inner(
     info!("Endpoint: {}", endpoint);
 
     // Validate token format
-    if !token.starts_with("agent_") {
-        error!("Invalid token format - must start with 'agent_'");
+    if let Err(e) = validate_token_prefix(&token) {
+        error!("{e}");
         std::process::exit(1);
     }
 
@@ -414,7 +428,6 @@ fn run_agent_with_shutdown_inner(
                 // counter so re-enable doesn't immediately trip self-uninstall.
                 consecutive_unauthorized = 0;
                 consecutive_errors = 0;
-                const DISABLED_BACKOFF_SECS: u64 = 300;
                 warn!(
                     "Agent is disabled in ConnLog (423 Locked). Backing off for {}s before checking again. Re-enable from the dashboard.",
                     DISABLED_BACKOFF_SECS
@@ -447,10 +460,10 @@ fn fetch_config_with_retry(client: &ApiClient) -> AgentConfig {
             Err(e) => {
                 if attempt < MAX_CONFIG_FETCH_RETRIES {
                     warn!(
-                        "Config fetch attempt {}/{} failed: {}. Retrying in 5s...",
-                        attempt, MAX_CONFIG_FETCH_RETRIES, e
+                        "Config fetch attempt {}/{} failed: {}. Retrying in {}s...",
+                        attempt, MAX_CONFIG_FETCH_RETRIES, e, CONFIG_FETCH_RETRY_DELAY_SECS
                     );
-                    thread::sleep(Duration::from_secs(5));
+                    thread::sleep(Duration::from_secs(CONFIG_FETCH_RETRY_DELAY_SECS));
                 } else {
                     error!(
                         "All {} config fetch attempts failed. Using safe fallback config.",
@@ -469,9 +482,7 @@ fn fetch_config_with_retry(client: &ApiClient) -> AgentConfig {
 /// fields. Token comes from CLI/env; endpoint from `resolve_endpoint`. Never
 /// touches the heartbeat loop and never prints the token.
 fn run_check_config(token: String, endpoint: String) -> Result<()> {
-    if !token.starts_with("agent_") {
-        anyhow::bail!("Token does not start with 'agent_' — refusing to call platform");
-    }
+    validate_token_prefix(&token)?;
     let client = ApiClient::new(endpoint.clone(), token).context("ApiClient init failed")?;
     println!("Endpoint: {endpoint}");
     println!("Fetching /api/agents/config...");
@@ -497,9 +508,7 @@ fn run_check_config(token: String, endpoint: String) -> Result<()> {
 /// the platform's response. Useful as a smoke test after install or after a
 /// config change. Never enters the retry loop and never prints the token.
 fn run_test_heartbeat(token: String, endpoint: String) -> Result<()> {
-    if !token.starts_with("agent_") {
-        anyhow::bail!("Token does not start with 'agent_' — refusing to call platform");
-    }
+    validate_token_prefix(&token)?;
     let client = ApiClient::new(endpoint.clone(), token).context("ApiClient init failed")?;
     let mut collector = MetricsCollector::new().context("Metrics collector init failed")?;
     let mut cfg = match client.fetch_config() {

@@ -92,8 +92,8 @@ pub fn install(token: &str) -> Result<()> {
     println!("Installing ConnLog agent as systemd service...");
 
     // Get platform URL from environment or use default
-    let platform_url =
-        std::env::var("CONNLOG_PLATFORM_URL").unwrap_or_else(|_| "https://connlog.com".to_string());
+    let platform_url = std::env::var("CONNLOG_PLATFORM_URL")
+        .unwrap_or_else(|_| crate::defaults::DEFAULT_ENDPOINT.to_string());
 
     // Create system user
     create_system_user()?;

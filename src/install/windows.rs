@@ -38,8 +38,8 @@ pub fn install(token: &str) -> Result<()> {
         );
     }
 
-    let platform_url =
-        std::env::var("CONNLOG_PLATFORM_URL").unwrap_or_else(|_| "https://connlog.com".to_string());
+    let platform_url = std::env::var("CONNLOG_PLATFORM_URL")
+        .unwrap_or_else(|_| crate::defaults::DEFAULT_ENDPOINT.to_string());
 
     println!("Installing ConnLog agent as a Windows service...");
 

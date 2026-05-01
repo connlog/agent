@@ -137,7 +137,8 @@ fn load_service_config() -> Result<Config> {
     }
 
     let token_b64 = token_b64.context("CONNLOG_TOKEN_DPAPI_B64 missing from config")?;
-    let platform_url = platform_url.unwrap_or_else(|| "https://connlog.com".to_string());
+    let platform_url =
+        platform_url.unwrap_or_else(|| crate::defaults::DEFAULT_ENDPOINT.to_string());
 
     let blob = install_win::base64_decode(&token_b64).context("base64 decode token")?;
     let plain = install_win::dpapi_unprotect(&blob).context("DPAPI decrypt token")?;
