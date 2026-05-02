@@ -124,10 +124,13 @@ What the agent **does not** protect against (and we will not pretend it does):
   is the wrong tool.
 - **A compromised SYSTEM process** can also decrypt the DPAPI blob. Same
   reason.
-- **No Authenticode signing yet.** The EXE is plain unsigned native code in
-  v1.2.0. Defender SmartScreen *will* warn when running the installer the
-  first time. Authenticode signing is a known follow-up; it requires an EV
-  code-signing cert.
+- **Authenticode signing.** Release binaries are Authenticode-signed via the
+  CI pipeline when the signing certificate is configured. SmartScreen may
+  still warn for new publishers until download reputation builds — this is
+  expected for any recently-issued certificate. In managed environments with
+  WDAC, App Control for Business, or AppLocker, the certificate publisher or
+  binary hash must also be explicitly allow-listed in your policy; signing
+  alone is not sufficient to bypass those controls.
 - **No anti-tamper.** The agent does not detect or resist a local admin
   modifying its EXE. Integrity is enforced *before* install (SHA-256 + Ed25519
   on the download path), not after.
@@ -139,6 +142,6 @@ What the agent **does not** protect against (and we will not pretend it does):
 | `Install-ConnLogAgent` fails immediately             | You're not in an elevated PowerShell. Right-click → *Run as Administrator*.                                            |
 | `Get-Service connlog-agent` says *Stopped*           | Check `C:\ProgramData\ConnLog\Agent\logs\service-fatal.log`. Most common cause: corrupt `agent.conf` (re-run install). |
 | `Start-Service` returns 1053 (timed out)             | The agent panicked before reporting `SERVICE_RUNNING`. Same log as above.                                              |
-| Defender / SmartScreen blocks the installer          | Until we ship Authenticode signing, you may need to click *More info → Run anyway*.                                    |
+| Defender / SmartScreen blocks the installer          | For consumer Windows, use *More info → Run anyway*. In managed environments with WDAC/AppLocker, unsigned binaries may be blocked entirely until allow-listed or Authenticode-signed. |
 | Disk usage in dashboard looks wrong                  | Filed → file an issue. We skip UNC mounts and rely on sysinfo for fixed-drive enumeration; bugs in that surface here.  |
 | Agent's `arch` shows `aarch64` on a Surface Pro X    | Expected. ARM64 Windows is built into the same release matrix.                                                         |

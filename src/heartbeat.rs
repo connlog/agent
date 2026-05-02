@@ -402,6 +402,98 @@ mod tests {
         assert!(upd.sha256.is_none());
     }
 
+    // ── Metrics wire format — aggregate CPU only, no per-core ────
+    //
+    // The agent collects only global_cpu_usage() from sysinfo. Per-core CPU
+    // data is not in scope for V1. These tests pin the JSON shape so that a
+    // change to the Metrics struct forces an explicit contract review.
+
+    #[test]
+    fn metrics_wire_format_has_aggregate_cpu_only() {
+        let m = Metrics {
+            cpu_percent: 42.5,
+            memory_used_mb: 1024,
+            memory_total_mb: 8192,
+            disk_used_mb: 20480,
+            disk_total_mb: 100000,
+            load_1m: 0.5,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let obj: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let keys: Vec<&str> = obj
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+
+        // Per-core fields must be absent from the wire format
+        assert!(
+            !keys.contains(&"cpu_per_core"),
+            "per-core CPU array must not appear on the wire"
+        );
+        assert!(
+            !keys.contains(&"cpu_cores"),
+            "CPU core count must not appear on the wire"
+        );
+
+        // Aggregate CPU must be present
+        assert!(
+            keys.contains(&"cpu_percent"),
+            "aggregate cpu_percent must be on the wire"
+        );
+
+        // load_1m only — no 5m or 15m
+        assert!(
+            !keys.contains(&"load_5m"),
+            "5-minute load average is not in the wire format"
+        );
+        assert!(
+            !keys.contains(&"load_15m"),
+            "15-minute load average is not in the wire format"
+        );
+        assert!(
+            keys.contains(&"load_1m"),
+            "1-minute load average must be on the wire"
+        );
+    }
+
+    #[test]
+    fn metrics_exact_field_set() {
+        // Pin the complete set of fields so additions require deliberate review.
+        let m = Metrics {
+            cpu_percent: 0.0,
+            memory_used_mb: 0,
+            memory_total_mb: 0,
+            disk_used_mb: 0,
+            disk_total_mb: 0,
+            load_1m: 0.0,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let obj: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let mut keys: Vec<&str> = obj
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        keys.sort_unstable();
+
+        assert_eq!(
+            keys,
+            &[
+                "cpu_percent",
+                "disk_total_mb",
+                "disk_used_mb",
+                "load_1m",
+                "memory_total_mb",
+                "memory_used_mb",
+            ],
+            "wire format field set changed — update both this test and \
+             ../connlog-platform/src/app/api/agents/heartbeat/route.ts"
+        );
+    }
+
     // ── HeartbeatPayload serialisation contract ──────────────────
 
     #[test]
