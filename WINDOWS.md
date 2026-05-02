@@ -60,14 +60,14 @@ sc.exe query connlog-agent
 
 ## Files & locations
 
-| Path                                                  | Purpose                                                    |
-| ----------------------------------------------------- | ---------------------------------------------------------- |
-| `C:\Program Files\ConnLog\Agent\connlog-agent.exe`    | The agent binary (read-only after install).                |
-| `C:\ProgramData\ConnLog\Agent\agent.conf`             | DPAPI-encrypted token + plaintext platform URL.            |
-| `C:\ProgramData\ConnLog\Agent\logs\`                  | Service-fatal log written when initialisation fails.       |
-| `C:\ProgramData\ConnLog\Agent\connlog-agent-new.exe`  | Staged update binary (transient).                          |
-| `C:\ProgramData\ConnLog\Agent\.update_requested`      | Marker file consumed by the recovery / restart path.       |
-| `C:\ProgramData\ConnLog\Agent\.uninstall_requested`   | Marker file consumed by the recovery / cleanup path.       |
+| Path                                                 | Purpose                                              |
+| ---------------------------------------------------- | ---------------------------------------------------- |
+| `C:\Program Files\ConnLog\Agent\connlog-agent.exe`   | The agent binary (read-only after install).          |
+| `C:\ProgramData\ConnLog\Agent\agent.conf`            | DPAPI-encrypted token + plaintext platform URL.      |
+| `C:\ProgramData\ConnLog\Agent\logs\`                 | Service-fatal log written when initialisation fails. |
+| `C:\ProgramData\ConnLog\Agent\connlog-agent-new.exe` | Staged update binary (transient).                    |
+| `C:\ProgramData\ConnLog\Agent\.update_requested`     | Marker file consumed by the recovery / restart path. |
+| `C:\ProgramData\ConnLog\Agent\.uninstall_requested`  | Marker file consumed by the recovery / cleanup path. |
 
 ## Service account
 
@@ -124,24 +124,23 @@ What the agent **does not** protect against (and we will not pretend it does):
   is the wrong tool.
 - **A compromised SYSTEM process** can also decrypt the DPAPI blob. Same
   reason.
-- **Authenticode signing.** Release binaries are Authenticode-signed via the
-  CI pipeline when the signing certificate is configured. SmartScreen may
-  still warn for new publishers until download reputation builds — this is
-  expected for any recently-issued certificate. In managed environments with
-  WDAC, App Control for Business, or AppLocker, the certificate publisher or
-  binary hash must also be explicitly allow-listed in your policy; signing
-  alone is not sufficient to bypass those controls.
+- **No Authenticode signing.** The EXE ships unsigned. Defender SmartScreen
+  will warn on first run — click *More info → Run anyway*. The installer
+  verifies the SHA-256 checksum before placing the binary, so integrity is
+  guaranteed even without a CA signature. In managed environments with WDAC,
+  App Control for Business, or AppLocker, unsigned binaries may be blocked
+  entirely and will need explicit allow-listing by hash or path.
 - **No anti-tamper.** The agent does not detect or resist a local admin
   modifying its EXE. Integrity is enforced *before* install (SHA-256 + Ed25519
   on the download path), not after.
 
 ## Troubleshooting
 
-| Symptom                                              | What to check                                                                                                          |
-| ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `Install-ConnLogAgent` fails immediately             | You're not in an elevated PowerShell. Right-click → *Run as Administrator*.                                            |
-| `Get-Service connlog-agent` says *Stopped*           | Check `C:\ProgramData\ConnLog\Agent\logs\service-fatal.log`. Most common cause: corrupt `agent.conf` (re-run install). |
-| `Start-Service` returns 1053 (timed out)             | The agent panicked before reporting `SERVICE_RUNNING`. Same log as above.                                              |
-| Defender / SmartScreen blocks the installer          | For consumer Windows, use *More info → Run anyway*. In managed environments with WDAC/AppLocker, unsigned binaries may be blocked entirely until allow-listed or Authenticode-signed. |
-| Disk usage in dashboard looks wrong                  | Filed → file an issue. We skip UNC mounts and rely on sysinfo for fixed-drive enumeration; bugs in that surface here.  |
-| Agent's `arch` shows `aarch64` on a Surface Pro X    | Expected. ARM64 Windows is built into the same release matrix.                                                         |
+| Symptom                                           | What to check                                                                                                          |
+| ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `Install-ConnLogAgent` fails immediately          | You're not in an elevated PowerShell. Right-click → *Run as Administrator*.                                            |
+| `Get-Service connlog-agent` says *Stopped*        | Check `C:\ProgramData\ConnLog\Agent\logs\service-fatal.log`. Most common cause: corrupt `agent.conf` (re-run install). |
+| `Start-Service` returns 1053 (timed out)          | The agent panicked before reporting `SERVICE_RUNNING`. Same log as above.                                              |
+| Defender / SmartScreen blocks the installer       | Click *More info -> Run anyway*. The binary is unsigned; WDAC/AppLocker envs need an explicit allow-list entry.        |
+| Disk usage in dashboard looks wrong               | Filed → file an issue. We skip UNC mounts and rely on sysinfo for fixed-drive enumeration; bugs in that surface here.  |
+| Agent's `arch` shows `aarch64` on a Surface Pro X | Expected. ARM64 Windows is built into the same release matrix.                                                         |

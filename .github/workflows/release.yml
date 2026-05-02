@@ -79,56 +79,6 @@ jobs:
           # Raw binary used by the auto-update path.
           cp connlog-agent "connlog-agent-${VERSION}-${OS}-${ARCH}"
 
-      # ── Windows Authenticode signing ──────────────────────────────
-      # Requires two GitHub Actions secrets in the "release" environment:
-      #   WINDOWS_CODESIGN_CERT_PFX_BASE64  — base64-encoded .pfx file
-      #   WINDOWS_CODESIGN_CERT_PASSWORD    — PFX passphrase
-      #
-      # To generate (PowerShell):
-      #   [Convert]::ToBase64String([IO.File]::ReadAllBytes("cert.pfx")) | Set-Clipboard
-      #
-      # If the secret is absent (e.g. forks, test branches) the step skips with
-      # a warning and the binary ships unsigned. Set the secret in:
-      #   GitHub → Settings → Environments → release → Environment secrets
-      - name: Sign Windows binary (Authenticode)
-        if: matrix.os == 'windows'
-        shell: pwsh
-        env:
-          CERT_PFX_B64: ${{ secrets.WINDOWS_CODESIGN_CERT_PFX_BASE64 }}
-          CERT_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_CERT_PASSWORD }}
-        run: |
-          if (-not $env:CERT_PFX_B64) {
-            Write-Warning "WINDOWS_CODESIGN_CERT_PFX_BASE64 not set — Authenticode signing skipped."
-            Write-Warning "Set the secret in GitHub → Settings → Environments → release to enable signing."
-            exit 0
-          }
-
-          $pfxPath = Join-Path $env:TEMP 'connlog-codesign.pfx'
-          try {
-            [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:CERT_PFX_B64))
-
-            $exePath = "target\${{ matrix.target }}\release\connlog-agent.exe"
-
-            # Sign: SHA-256 file digest, RFC 3161 timestamp via DigiCert
-            & signtool sign `
-              /fd sha256 `
-              /td sha256 `
-              /tr http://timestamp.digicert.com `
-              /f $pfxPath `
-              /p $env:CERT_PASSWORD `
-              $exePath
-            if ($LASTEXITCODE -ne 0) { throw "signtool sign failed (exit $LASTEXITCODE)" }
-
-            # Verify the embedded signature against the public CA trust store
-            & signtool verify /pa $exePath
-            if ($LASTEXITCODE -ne 0) { throw "signtool verify failed (exit $LASTEXITCODE)" }
-
-            Write-Host "✓ Authenticode signature applied and verified on $exePath"
-          } finally {
-            # Always remove the PFX — even if signing failed
-            if (Test-Path $pfxPath) { Remove-Item $pfxPath -Force }
-          }
-
       - name: Package binary (Windows)
         if: matrix.os == 'windows'
         shell: pwsh
