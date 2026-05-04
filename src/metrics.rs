@@ -61,10 +61,12 @@ impl MetricsCollector {
     /// Create a new collector. Performs a full initial refresh to populate CPU baseline.
     pub fn new() -> Result<Self> {
         let mut sys = System::new();
-        // Initial CPU refresh - sysinfo needs two refreshes to compute usage delta
-        sys.refresh_cpu_all();
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        sys.refresh_cpu_all();
+        // Initial CPU sample - sysinfo needs two refreshes with a small gap
+        // to compute usage delta. The first heartbeat would otherwise read
+        // 0 % even on a busy host.
+        sys.refresh_cpu_usage();
+        std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+        sys.refresh_cpu_usage();
         sys.refresh_memory();
 
         let disks = Disks::new_with_refreshed_list();
@@ -115,8 +117,19 @@ impl MetricsCollector {
     }
 
     fn collect_inner(&mut self) -> SystemMetrics {
-        // Targeted refresh - only what we need
-        self.sys.refresh_cpu_all();
+        // CPU usage in sysinfo is computed from the delta between two
+        // consecutive refreshes. The documented recipe is:
+        //   refresh_cpu_usage() → sleep(MINIMUM_CPU_UPDATE_INTERVAL) → refresh_cpu_usage()
+        // and only THEN read `global_cpu_usage()`. Skipping the inner sleep
+        // (or relying on the previous sample being from 60s ago) reliably
+        // reports 0% on Linux containers and CI runners — exactly what we
+        // were seeing on the dashboard. The 200 ms penalty is paid once per
+        // heartbeat and is invisible compared with the 60 s tick.
+        self.sys.refresh_cpu_usage();
+        std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+        self.sys.refresh_cpu_usage();
+
+        // Memory + disks don't need the two-step dance.
         self.sys.refresh_memory();
         self.disks.refresh();
 
@@ -274,6 +287,29 @@ mod tests {
         assert!(
             metrics.memory_total_mb > 0,
             "test host should report memory"
+        );
+    }
+
+    /// Regression for v1.3.3: every `collect()` must perform the documented
+    /// sysinfo recipe of `refresh_cpu_usage → sleep ≥ MINIMUM_CPU_UPDATE_INTERVAL
+    /// → refresh_cpu_usage` so `global_cpu_usage()` returns a real delta.
+    /// Skipping the inner sleep silently reports 0 % on several Linux kernels
+    /// (notably the GitHub Actions runners), which is exactly what blanked
+    /// the dashboard in v1.3.2. We can't easily assert the CPU value itself
+    /// (a quiescent test host can legitimately report ~0 %), so instead we
+    /// assert the *recipe* is in place by measuring wall-clock duration.
+    #[test]
+    fn collect_observes_minimum_cpu_update_interval() {
+        let mut c = MetricsCollector::new().expect("collector init must work in tests");
+        let start = std::time::Instant::now();
+        let _ = c.collect().expect("collect must succeed");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= sysinfo::MINIMUM_CPU_UPDATE_INTERVAL,
+            "collect() finished in {:?}, faster than MINIMUM_CPU_UPDATE_INTERVAL ({:?}) — \
+             the refresh-sleep-refresh recipe is missing and CPU readings will be 0 %",
+            elapsed,
+            sysinfo::MINIMUM_CPU_UPDATE_INTERVAL,
         );
     }
 

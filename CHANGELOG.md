@@ -8,6 +8,24 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 
 ## [Unreleased]
 
+## [1.3.3] — 2026-05-04
+
+### Fixed
+
+- **CPU usage no longer reports 0 % on every host.** `MetricsCollector::collect_inner`
+  was issuing a single `refresh_cpu_all()` per heartbeat and immediately
+  reading `global_cpu_usage()`. sysinfo's documented contract requires two
+  `refresh_cpu_*` calls separated by at least
+  `MINIMUM_CPU_UPDATE_INTERVAL` (~200 ms) per *sample* — relying on the
+  previous tick's refresh from 60 s ago is unsupported and silently produces
+  0 % on a number of Linux kernels (notably the ones running our CI
+  runners). Each collect now does the canonical
+  `refresh_cpu_usage → sleep → refresh_cpu_usage → read` dance. The 200 ms
+  cost is paid once per heartbeat and is invisible against the 60 s tick.
+- Switched both startup baseline and per-tick samples from `refresh_cpu_all`
+  to the lighter `refresh_cpu_usage`; we never read frequency or per-CPU
+  data, so the heavier call was wasted work.
+
 ## [1.3.2] — 2026-05-04
 
 ### Fixed
