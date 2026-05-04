@@ -719,6 +719,35 @@ fn send_heartbeat(
         dev_mode: None,
     };
 
+    // One-line per-heartbeat diagnostic. Visible at the default `info` log
+    // level so users can see end-to-end what each agent is sending without
+    // needing to flip on debug logging. Cheap (one formatted line / minute)
+    // and the single best signal when "the dashboard shows zeros" — it
+    // disambiguates between (a) config disabling a metric, (b) sysinfo
+    // returning zero, and (c) the wire encode itself.
+    info!(
+        "HB v={} cfg=v{}(cpu={} mem={} disk={} load={}) sample(cpu={:.1}% mem={}/{} MB disk={}/{} MB load={:.2} up={}s) → wire(cpu={:.1}% mem={}/{} MB disk={}/{} MB load={:.2})",
+        AGENT_VERSION,
+        config.version,
+        config.metrics.cpu,
+        config.metrics.memory,
+        config.metrics.disk,
+        config.metrics.load,
+        metrics.cpu_percent,
+        metrics.memory_used_mb,
+        metrics.memory_total_mb,
+        metrics.disk_used_mb,
+        metrics.disk_total_mb,
+        metrics.load_1m,
+        metrics.uptime_seconds,
+        payload.metrics.cpu_percent,
+        payload.metrics.memory_used_mb,
+        payload.metrics.memory_total_mb,
+        payload.metrics.disk_used_mb,
+        payload.metrics.disk_total_mb,
+        payload.metrics.load_1m,
+    );
+
     // Enforce server-mandated payload size limit
     if config.max_payload_size_kb > 0 {
         let payload_json = serde_json::to_vec(&payload).map_err(|e| ApiError::Other(e.into()))?;

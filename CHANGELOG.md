@@ -8,6 +8,19 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 
 ## [Unreleased]
 
+## [1.3.5] — 2026-05-04
+
+### Added
+
+- **Per-heartbeat diagnostic line.** Every heartbeat now logs a single
+  `info!` line containing the agent version, fetched config (version +
+  metric toggles), the raw values sysinfo returned, and the values
+  actually placed on the wire. This is the fastest way to diagnose the
+  "dashboard shows zeros" class of issue end-to-end without flipping the
+  global log level — it disambiguates between (a) the platform telling
+  the agent a metric is disabled, (b) sysinfo returning zero on this host,
+  and (c) the wire encoding masking real samples.
+
 ## [1.3.4] — 2026-05-04
 
 ### Fixed
