@@ -45,9 +45,15 @@ SystemCallArchitectures=native
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 CapabilityBoundingSet=
 AmbientCapabilities=
-# Additional sandboxing — recommended by `systemd-analyze security`.
-ProtectProc=invisible
-ProcSubset=pid
+# NOTE: We deliberately DO NOT restrict /proc visibility for this service.
+# `sysinfo` reads /proc/stat, /proc/meminfo, /proc/loadavg, /proc/uptime, and
+# /proc/diskstats to compute CPU, memory, load, uptime and disk metrics —
+# hiding those files (e.g. via the proc-subset / protect-proc directives that
+# `systemd-analyze security` recommends) makes every read return ENOENT and
+# the agent silently sends a perfectly-formed heartbeat full of zeros. The
+# remaining hardening (NoNewPrivileges, ProtectSystem=strict, ProtectHome,
+# syscall filter, RestrictAddressFamilies, capability drop, etc.) keeps the
+# agent tightly contained without breaking metric collection.
 RemoveIPC=yes
 UMask=0077
 SystemCallFilter=@system-service
@@ -479,8 +485,6 @@ mod tests {
             "ProtectKernelModules=yes",
             "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX",
             "CapabilityBoundingSet=",
-            "ProtectProc=invisible",
-            "ProcSubset=pid",
             "RemoveIPC=yes",
             "UMask=0077",
             "SystemCallFilter=@system-service",
@@ -491,5 +495,24 @@ mod tests {
                 flag
             );
         }
+    }
+
+    /// Regression for the v1.3.x "dashboard shows zeros" bug. With
+    /// `ProcSubset=pid` (or `ProtectProc=invisible`) the kernel hides almost
+    /// all of /proc from the service, and `sysinfo` silently reports zero
+    /// for CPU, memory, load, disk and uptime. Keep this test as a tripwire:
+    /// re-introducing either flag without also re-implementing metric
+    /// collection will fail here loudly.
+    #[test]
+    fn systemd_unit_does_not_block_proc_reads() {
+        assert!(
+            !SYSTEMD_SERVICE.contains("ProcSubset"),
+            "ProcSubset=* breaks /proc reads that sysinfo needs for CPU/memory/load metrics"
+        );
+        assert!(
+            !SYSTEMD_SERVICE.contains("ProtectProc=invisible")
+                && !SYSTEMD_SERVICE.contains("ProtectProc=ptraceable"),
+            "ProtectProc=invisible/ptraceable hides /proc/meminfo etc. from sysinfo"
+        );
     }
 }

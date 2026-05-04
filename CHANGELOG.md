@@ -8,6 +8,23 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 
 ## [Unreleased]
 
+## [1.3.6] — 2026-05-04
+
+### Fixed
+
+- **Systemd sandbox no longer blocks `/proc` reads.** The unit shipped
+  `ProtectProc=invisible` and `ProcSubset=pid`, which together hide almost
+  all of `/proc` from the service. `sysinfo` reads `/proc/meminfo`,
+  `/proc/stat`, `/proc/loadavg`, `/proc/uptime`, and `/proc/diskstats` to
+  produce metrics; with those two flags set, every read returned ENOENT and
+  the agent silently sent zeros for CPU, memory, disk, load, *and uptime*.
+  The dashboard cards then displayed `0%` / `0 MB` even though heartbeats
+  were arriving normally. Removed both directives. The remaining hardening
+  (NoNewPrivileges, ProtectSystem=strict, ProtectHome, syscall filter,
+  RestrictAddressFamilies, capability drop, namespace and realtime
+  restrictions, MemoryDenyWriteExecute, etc.) is unchanged. Added a
+  regression test that fails if either flag is reintroduced.
+
 ## [1.3.5] — 2026-05-04
 
 ### Added
