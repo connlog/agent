@@ -6,8 +6,9 @@ update channel, and the same Rust crate as the Linux build — the differences
 are confined to the `install/`, `service/`, and `platform/` modules.
 
 > **Status:** GA in v1.2.0. Built nightly in CI on `windows-latest`. The
-> agent is **not** "100% secure" — see [Security model](#security-model)
-> for the honest take on what we do and do not protect against.
+> Windows release is currently unsigned; see
+> [Windows security notice](#windows-security-notice) and
+> [Security model](#security-model) for the current trust boundaries.
 
 ---
 
@@ -31,6 +32,23 @@ This:
    - Starts the service.
 
 Idempotent: if the service already exists, re-running with `-Force` reinstalls. Re-running without `-Force` prints a hint and exits.
+
+## Windows security notice
+
+The Windows agent is not code-signed yet, so Windows SmartScreen may show an
+"Unknown publisher" warning during installation.
+
+ConnLog is a small independent startup, and signed Windows releases are part
+of our roadmap as the product matures. Until then, we keep the installer
+transparent: it downloads only from `connlog.com` over HTTPS and verifies the
+SHA-256 checksum before installing the agent.
+
+The agent runs as a Windows service and only communicates outbound with the
+ConnLog API. The full agent source code is public and can be reviewed at
+[github.com/connlog/connlog-agent](https://github.com/connlog/connlog-agent).
+
+For managed environments, ask your IT administrator to review the installer
+and source code before running it.
 
 To rotate the token without reinstalling everything:
 
@@ -76,7 +94,7 @@ The service runs as **LocalSystem**. This is required so that:
 1. The DPAPI blob in `agent.conf` (encrypted under the machine scope) can be decrypted.
 2. The agent can read its own config and write to `C:\ProgramData\ConnLog\Agent\` without having to negotiate ACLs with another principal.
 
-A future hardening pass can drop to `NT AUTHORITY\NetworkService` after install — that's a follow-up, not a v1.2 ship blocker.
+A future hardening pass can evaluate `NT AUTHORITY\NetworkService` after install.
 
 ## Auto-update on Windows
 
@@ -103,7 +121,7 @@ Start-Service connlog-agent
 
 ## Security model
 
-What the agent **does** protect against:
+Current protections:
 
 - **Token exfiltration via casual file read.** `agent.conf` is DPAPI-encrypted
   under the machine scope; copying the file off the host yields ciphertext
@@ -117,19 +135,21 @@ What the agent **does** protect against:
 - **TLS interception.** All platform calls go to `https://connlog.com` with
   rustls' default cert validation.
 
-What the agent **does not** protect against (and we will not pretend it does):
+Current limitations:
 
 - **A local administrator** can read DPAPI blobs because they are encrypted
-  under the machine scope. If your threat model is hostile local admins, this
-  is the wrong tool.
-- **A compromised SYSTEM process** can also decrypt the DPAPI blob. Same
+  under the machine scope. If your threat model includes hostile local
+  administrators, the current Windows agent is not a good fit.
+- **A compromised SYSTEM process** can also decrypt the DPAPI blob for the same
   reason.
-- **No Authenticode signing.** The EXE ships unsigned. Defender SmartScreen
-  will warn on first run — click *More info → Run anyway*. The installer
-  verifies the SHA-256 checksum before placing the binary, so integrity is
-  guaranteed even without a CA signature. In managed environments with WDAC,
-  App Control for Business, or AppLocker, unsigned binaries may be blocked
-  entirely and will need explicit allow-listing by hash or path.
+- **Unsigned Windows release.** The EXE and installer are not code-signed yet,
+  so Windows SmartScreen may show an "Unknown publisher" warning. The installer
+  downloads only from `connlog.com` over HTTPS and verifies the SHA-256 checksum
+  before placing the binary. This verifies the expected file integrity, but it
+  is not the same as publisher signing. ConnLog is working toward signed Windows
+  releases as the product matures. In managed environments with WDAC, App
+  Control for Business, or AppLocker, ask your IT administrator to review the
+  installer and source code before installing.
 - **No anti-tamper.** The agent does not detect or resist a local admin
   modifying its EXE. Integrity is enforced *before* install (SHA-256 + Ed25519
   on the download path), not after.
@@ -141,6 +161,6 @@ What the agent **does not** protect against (and we will not pretend it does):
 | `Install-ConnLogAgent` fails immediately          | You're not in an elevated PowerShell. Right-click → *Run as Administrator*.                                            |
 | `Get-Service connlog-agent` says *Stopped*        | Check `C:\ProgramData\ConnLog\Agent\logs\service-fatal.log`. Most common cause: corrupt `agent.conf` (re-run install). |
 | `Start-Service` returns 1053 (timed out)          | The agent panicked before reporting `SERVICE_RUNNING`. Same log as above.                                              |
-| Defender / SmartScreen blocks the installer       | Click *More info -> Run anyway*. The binary is unsigned; WDAC/AppLocker envs need an explicit allow-list entry.        |
-| Disk usage in dashboard looks wrong               | Filed → file an issue. We skip UNC mounts and rely on sysinfo for fixed-drive enumeration; bugs in that surface here.  |
+| Defender / SmartScreen blocks the installer       | The Windows release is currently unsigned. In managed environments, ask your IT administrator to review the installer and source code before installing. |
+| Disk usage in dashboard looks wrong               | Open an issue with the fixed-drive details. The agent skips UNC mounts and relies on sysinfo for fixed-drive enumeration. |
 | Agent's `arch` shows `aarch64` on a Surface Pro X | Expected. ARM64 Windows is built into the same release matrix.                                                         |
