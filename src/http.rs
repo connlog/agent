@@ -45,7 +45,6 @@ pub struct ApiClient {
     client: Client,
     base_url: String,
     token: String,
-    use_binary: bool,
     /// SHA-256 hash of the host's stable machine identifier. `None` when no
     /// source is available (e.g. an unsupported OS); platform falls back to
     /// hostname binding in that case.
@@ -81,31 +80,19 @@ impl ApiClient {
             client,
             base_url,
             token,
-            use_binary: true, // Protocol v2 by default
             machine_id: crate::identity::machine_id(),
         })
     }
 
-    /// Send heartbeat using binary wire format (protocol v2) or JSON (protocol v1 fallback)
+    /// Send heartbeat using the binary wire protocol (v1, 32-byte LE frame).
+    /// This is the only supported transport — there is no JSON fallback.
     pub fn send_heartbeat(
-        &self,
-        payload: &HeartbeatPayload,
-    ) -> Result<HeartbeatResponse, ApiError> {
-        if self.use_binary {
-            self.send_heartbeat_binary(payload)
-        } else {
-            self.send_heartbeat_json(payload)
-        }
-    }
-
-    /// Protocol v2: Binary wire format (32 bytes)
-    fn send_heartbeat_binary(
         &self,
         payload: &HeartbeatPayload,
     ) -> Result<HeartbeatResponse, ApiError> {
         let url = format!("{}/api/agents/heartbeat", self.base_url);
 
-        let binary_payload = encode_heartbeat_v2(payload);
+        let binary_payload = encode_heartbeat(payload);
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -194,70 +181,6 @@ impl ApiClient {
         Ok(heartbeat_response)
     }
 
-    /// Protocol v1: JSON format (fallback)
-    fn send_heartbeat_json(
-        &self,
-        payload: &HeartbeatPayload,
-    ) -> Result<HeartbeatResponse, ApiError> {
-        let url = format!("{}/api/agents/heartbeat", self.base_url);
-
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-
-        if let Some(mid) = &self.machine_id {
-            headers.insert(
-                "X-Machine-Id",
-                HeaderValue::from_str(mid).context("Failed to create machine-id header")?,
-            );
-        }
-
-        // SECURITY: Never log the token
-        let auth_value = format!("Bearer {}", self.token);
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&auth_value).context("Failed to create authorization header")?,
-        );
-
-        let response = self
-            .client
-            .post(&url)
-            .headers(headers)
-            .json(payload)
-            .send()
-            .context("Failed to send heartbeat request")?;
-
-        let status = response.status();
-
-        // Check for specific error codes
-        if status == StatusCode::UNAUTHORIZED {
-            return Err(ApiError::Unauthorized);
-        }
-
-        if status == StatusCode::GONE {
-            return Err(ApiError::Decommissioned);
-        }
-
-        if status == StatusCode::LOCKED {
-            return Err(ApiError::Disabled);
-        }
-
-        if !status.is_success() {
-            let error_text = response
-                .text()
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(ApiError::HttpError {
-                status: status.as_u16(),
-                message: error_text,
-            });
-        }
-
-        let heartbeat_response: HeartbeatResponse = response
-            .json()
-            .context("Failed to parse heartbeat response")?;
-
-        Ok(heartbeat_response)
-    }
-
     pub fn fetch_config(&self) -> Result<AgentConfig> {
         let url = format!("{}/api/agents/config", self.base_url);
 
@@ -297,7 +220,7 @@ impl ApiClient {
     }
 }
 
-/// Encode a heartbeat payload into the 32-byte protocol v2 binary wire frame.
+/// Encode a heartbeat payload into the 32-byte protocol v1 binary wire frame.
 ///
 /// Frame layout (little-endian):
 /// | Offset | Size | Field                        |
@@ -315,7 +238,7 @@ impl ApiClient {
 /// Identity metadata (hostname, OS, arch, versions) is carried in HTTP headers,
 /// not in this frame. cpu_max and load_max mirror cpu_avg/load_avg for now
 /// (single-sample path — min/max fields mirror the average sample).
-pub(crate) fn encode_heartbeat_v2(payload: &HeartbeatPayload) -> [u8; 32] {
+pub(crate) fn encode_heartbeat(payload: &HeartbeatPayload) -> [u8; 32] {
     let mut frame = [0u8; 32];
 
     // [0..8] uptime_seconds as u64 LE
@@ -384,7 +307,7 @@ mod tests {
             // footgun: bumping the crate version would have left the test asserting an
             // outdated value if anything actually inspected agent_version.
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
-            protocol_version: 2,
+            protocol_version: 1,
             config_version: 0,
             hostname: "test-host".to_string(),
             os: "linux".to_string(),
@@ -406,11 +329,11 @@ mod tests {
     #[test]
     fn test_frame_is_32_bytes() {
         let payload = make_payload(12345, 12.5, 1024, 8192, 20480, 100000, 0.42);
-        let frame = encode_heartbeat_v2(&payload);
+        let frame = encode_heartbeat(&payload);
         assert_eq!(
             frame.len(),
             32,
-            "Protocol v2 frame must be exactly 32 bytes"
+            "Protocol v1 frame must be exactly 32 bytes"
         );
     }
 
@@ -426,7 +349,7 @@ mod tests {
             100000,                // disk_total
             0.42,                  // load   → 42 as u16
         );
-        let frame = encode_heartbeat_v2(&payload);
+        let frame = encode_heartbeat(&payload);
 
         // [0..8] uptime_seconds little-endian u64
         let uptime = u64::from_le_bytes(frame[0..8].try_into().unwrap());
@@ -469,7 +392,7 @@ mod tests {
     #[test]
     fn test_frame_zero_metrics() {
         let payload = make_payload(0, 0.0, 0, 0, 0, 0, 0.0);
-        let frame = encode_heartbeat_v2(&payload);
+        let frame = encode_heartbeat(&payload);
         assert_eq!(
             frame, [0u8; 32],
             "All-zero metrics must produce an all-zero frame"
@@ -481,7 +404,7 @@ mod tests {
     fn test_frame_large_uptime() {
         let uptime = u64::MAX / 2;
         let payload = make_payload(uptime, 0.0, 0, 0, 0, 0, 0.0);
-        let frame = encode_heartbeat_v2(&payload);
+        let frame = encode_heartbeat(&payload);
         let decoded = u64::from_le_bytes(frame[0..8].try_into().unwrap());
         assert_eq!(decoded, uptime);
     }
@@ -491,7 +414,7 @@ mod tests {
     fn test_frame_max_cpu_load() {
         // 100.0 × 100 = 10000, well within u16 range (max 65535)
         let payload = make_payload(0, 100.0, 0, 0, 0, 0, 99.99);
-        let frame = encode_heartbeat_v2(&payload);
+        let frame = encode_heartbeat(&payload);
         let cpu_x100 = u16::from_le_bytes(frame[8..10].try_into().unwrap());
         assert_eq!(cpu_x100, 10000, "100% × 100 = 10000");
         let load_x100 = u16::from_le_bytes(frame[28..30].try_into().unwrap());

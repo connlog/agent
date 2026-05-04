@@ -158,7 +158,7 @@ fn one_shot_redirect(target: &'static str) -> (String, mpsc::Receiver<CapturedRe
 fn make_payload() -> HeartbeatPayload {
     HeartbeatPayload {
         agent_version: "1.2.0".into(),
-        protocol_version: 2,
+        protocol_version: 1,
         config_version: 0,
         hostname: "sim-host".into(),
         os: "linux".into(),
@@ -206,10 +206,10 @@ fn heartbeat_200_parses_response() {
     assert_eq!(req.method, "POST");
     assert_eq!(req.path, "/api/agents/heartbeat");
 
-    // Required identity headers (wire protocol v2 carries identity in headers).
+    // Required identity headers (binary protocol v1 carries identity in headers).
     assert_eq!(req.header("Authorization"), Some("Bearer test-token"));
     assert_eq!(req.header("X-Agent-Version"), Some("1.2.0"));
-    assert_eq!(req.header("X-Protocol-Version"), Some("2"));
+    assert_eq!(req.header("X-Protocol-Version"), Some("1"));
     assert_eq!(req.header("X-Hostname"), Some("sim-host"));
     assert_eq!(req.header("X-OS"), Some("linux"));
     assert_eq!(req.header("X-Arch"), Some("x86_64"));
@@ -230,7 +230,7 @@ fn heartbeat_200_parses_response() {
         "machine-id must be lowercase hex"
     );
 
-    // Binary frame is 32 bytes exactly (protocol v2).
+    // Binary frame is 32 bytes exactly (protocol v1).
     assert_eq!(req.body.len(), 32, "v2 wire frame must be exactly 32 bytes");
 }
 

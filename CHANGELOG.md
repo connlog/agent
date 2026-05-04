@@ -8,7 +8,26 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 
 ## [Unreleased]
 
-## [1.3.0] — 2026-05-01
+## [1.3.2] — 2026-05-04
+
+### Fixed
+
+- **Heartbeats reach the platform again.** The agent has been advertising
+  `protocol_version: 2` (binary wire format) in headers, but the platform's
+  validation gate only accepted `protocol_version === 1` and rejected every
+  heartbeat with `400 Unsupported protocol version`. Result: no
+  `AgentSnapshot` writes, no rollups, and a completely blank dashboard
+  (overview cards and per-agent details). The wire format itself was always
+  correct; only the version integer was wrong.
+
+### Changed
+
+- **Single, unified wire protocol (v1 binary).** Pre-launch decision: there
+  is now exactly one supported transport — the 32-byte little-endian binary
+  frame over `application/octet-stream`, identified as `protocol_version: 1`.
+  The legacy JSON heartbeat path has been removed from both the agent and the
+  platform. `encode_heartbeat_v2` is now `encode_heartbeat`. The
+  `ApiClient.use_binary` toggle and `send_heartbeat_json` fallback are gone.
 
 ### Added
 

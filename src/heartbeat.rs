@@ -500,7 +500,7 @@ mod tests {
     fn heartbeat_payload_omits_dev_mode_when_none() {
         let payload = HeartbeatPayload {
             agent_version: "1.0.0".to_string(),
-            protocol_version: 2,
+            protocol_version: 1,
             config_version: 1,
             hostname: "h".into(),
             os: "linux".into(),

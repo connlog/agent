@@ -27,7 +27,10 @@ use http::{ApiClient, ApiError};
 use metrics::MetricsCollector;
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-const PROTOCOL_VERSION: u32 = 2;
+/// Wire protocol version. v1 = 32-byte little-endian binary frame over
+/// `application/octet-stream`; identity metadata travels in `X-*` headers.
+/// There is intentionally no JSON fallback — both ends speak binary only.
+const PROTOCOL_VERSION: u32 = 1;
 
 /// Maximum consecutive 401 errors before self-uninstall.
 ///
