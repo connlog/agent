@@ -238,9 +238,9 @@ impl ApiClient {
             );
         }
 
-        envelope
-            .data
-            .ok_or_else(|| anyhow::anyhow!("Config envelope missing `data` field: {}", response_text))
+        envelope.data.ok_or_else(|| {
+            anyhow::anyhow!("Config envelope missing `data` field: {}", response_text)
+        })
     }
 }
 
