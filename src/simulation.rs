@@ -352,12 +352,19 @@ fn heartbeat_redirect_is_not_followed() {
 
 #[test]
 fn fetch_config_parses_and_clamp_keeps_it_sane() {
+    // Platform wraps the response in `{ ok: true, data: {...} }` — the
+    // agent must unwrap the envelope. Regression: prior to v1.3.4, the
+    // agent deserialised this directly into `AgentConfig` and failed on
+    // every refresh, silently sticking on the v0 fallback config.
     let body = br#"{
-        "configVersion": 7,
-        "heartbeatIntervalSeconds": 1,
-        "missedThreshold": 999,
-        "metrics": {"cpu": true, "memory": true, "disk": false, "load": true},
-        "maxPayloadSizeKb": 99999
+        "ok": true,
+        "data": {
+            "configVersion": 7,
+            "heartbeatIntervalSeconds": 1,
+            "missedThreshold": 999,
+            "metrics": {"cpu": true, "memory": true, "disk": false, "load": true},
+            "maxPayloadSizeKb": 99999
+        }
     }"#
     .to_vec();
     let (base, _rx) = one_shot_server("200 OK", body);

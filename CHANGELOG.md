@@ -8,6 +8,20 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 
 ## [Unreleased]
 
+## [1.3.4] — 2026-05-04
+
+### Fixed
+
+- **Config fetch now unwraps the platform response envelope.** The platform
+  returns `GET /api/agents/config` as `{"ok":true,"data":<AgentConfig>}`,
+  but the agent was deserialising the envelope directly into `AgentConfig`
+  and failing every config refresh with `Failed to parse config response`.
+  The agent silently fell back to `safe_fallback()` (version `0`),
+  triggering a `config_outdated` round-trip on every heartbeat and never
+  picking up the real server-side config — including any metric toggles
+  the workspace plan dictates. Fixed by parsing through an `Envelope<T>`
+  wrapper and pulling out `data`.
+
 ## [1.3.3] — 2026-05-04
 
 ### Fixed

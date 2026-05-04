@@ -213,10 +213,34 @@ impl ApiClient {
             .text()
             .context("Failed to read config response body")?;
 
-        let config: AgentConfig = serde_json::from_str(&response_text)
-            .with_context(|| format!("Failed to parse config response: {}", response_text))?;
+        // The platform wraps successful responses in an `apiResponse.ok`
+        // envelope: `{"ok":true,"data":<AgentConfig>}`. Parse the envelope
+        // first, then extract `data`. Direct `from_str::<AgentConfig>` would
+        // (and historically did) fail with "missing field configVersion",
+        // leaving the agent stuck on the v0 fallback config — which has all
+        // metric toggles enabled by default but, crucially, prevented config
+        // version ever advancing past 0 and broke any feature that gates on
+        // `configVersion > 0`.
+        #[derive(serde::Deserialize)]
+        struct Envelope<T> {
+            ok: bool,
+            data: Option<T>,
+            error: Option<String>,
+        }
 
-        Ok(config)
+        let envelope: Envelope<AgentConfig> = serde_json::from_str(&response_text)
+            .with_context(|| format!("Failed to parse config envelope: {}", response_text))?;
+
+        if !envelope.ok {
+            anyhow::bail!(
+                "Config response not ok: {}",
+                envelope.error.unwrap_or_else(|| response_text.clone())
+            );
+        }
+
+        envelope
+            .data
+            .ok_or_else(|| anyhow::anyhow!("Config envelope missing `data` field: {}", response_text))
     }
 }
 
