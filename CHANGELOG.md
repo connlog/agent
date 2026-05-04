@@ -8,6 +8,24 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 
 ## [Unreleased]
 
+## [1.3.7] — 2026-05-04
+
+### Fixed
+
+- **CPU usage no longer stuck at 0%.** `MetricsCollector::new()` was using
+  `System::new()`, which creates an *empty* sysinfo system with no CPUs
+  enumerated. `refresh_cpu_usage()` only refreshes CPUs already in the
+  list, so the list stayed empty forever and `global_cpu_usage()` always
+  returned `0.0`. Switched to `System::new_all()` for the initial
+  enumeration; subsequent ticks still use the cheap `refresh_cpu_usage()`
+  + sleep + `refresh_cpu_usage()` recipe.
+- **1-minute load average reads `/proc/loadavg` directly on Linux.** The
+  sysinfo wrapper has been observed to silently return `0.00` on some
+  hosts. Reading the file directly is a single `read_to_string` of a
+  ~30-byte file with a stable, well-defined format — no extra deps and no
+  surprise-zeros. Falls back to `sysinfo::System::load_average()` on
+  non-Linux.
+
 ## [1.3.6] — 2026-05-04
 
 ### Fixed

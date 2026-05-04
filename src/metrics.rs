@@ -60,8 +60,14 @@ impl MetricsCollector {
 
     /// Create a new collector. Performs a full initial refresh to populate CPU baseline.
     pub fn new() -> Result<Self> {
-        let mut sys = System::new();
-        // Initial CPU sample - sysinfo needs two refreshes with a small gap
+        // IMPORTANT: `System::new()` creates an EMPTY system with no CPUs
+        // enumerated. `refresh_cpu_usage()` only refreshes CPUs that are
+        // already in the list — so on a fresh `System::new()` it's a no-op
+        // and `global_cpu_usage()` returns 0.0 forever. `new_all()` does the
+        // initial enumeration of CPUs (and processes/memory). After that we
+        // can use the cheap `refresh_cpu_usage()` per tick.
+        let mut sys = System::new_all();
+        // Initial CPU sample — sysinfo needs two refreshes with a small gap
         // to compute usage delta. The first heartbeat would otherwise read
         // 0 % even on a busy host.
         sys.refresh_cpu_usage();
@@ -237,7 +243,7 @@ impl MetricsCollector {
             }
         };
 
-        let load_1m = System::load_average().one;
+        let load_1m = read_load_1m();
 
         SystemMetrics {
             hostname: self.hostname.clone(),
@@ -252,6 +258,26 @@ impl MetricsCollector {
             load_1m,
         }
     }
+}
+
+/// Read the 1-minute load average. On Linux we read `/proc/loadavg` directly
+/// because the sysinfo wrapper has been observed to silently return 0.0 on
+/// some hosts (likely a static-state caching quirk in older `procfs` parses).
+/// `/proc/loadavg` is a tiny well-defined file:
+///     `0.51 0.42 0.34 1/345 12345`
+/// First field is the 1m load. On non-Linux we keep the sysinfo path.
+fn read_load_1m() -> f64 {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(s) = std::fs::read_to_string("/proc/loadavg") {
+            if let Some(first) = s.split_whitespace().next() {
+                if let Ok(v) = first.parse::<f64>() {
+                    return v;
+                }
+            }
+        }
+    }
+    System::load_average().one
 }
 
 /// Best-effort extraction of a panic payload's message.
