@@ -63,10 +63,11 @@ SystemCallFilter=~@privileged @resources @mount @debug @cpu-emulation @obsolete 
 ExecStopPost=+/bin/bash -c '\
 if [ -f /run/connlog/.update_requested ]; then \
     echo "ConnLog: Update marker detected, applying update..."; \
-    cp /run/connlog/connlog-agent-new /usr/local/bin/connlog-agent; \
-    chmod 755 /usr/local/bin/connlog-agent; \
-    if /usr/local/bin/connlog-agent --emit-service > /run/connlog/connlog-agent.service.new 2>/dev/null; then \
-        mv /run/connlog/connlog-agent.service.new /etc/systemd/system/connlog-agent.service; \
+    cp /run/connlog/connlog-agent-new /usr/local/bin/connlog-agent.new && \
+    chmod 755 /usr/local/bin/connlog-agent.new && \
+    mv /usr/local/bin/connlog-agent.new /usr/local/bin/connlog-agent; \
+    if /usr/local/bin/connlog-agent --emit-service > /etc/systemd/system/connlog-agent.service.new 2>/dev/null; then \
+        mv /etc/systemd/system/connlog-agent.service.new /etc/systemd/system/connlog-agent.service; \
         echo "ConnLog: Service file refreshed from new binary."; \
     else \
         echo "ConnLog: Warning - could not refresh service file, keeping existing."; \
@@ -472,6 +473,44 @@ mod tests {
         assert!(SYSTEMD_SERVICE.contains("/run/connlog/.update_requested"));
         assert!(SYSTEMD_SERVICE.contains("/run/connlog/.uninstall_requested"));
         assert!(SYSTEMD_SERVICE.contains("systemctl daemon-reload"));
+    }
+
+    /// The binary replacement in ExecStopPost MUST NOT overwrite the live binary
+    /// directly with `cp`. A crash during `cp` leaves a corrupt binary and a
+    /// permanently bricked agent. The correct pattern is:
+    ///   1. cp → connlog-agent.new   (safe: original is untouched if cp fails)
+    ///   2. chmod                     (sets executable bit on the staging file)
+    ///   3. mv .new → connlog-agent  (atomic rename() within the same fs)
+    #[test]
+    fn systemd_unit_binary_replacement_is_atomic() {
+        // The staged binary must land in a .new file first, then be atomically
+        // renamed into place. Direct cp to the live path is not atomic.
+        assert!(
+            SYSTEMD_SERVICE.contains("connlog-agent.new"),
+            "binary must be staged to connlog-agent.new before atomic mv into place"
+        );
+        assert!(
+            SYSTEMD_SERVICE
+                .contains("mv /usr/local/bin/connlog-agent.new /usr/local/bin/connlog-agent"),
+            "final replacement must be an atomic mv, not a direct cp"
+        );
+    }
+
+    /// The service-file refresh temp file must be created on the same
+    /// filesystem as the destination so that `mv` is an atomic rename().
+    /// Writing to /run (tmpfs) and then mv-ing to /etc (root fs) crosses
+    /// filesystem boundaries — the kernel falls back to copy+unlink, which
+    /// is NOT atomic.
+    #[test]
+    fn systemd_unit_service_file_refresh_is_atomic() {
+        assert!(
+            SYSTEMD_SERVICE.contains("/etc/systemd/system/connlog-agent.service.new"),
+            "service file temp must be on the same fs as the target (/etc/systemd/system)"
+        );
+        assert!(
+            !SYSTEMD_SERVICE.contains("/run/connlog/connlog-agent.service.new"),
+            "service file temp must NOT be on /run (tmpfs) — cross-fs mv is not atomic"
+        );
     }
 
     #[test]

@@ -119,4 +119,4 @@ GitHub Actions builds both architectures, creates tarballs with SHA-256 checksum
 
 ## License
 
-MIT
+[MIT](LICENSE) — Copyright (c) 2026 IA Solutions B.V.

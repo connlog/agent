@@ -803,4 +803,104 @@ mod tests {
         assert!(hex_decode("zz").is_err());
         assert!(hex_decode("abc").is_err()); // odd length
     }
+
+    // ── require_https ───────────────────────────────────────────
+    //
+    // SECURITY: All update-path fetches (binary, signature, checksum) must use
+    // HTTPS. A non-HTTPS URL means an attacker with network access could serve
+    // a malicious binary *before* the Ed25519 / SHA-256 checks run. Tests here
+    // pin that guard so a careless refactor can't silently drop it.
+
+    #[test]
+    fn require_https_accepts_https_url() {
+        assert!(
+            require_https("https://example.com/agent", "binary").is_ok(),
+            "HTTPS URLs must be accepted"
+        );
+    }
+
+    #[test]
+    fn require_https_rejects_http_url() {
+        let err = require_https("http://example.com/agent", "binary").unwrap_err();
+        assert!(
+            err.to_string().contains("non-HTTPS"),
+            "error must name the policy: {err}"
+        );
+    }
+
+    #[test]
+    fn require_https_rejects_empty_url() {
+        assert!(
+            require_https("", "binary").is_err(),
+            "empty URL must be rejected"
+        );
+    }
+
+    #[test]
+    fn require_https_rejects_ftp_and_other_schemes() {
+        assert!(require_https("ftp://example.com/agent", "binary").is_err());
+        assert!(require_https("file:///usr/local/bin/agent", "binary").is_err());
+    }
+
+    // ── verify_sha256 ───────────────────────────────────────────
+    //
+    // SECURITY: SHA-256 is the last integrity check before the binary is staged.
+    // If this check ever returns Ok on a mismatched hash, an attacker who can
+    // MITM the download URL (even over HTTPS, e.g. via a CDN compromise) can
+    // replace the binary. These tests ensure the check is correct and
+    // case-insensitive (the platform may emit uppercase hex).
+
+    #[test]
+    fn verify_sha256_accepts_correct_hash() {
+        let data = b"hello world";
+        // sha256("hello world") = b94d27b9...
+        let expected = "b94d27b9934d3e08a52e52d7da7dabfac484efe04294e576f6a4e578cd928ba2";
+        // Use ring to compute what we expect, then verify our function accepts it.
+        use ring::digest;
+        let actual = digest::digest(&digest::SHA256, data);
+        let actual_hex: String = actual
+            .as_ref()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        let result = verify_sha256(data, &actual_hex);
+        assert!(
+            result.is_ok(),
+            "correct SHA-256 hash must be accepted, actual={actual_hex}"
+        );
+        // Expected hash must be 32 bytes
+        let digest = result.unwrap();
+        assert_eq!(digest.as_ref().len(), 32);
+        // Suppress the unused variable warning on the constant above
+        let _ = expected;
+    }
+
+    #[test]
+    fn verify_sha256_rejects_wrong_hash() {
+        let data = b"hello world";
+        let wrong = "0".repeat(64);
+        let err = verify_sha256(data, &wrong).unwrap_err();
+        assert!(
+            err.to_string().contains("SHA-256 MISMATCH"),
+            "error must identify mismatch: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_sha256_is_case_insensitive_for_expected() {
+        // The platform may return uppercase hex; the agent must accept both cases.
+        let data = b"test data";
+        use ring::digest;
+        let actual = digest::digest(&digest::SHA256, data);
+        let upper_hex: String = actual
+            .as_ref()
+            .iter()
+            .map(|b| format!("{:02X}", b))
+            .collect();
+        let result = verify_sha256(data, &upper_hex);
+        assert!(
+            result.is_ok(),
+            "uppercase hex from platform must be accepted: {upper_hex}"
+        );
+    }
 }

@@ -8,6 +8,46 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 
 ## [Unreleased]
 
+## [1.3.8] — 2026-05-07
+
+### Security
+
+- **ExecStopPost binary replacement is now atomic.** The previous
+  `cp /run/connlog/connlog-agent-new /usr/local/bin/connlog-agent` wrote
+  directly to the live binary path. A power failure or OOM-kill during
+  the copy would leave a partially-written, corrupt binary — bricking the
+  agent permanently. Fixed by staging to
+  `/usr/local/bin/connlog-agent.new` first, setting permissions, then
+  using `mv` (an atomic `rename()` within the same filesystem). The live
+  binary is never touched until the replacement is fully written to disk.
+- **Service-file refresh in ExecStopPost is now atomic.** The previous
+  implementation wrote the new `.service` file to `/run/connlog/` (tmpfs)
+  and then `mv`-ed it to `/etc/systemd/system/`. A cross-filesystem `mv`
+  is not atomic (kernel falls back to copy + unlink). Fixed by writing
+  the temp file directly to `/etc/systemd/system/connlog-agent.service.new`
+  then using `mv` within the same filesystem.
+
+### Added
+
+- `docs/agent-architecture.md` — architecture reference for contributors,
+  auditors, and security researchers. Covers startup, heartbeat, update,
+  install/uninstall flows, updater safety invariants, wire protocol layout,
+  versioning rules, and what must never be broken.
+- `LICENSE` — MIT license file (copyright IA Solutions B.V.)
+- Tests for `require_https` in `update.rs`: verifies that HTTP, FTP, and
+  empty URLs are rejected by the update download path.
+- Tests for `verify_sha256` in `update.rs`: verifies correct hash is
+  accepted, wrong hash is rejected with a named error, and the comparison
+  is case-insensitive (platform may return uppercase hex).
+- Tests for ExecStopPost atomicity in `install/linux.rs`: pins the
+  `.new` staging + `mv` pattern and the same-filesystem service file temp
+  location so they cannot be silently reverted.
+
+### Changed
+
+- `README.md` License section now links to the `LICENSE` file and names
+  the copyright holder.
+
 ## [1.3.7] — 2026-05-04
 
 ### Fixed
