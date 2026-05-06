@@ -144,18 +144,18 @@ ExecStopPost (runs as root, +/bin/bash)
 These invariants must never be broken. They are pinned by tests in
 `src/install/linux.rs` and `src/update.rs`.
 
-| Invariant | How it is enforced |
-|---|---|
+| Invariant                                              | How it is enforced                                                                                                                            |
+| ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
 | Current binary untouched until replacement is verified | Staged to `/run/connlog/connlog-agent-new`; original at `/usr/local/bin/connlog-agent` is only replaced after a verified copy+rename sequence |
-| Binary replacement is atomic | `cp → .new` on the destination filesystem, `chmod`, then `mv` (kernel `rename()` — atomic within same fs) |
-| Service file refresh is atomic | Temp file written directly to `/etc/systemd/system/*.new`, then `mv` within same fs |
-| SHA-256 always checked | `verify_sha256()` called before `verify_ed25519()`; mismatch aborts immediately |
-| Ed25519 always checked | `verify_ed25519()` called after SHA-256; can only be skipped with `force=true` AND no compiled-in key |
-| Downgrades rejected | `is_version_upgrade()` blocks any version ≤ current |
-| Non-HTTPS URLs rejected | `require_https()` called before every download |
-| Oversized downloads rejected | 50 MB hard cap + streaming read; also a 100 KB floor (too small = suspicious) |
-| Failed update leaves agent running | `try_apply_update()` returns `Err` on any failure; main loop catches it, logs, and continues |
-| Signing key placeholder ≠ real key | All-zero 64-char hex key is a sentinel; `has_signing_key()` returns false |
+| Binary replacement is atomic                           | `cp → .new` on the destination filesystem, `chmod`, then `mv` (kernel `rename()` — atomic within same fs)                                     |
+| Service file refresh is atomic                         | Temp file written directly to `/etc/systemd/system/*.new`, then `mv` within same fs                                                           |
+| SHA-256 always checked                                 | `verify_sha256()` called before `verify_ed25519()`; mismatch aborts immediately                                                               |
+| Ed25519 always checked                                 | `verify_ed25519()` called after SHA-256; can only be skipped with `force=true` AND no compiled-in key                                         |
+| Downgrades rejected                                    | `is_version_upgrade()` blocks any version ≤ current                                                                                           |
+| Non-HTTPS URLs rejected                                | `require_https()` called before every download                                                                                                |
+| Oversized downloads rejected                           | 50 MB hard cap + streaming read; also a 100 KB floor (too small = suspicious)                                                                 |
+| Failed update leaves agent running                     | `try_apply_update()` returns `Err` on any failure; main loop catches it, logs, and continues                                                  |
+| Signing key placeholder ≠ real key                     | All-zero 64-char hex key is a sentinel; `has_signing_key()` returns false                                                                     |
 
 ---
 
@@ -208,11 +208,11 @@ token + platform URL in `/etc/connlog/agent.conf`.
 or malicious server from pushing values that would spin the CPU or prevent
 check-ins:
 
-| Field | Minimum | Maximum |
-|---|---|---|
-| `heartbeat_interval_secs` | 10 s | 86400 s (24 h) |
-| `missed_threshold` | 1 | 100 |
-| `max_payload_size_kb` | 1 KB (0 = unlimited) | 1024 KB |
+| Field                     | Minimum              | Maximum        |
+| ------------------------- | -------------------- | -------------- |
+| `heartbeat_interval_secs` | 10 s                 | 86400 s (24 h) |
+| `missed_threshold`        | 1                    | 100            |
+| `max_payload_size_kb`     | 1 KB (0 = unlimited) | 1024 KB        |
 
 ---
 
@@ -220,17 +220,17 @@ check-ins:
 
 Binary frame (v1), 32 bytes, little-endian:
 
-| Offset | Size | Field |
-|---|---|---|
-| 0 | 8 | uptime_seconds (u64 LE) |
-| 8 | 2 | cpu_percent × 100 (u16 LE) |
-| 10 | 2 | cpu_max × 100 (u16 LE) |
-| 12 | 4 | memory_used_mb (u32 LE) |
-| 16 | 4 | memory_total_mb (u32 LE) |
-| 20 | 4 | disk_used_mb (u32 LE) |
-| 24 | 4 | disk_total_mb (u32 LE) |
-| 28 | 2 | load_1m × 100 (u16 LE) |
-| 30 | 2 | load_max × 100 (u16 LE) |
+| Offset | Size | Field                      |
+| ------ | ---- | -------------------------- |
+| 0      | 8    | uptime_seconds (u64 LE)    |
+| 8      | 2    | cpu_percent × 100 (u16 LE) |
+| 10     | 2    | cpu_max × 100 (u16 LE)     |
+| 12     | 4    | memory_used_mb (u32 LE)    |
+| 16     | 4    | memory_total_mb (u32 LE)   |
+| 20     | 4    | disk_used_mb (u32 LE)      |
+| 24     | 4    | disk_total_mb (u32 LE)     |
+| 28     | 2    | load_1m × 100 (u16 LE)     |
+| 30     | 2    | load_max × 100 (u16 LE)    |
 
 Identity metadata travels in HTTP headers (`X-Agent-Version`, `X-Hostname`,
 `X-OS`, `X-Arch`, `X-Machine-Id`, etc.). There is no JSON fallback.

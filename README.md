@@ -16,11 +16,11 @@ Get your token from the [ConnLog dashboard](https://connlog.com) under **Agents 
 
 ### Supported platforms
 
-| OS      | Architecture | Binary                                   |
-| ------- | ------------ | ---------------------------------------- |
-| Linux   | x86_64       | `connlog-agent-*-linux-x86_64.tar.gz`    |
-| Linux   | aarch64      | `connlog-agent-*-linux-aarch64.tar.gz`   |
-| Windows | x86_64       | `connlog-agent-*-windows-x86_64.exe`     |
+| OS      | Architecture | Binary                                 |
+| ------- | ------------ | -------------------------------------- |
+| Linux   | x86_64       | `connlog-agent-*-linux-x86_64.tar.gz`  |
+| Linux   | aarch64      | `connlog-agent-*-linux-aarch64.tar.gz` |
+| Windows | x86_64       | `connlog-agent-*-windows-x86_64.exe`   |
 
 For Windows-specific install and management instructions, see [WINDOWS.md](WINDOWS.md).
 
@@ -102,17 +102,17 @@ Each metric category (CPU, memory, disk, load) can be toggled on/off from the da
 
 ## File layout
 
-**Linux**
+**Linux**:
 
-```
+```txt
 /usr/local/bin/connlog-agent              # Binary
 /etc/connlog/agent.conf                   # Token + platform URL (mode 600, root-only)
 /etc/systemd/system/connlog-agent.service
 ```
 
-**Windows** — see [WINDOWS.md](WINDOWS.md) for full details.
+**Windows**: see [WINDOWS.md](WINDOWS.md) for full details.
 
-```
+```txt
 C:\Program Files\ConnLog\Agent\connlog-agent.exe
 C:\ProgramData\ConnLog\Agent\agent.conf   # DPAPI-encrypted token
 ```
