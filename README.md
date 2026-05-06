@@ -1,6 +1,6 @@
 # ConnLog Agent
 
-Lightweight system monitoring agent for Linux servers. Collects CPU, memory, disk, and load metrics and sends them to the [ConnLog](https://connlog.com) platform via authenticated heartbeats.
+Lightweight system monitoring agent for Linux and Windows servers. Collects CPU, memory, disk, and load metrics and sends them to the [ConnLog](https://connlog.com) platform via authenticated heartbeats.
 
 Single static binary. One-command install. Zero dependencies.
 
@@ -16,10 +16,13 @@ Get your token from the [ConnLog dashboard](https://connlog.com) under **Agents 
 
 ### Supported platforms
 
-| OS    | Architecture | Binary                              |
-|-------|-------------|--------------------------------------|
-| Linux | x86_64      | `connlog-agent-*-linux-x86_64.tar.gz`  |
-| Linux | aarch64     | `connlog-agent-*-linux-aarch64.tar.gz` |
+| OS      | Architecture | Binary                                   |
+| ------- | ------------ | ---------------------------------------- |
+| Linux   | x86_64       | `connlog-agent-*-linux-x86_64.tar.gz`    |
+| Linux   | aarch64      | `connlog-agent-*-linux-aarch64.tar.gz`   |
+| Windows | x86_64       | `connlog-agent-*-windows-x86_64.exe`     |
+
+For Windows-specific install and management instructions, see [WINDOWS.md](WINDOWS.md).
 
 ### Two-step install
 
@@ -37,6 +40,13 @@ sudo connlog-agent --install --token <TOKEN>
 connlog-agent --token <TOKEN>
 ```
 
+You can also pass the token via the `CONNLOG_TOKEN` environment variable instead of the `--token` flag:
+
+```bash
+export CONNLOG_TOKEN=agent_xxxxxxxxxxxx
+connlog-agent
+```
+
 ## Management
 
 ```bash
@@ -50,7 +60,21 @@ journalctl -u connlog-agent -f
 sudo connlog-agent --uninstall
 ```
 
+Note: uninstall preserves the `connlog-agent` system user. Remove it manually if needed: `sudo userdel connlog-agent`.
+
 You can also trigger a remote uninstall from the ConnLog dashboard. The agent will clean itself up on the next heartbeat.
+
+### Diagnostics
+
+These commands are useful after install or when troubleshooting. They require a token but never start the heartbeat loop.
+
+```bash
+# Fetch and print the agent config from the platform
+connlog-agent --check-config --token <TOKEN>
+
+# Send one heartbeat and print the platform response
+connlog-agent --test-heartbeat --token <TOKEN>
+```
 
 ## How it works
 
@@ -61,27 +85,36 @@ You can also trigger a remote uninstall from the ConnLog dashboard. The agent wi
 
 ### Collected metrics
 
-| Metric           | Description                         |
-|------------------|-------------------------------------|
-| `cpu_percent`    | CPU usage across all cores          |
-| `memory_used_mb` | Used RAM in MB                      |
-| `memory_total_mb`| Total RAM in MB                     |
-| `disk_used_mb`   | Used disk on root filesystem in MB  |
-| `disk_total_mb`  | Total disk on root filesystem in MB |
-| `load_1m`        | 1-minute load average               |
-| `hostname`       | System hostname                     |
-| `os`             | Operating system                    |
-| `arch`           | CPU architecture                    |
-| `uptime_seconds` | System uptime                       |
+| Metric            | Description                         |
+| ----------------- | ----------------------------------- |
+| `cpu_percent`     | CPU usage across all cores          |
+| `memory_used_mb`  | Used RAM in MB                      |
+| `memory_total_mb` | Total RAM in MB                     |
+| `disk_used_mb`    | Used disk on root filesystem in MB  |
+| `disk_total_mb`   | Total disk on root filesystem in MB |
+| `load_1m`         | 1-minute load average               |
+| `hostname`        | System hostname                     |
+| `os`              | Operating system                    |
+| `arch`            | CPU architecture                    |
+| `uptime_seconds`  | System uptime                       |
 
 Each metric category (CPU, memory, disk, load) can be toggled on/off from the dashboard.
 
 ## File layout
 
+**Linux**
+
 ```
-/usr/local/bin/connlog-agent       # Binary
-/etc/connlog/agent.conf            # Token + config (mode 600)
+/usr/local/bin/connlog-agent              # Binary
+/etc/connlog/agent.conf                   # Token + platform URL (mode 600, root-only)
 /etc/systemd/system/connlog-agent.service
+```
+
+**Windows** — see [WINDOWS.md](WINDOWS.md) for full details.
+
+```
+C:\Program Files\ConnLog\Agent\connlog-agent.exe
+C:\ProgramData\ConnLog\Agent\agent.conf   # DPAPI-encrypted token
 ```
 
 ## Development
@@ -100,11 +133,19 @@ The `--endpoint` flag is stripped from release builds at compile time. Productio
 
 ### Cross-compilation
 
-CI uses [cross](https://github.com/cross-rs/cross) for multi-arch builds:
+CI uses [cross](https://github.com/cross-rs/cross) for Linux musl targets and a native `windows-latest` runner for Windows:
 
 ```bash
 cargo install cross --git https://github.com/cross-rs/cross
+
+# Linux x86_64 (musl static)
+cross build --release --target x86_64-unknown-linux-musl
+
+# Linux aarch64 (musl static)
 cross build --release --target aarch64-unknown-linux-musl
+
+# Windows (requires native MSVC toolchain — run on Windows)
+cargo build --release --target x86_64-pc-windows-msvc
 ```
 
 ### Releases
@@ -112,10 +153,10 @@ cross build --release --target aarch64-unknown-linux-musl
 Push a version tag to trigger CI:
 
 ```bash
-git tag v0.2.1 && git push origin v0.2.1
+git tag vX.Y.Z && git push origin vX.Y.Z
 ```
 
-GitHub Actions builds both architectures, creates tarballs with SHA-256 checksums, and publishes a GitHub release. The install script picks up the latest release automatically.
+GitHub Actions builds all three targets (x86_64-musl, aarch64-musl, Windows x86_64), creates tarballs with SHA-256 checksums and Ed25519 signatures, and publishes a GitHub release. The install script picks up the latest release automatically.
 
 ## License
 
