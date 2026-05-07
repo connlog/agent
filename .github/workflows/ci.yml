@@ -1,9 +1,5 @@
 name: CI
 
-# Validates pushes to canary/main and all PRs. The release workflow only runs
-# on tag push, so without this we'd discover Windows compile failures only
-# after tagging — which would leave a half-published GitHub release.
-
 on:
   push:
     branches: [canary, main]
@@ -16,16 +12,8 @@ env:
 
 jobs:
   fmt-clippy-test:
-    name: ${{ matrix.os }} / fmt + clippy + test
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: linux
-            runner: ubuntu-latest
-          - os: windows
-            runner: windows-latest
+    name: linux / fmt + clippy + test
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -42,14 +30,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ matrix.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ matrix.os }}-cargo-
+          key: linux-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: linux-cargo-
 
       - name: cargo fmt --check
-        # Run on Linux only; rustfmt output is platform-independent and re-running
-        # it on Windows just doubles the wall time.
-        if: matrix.os == 'linux'
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
@@ -66,7 +50,6 @@ jobs:
         # us around 6-8 MiB today; 12 MiB leaves headroom but flags regressions
         # like an accidental tokio/serde_yaml/syn-heavy dep before they ship.
         # Bump deliberately and explain why in the commit if you must.
-        if: matrix.os == 'linux'
         run: |
           set -e
           BIN="target/release/connlog-agent"

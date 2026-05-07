@@ -78,6 +78,26 @@ pub struct AgentConfig {
     /// Maximum payload size for heartbeats (KB)
     #[serde(rename = "maxPayloadSizeKb")]
     pub max_payload_size_kb: u64,
+
+    /// Extended Linux resource metrics (opt-in per agent)
+    #[serde(rename = "extendedMetrics", default)]
+    pub extended_metrics: ExtendedMetricsConfig,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ExtendedMetricsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(rename = "discoverResources", default)]
+    pub discover_resources: bool,
+    #[serde(rename = "collectDisks", default)]
+    pub collect_disks: bool,
+    #[serde(rename = "collectNetwork", default)]
+    pub collect_network: bool,
+    #[serde(rename = "monitoredDiskKeys", default)]
+    pub monitored_disk_keys: Vec<String>,
+    #[serde(rename = "monitoredNetworkKeys", default)]
+    pub monitored_network_keys: Vec<String>,
 }
 
 /// Configuration for which metrics to collect
@@ -104,6 +124,7 @@ impl AgentConfig {
                 load: true,
             },
             max_payload_size_kb: 32,
+            extended_metrics: ExtendedMetricsConfig::default(),
         }
     }
 
@@ -159,6 +180,7 @@ mod tests {
                 load: true,
             },
             max_payload_size_kb: payload,
+            extended_metrics: ExtendedMetricsConfig::default(),
         }
     }
 

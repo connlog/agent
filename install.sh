@@ -4,7 +4,7 @@ set -e
 # ConnLog Agent Installer
 # Usage: curl -fsSL https://connlog.com/install.sh | sudo sh -s -- --install --token <token>
 
-REPO="connlog/connlog-agent"
+REPO="connlog/agent"
 INSTALL_DIR="/usr/local/bin"
 BINARY_NAME="connlog-agent"
 

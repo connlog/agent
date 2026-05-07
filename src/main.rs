@@ -8,13 +8,13 @@ use std::time::Duration;
 
 mod config;
 mod defaults;
+mod extended_metrics;
 mod heartbeat;
 mod http;
 mod identity;
 mod install;
 mod metrics;
 mod platform;
-mod service;
 mod update;
 
 #[cfg(test)]
@@ -115,18 +115,6 @@ fn validate_token_prefix(token: &str) -> Result<()> {
 fn main() -> Result<()> {
     init_logger();
 
-    // Windows SCM dispatch — must happen BEFORE anything that touches stdio
-    // assuming a console session. The SCM launches the binary with
-    // `--run-service` (see install/windows.rs); detecting it via raw argv lets
-    // us hand off without parsing the rest of the CLI.
-    #[cfg(windows)]
-    {
-        let raw_args: Vec<String> = std::env::args().collect();
-        if service::is_service_invocation(&raw_args) {
-            return service::run_service();
-        }
-    }
-
     let config = Config::parse();
 
     // Handle --emit-service (used by ExecStopPost during self-update on Linux)
@@ -189,22 +177,7 @@ fn main() -> Result<()> {
 
     let endpoint = config.resolve_endpoint(DEFAULT_ENDPOINT);
 
-    // Interactive run — no shutdown signal, loop forever. The service path
-    // (Windows) builds its own AtomicBool and calls `run_agent_with_shutdown`
-    // directly.
     run_agent_with_shutdown_inner(token, endpoint, Arc::new(AtomicBool::new(false)))
-}
-
-/// Public entry used by the Windows service dispatcher. Builds an endpoint
-/// from the same Config-driven precedence as the interactive path.
-#[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) fn run_agent_with_shutdown(cfg: Config, stop: Arc<AtomicBool>) -> Result<()> {
-    let token = cfg
-        .token
-        .clone()
-        .context("Token missing in service config (corrupt agent.conf?)")?;
-    let endpoint = cfg.resolve_endpoint(DEFAULT_ENDPOINT);
-    run_agent_with_shutdown_inner(token, endpoint, stop)
 }
 
 fn run_agent_with_shutdown_inner(
@@ -251,6 +224,7 @@ fn run_agent_with_shutdown_inner(
     let mut consecutive_unauthorized = 0u32;
     let mut consecutive_errors = 0u32;
     let mut consecutive_uninstall_commands = 0u32;
+    let mut extended_state = extended_metrics::ExtendedMetricsState::default();
 
     // ── Update strategy ──────────────────────────────────────────
     //
@@ -267,8 +241,7 @@ fn run_agent_with_shutdown_inner(
     // proxy is untrusted by design.
 
     // Cooperative sleep helper: returns Err(()) if shutdown was requested
-    // mid-sleep, otherwise Ok(()). Sleeps in 500 ms ticks so a Windows STOP
-    // is observed in <1 s even with a long heartbeat interval.
+    // mid-sleep, otherwise Ok(()). Sleeps in 500 ms ticks for responsiveness.
     let stop_for_sleep = Arc::clone(&stop);
     let interruptible_sleep = move |total_secs: u64| -> Result<(), ()> {
         let deadline = std::time::Instant::now() + Duration::from_secs(total_secs);
@@ -373,6 +346,51 @@ fn run_agent_with_shutdown_inner(
                         Err(e) => {
                             error!("Failed to fetch updated config: {}", e);
                             // Continue with old config - it still works
+                        }
+                    }
+                }
+
+                // Extended Linux metrics (opt-in): discovery + compact samples
+                if extended_metrics::is_linux_runtime()
+                    && extended_metrics::should_collect(
+                        config.extended_metrics.enabled,
+                        config.extended_metrics.collect_disks,
+                        config.extended_metrics.collect_network,
+                    )
+                {
+                    if config.extended_metrics.discover_resources {
+                        let discovery = extended_metrics::collect_discovery();
+                        match client.send_resource_discovery(&discovery) {
+                            Ok(_) => info!(
+                                "Extended discovery sent (disks={}, network={})",
+                                discovery.disks.len(),
+                                discovery.network.len()
+                            ),
+                            Err(e) => warn!("Extended discovery send failed: {}", e),
+                        }
+                    }
+
+                    if extended_metrics::has_monitored(
+                        &config.extended_metrics.monitored_disk_keys,
+                        &config.extended_metrics.monitored_network_keys,
+                    ) {
+                        let samples = extended_metrics::collect_samples(
+                            &mut extended_state,
+                            &config.extended_metrics.monitored_disk_keys,
+                            &config.extended_metrics.monitored_network_keys,
+                        );
+
+                        if extended_metrics::validate_payload_size(
+                            &samples,
+                            config.max_payload_size_kb,
+                        )
+                        .unwrap_or(true)
+                        {
+                            if let Err(e) = client.send_resource_samples(&samples) {
+                                warn!("Extended sample send failed: {}", e);
+                            }
+                        } else {
+                            warn!("Extended sample payload exceeds server max payload size");
                         }
                     }
                 }
@@ -586,15 +604,10 @@ fn log_config_change(old: &AgentConfig, new: &AgentConfig) {
 fn trigger_self_uninstall(reason: &str) {
     error!("UNINSTALL: {}", reason);
 
-    // Linux: prefer the marker-file path so systemd's ExecStopPost can do the
-    // actual root-only cleanup. Windows: write the marker too — the install
-    // flow's recovery action will spawn the elevated cleanup helper. In both
-    // cases, fall back to a direct in-process uninstall if the marker write
-    // fails (only succeeds when we're running with privilege).
-    #[cfg(unix)]
+    // Prefer the marker-file path so systemd's ExecStopPost can do the
+    // actual root-only cleanup. Fall back to a direct in-process uninstall
+    // if the marker write fails (only succeeds when running with privilege).
     let is_supervised = std::env::var("INVOCATION_ID").is_ok();
-    #[cfg(windows)]
-    let is_supervised = true; // Windows agent always runs as a service
 
     if is_supervised {
         info!("UNINSTALL: Running under supervisor — writing uninstall marker");
@@ -623,9 +636,7 @@ fn trigger_self_uninstall(reason: &str) {
         }
     }
 
-    // Exit cleanly — supervisor's restart policy is configured to NOT restart
-    // us after a clean exit (Restart=on-failure on systemd, no auto-restart
-    // after delete on Windows once the marker is processed).
+    // Exit cleanly — systemd Restart=on-failure does not restart clean exits.
     std::process::exit(0);
 }
 

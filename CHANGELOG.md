@@ -8,6 +8,45 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 
 ## [Unreleased]
 
+## [1.4.0] — 2026-05-07
+
+### Added
+
+- **Opt-in extended Linux metrics: disk mount and network interface monitoring.**
+  Agents on paid plans (Developer+) can be enabled for extended metrics via the
+  dashboard. When enabled, the agent discovers disk mounts and network interfaces
+  on the host and reports them to the platform. Only Linux is supported.
+  - `ExtendedMetricsConfig` in agent config controls whether extended metrics
+    are enabled, which disk/network keys to sample, and whether discovery should
+    be re-run.
+  - New `extended_metrics.rs` module: discovers disk mounts from
+    `/proc/self/mountinfo` + `statvfs()`, and network interfaces from
+    `/proc/net/dev`. Virtual/container filesystems and loopback/virtual network
+    interfaces are automatically excluded from default monitoring.
+  - Disk samples include: used/available/total MB, usage %, inode usage %.
+  - Network samples include: rx/tx bytes/second (rate-calculated), rx/tx
+    errors delta, rx/tx dropped delta. Counter resets (interface restart or
+    overflow) are detected and skipped to avoid false spikes.
+  - Discovery is sent to `POST /api/agents/resources/discovery`; samples to
+    `POST /api/agents/resources/samples`. Both are separate lightweight JSON
+    calls — the 32-byte binary heartbeat is unchanged.
+- `src/extended_metrics.rs` — new module with `ExtendedMetricsState`,
+  `collect_discovery()`, and `collect_samples()`.
+
+### Changed
+
+- Heartbeat config response now carries `extendedMetrics` block:
+  `enabled`, `discoverResources`, `collectDisks`, `collectNetwork`,
+  `monitoredDiskKeys`, `monitoredNetworkKeys`.
+- Main loop now conditionally runs the discovery + sample collection cycle
+  in parallel with the heartbeat when `extendedMetrics.enabled` is true.
+- Discovery is only sent when `discoverResources` flag is set by the platform
+  (cleared after first successful ingestion).
+- Removed Windows support. Windows-specific files (`WINDOWS.md`,
+  `src/install/windows.rs`, `src/platform/windows.rs`, `src/service/windows.rs`)
+  have been removed. The agent is Linux-first and the Windows path was untested
+  and incomplete.
+
 ## [1.3.8] — 2026-05-07
 
 ### Security
@@ -328,6 +367,6 @@ considered stable; breaking changes from this point on require a major bump.
 
 - Last pre-1.0 release. See git history for prior changes.
 
-[Unreleased]: https://github.com/connlog/connlog-agent/compare/v1.0.0...HEAD
-[1.0.0]: https://github.com/connlog/connlog-agent/compare/v0.3.6...v1.0.0
-[0.3.6]: https://github.com/connlog/connlog-agent/releases/tag/v0.3.6
+[Unreleased]: https://github.com/connlog/agent/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/connlog/agent/compare/v0.3.6...v1.0.0
+[0.3.6]: https://github.com/connlog/agent/releases/tag/v0.3.6

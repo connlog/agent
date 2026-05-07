@@ -1,8 +1,12 @@
 # ConnLog Agent
 
-Lightweight system monitoring agent for Linux and Windows servers. Collects CPU, memory, disk, and load metrics and sends them to the [ConnLog](https://connlog.com) platform via authenticated heartbeats.
+Lightweight Linux monitoring agent for [ConnLog](https://connlog.com). Collects CPU, memory, disk, and load metrics and sends them to the ConnLog platform via authenticated heartbeats.
 
 Single static binary. One-command install. Zero dependencies.
+
+> **Source:** [github.com/connlog/agent](https://github.com/connlog/agent)  
+> **Binary/service name:** `connlog-agent`  
+> **Supported platforms:** Linux x86_64 and Linux aarch64
 
 ## Install
 
@@ -10,19 +14,16 @@ Single static binary. One-command install. Zero dependencies.
 curl -fsSL https://connlog.com/install.sh | sudo sh -s -- --install --token <TOKEN>
 ```
 
-This will detect your architecture, download the latest release, verify its checksum, install the binary to `/usr/local/bin`, store your token in `/etc/connlog/agent.conf`, and start a systemd service. The agent begins reporting immediately.
+This detects your architecture, downloads the latest release, verifies its SHA-256 checksum, installs the binary to `/usr/local/bin/connlog-agent`, stores your token in `/etc/connlog/agent.conf`, and starts a systemd service. The agent begins reporting immediately.
 
 Get your token from the [ConnLog dashboard](https://connlog.com) under **Agents → Add Agent**.
 
 ### Supported platforms
 
-| OS      | Architecture | Binary                                 |
-| ------- | ------------ | -------------------------------------- |
-| Linux   | x86_64       | `connlog-agent-*-linux-x86_64.tar.gz`  |
-| Linux   | aarch64      | `connlog-agent-*-linux-aarch64.tar.gz` |
-| Windows | x86_64       | `connlog-agent-*-windows-x86_64.exe`   |
-
-For Windows-specific install and management instructions, see [WINDOWS.md](WINDOWS.md).
+| OS    | Architecture | Binary                                 |
+| ----- | ------------ | -------------------------------------- |
+| Linux | x86_64       | `connlog-agent-*-linux-x86_64.tar.gz`  |
+| Linux | aarch64      | `connlog-agent-*-linux-aarch64.tar.gz` |
 
 ### Two-step install
 
@@ -40,7 +41,7 @@ sudo connlog-agent --install --token <TOKEN>
 connlog-agent --token <TOKEN>
 ```
 
-You can also pass the token via the `CONNLOG_TOKEN` environment variable instead of the `--token` flag:
+You can also pass the token via the `CONNLOG_TOKEN` environment variable:
 
 ```bash
 export CONNLOG_TOKEN=agent_xxxxxxxxxxxx
@@ -52,6 +53,8 @@ connlog-agent
 ```bash
 # Check service status
 connlog-agent --status
+# or
+systemctl status connlog-agent
 
 # View logs
 journalctl -u connlog-agent -f
@@ -62,11 +65,9 @@ sudo connlog-agent --uninstall
 
 Note: uninstall preserves the `connlog-agent` system user. Remove it manually if needed: `sudo userdel connlog-agent`.
 
-You can also trigger a remote uninstall from the ConnLog dashboard. The agent will clean itself up on the next heartbeat.
+You can also trigger a remote uninstall from the ConnLog dashboard.
 
 ### Diagnostics
-
-These commands are useful after install or when troubleshooting. They require a token but never start the heartbeat loop.
 
 ```bash
 # Fetch and print the agent config from the platform
@@ -102,19 +103,10 @@ Each metric category (CPU, memory, disk, load) can be toggled on/off from the da
 
 ## File layout
 
-**Linux**:
-
 ```txt
 /usr/local/bin/connlog-agent              # Binary
 /etc/connlog/agent.conf                   # Token + platform URL (mode 600, root-only)
 /etc/systemd/system/connlog-agent.service
-```
-
-**Windows**: see [WINDOWS.md](WINDOWS.md) for full details.
-
-```txt
-C:\Program Files\ConnLog\Agent\connlog-agent.exe
-C:\ProgramData\ConnLog\Agent\agent.conf   # DPAPI-encrypted token
 ```
 
 ## Development
@@ -129,11 +121,9 @@ cargo run -- --token <TOKEN> --endpoint http://localhost:3000
 cargo build --release
 ```
 
-The `--endpoint` flag is stripped from release builds at compile time. Production agents always connect to `https://connlog.com`.
-
 ### Cross-compilation
 
-CI uses [cross](https://github.com/cross-rs/cross) for Linux musl targets and a native `windows-latest` runner for Windows:
+CI uses [cross](https://github.com/cross-rs/cross):
 
 ```bash
 cargo install cross --git https://github.com/cross-rs/cross
@@ -143,9 +133,6 @@ cross build --release --target x86_64-unknown-linux-musl
 
 # Linux aarch64 (musl static)
 cross build --release --target aarch64-unknown-linux-musl
-
-# Windows (requires native MSVC toolchain — run on Windows)
-cargo build --release --target x86_64-pc-windows-msvc
 ```
 
 ### Releases
@@ -156,7 +143,13 @@ Push a version tag to trigger CI:
 git tag vX.Y.Z && git push origin vX.Y.Z
 ```
 
-GitHub Actions builds all three targets (x86_64-musl, aarch64-musl, Windows x86_64), creates tarballs with SHA-256 checksums and Ed25519 signatures, and publishes a GitHub release. The install script picks up the latest release automatically.
+GitHub Actions builds both Linux targets (`x86_64-musl`, `aarch64-musl`), creates tarballs with SHA-256 checksums and Ed25519 signatures, and publishes a GitHub release. The install script picks up the latest release automatically.
+
+## Platform support
+
+ConnLog V1 supports Linux servers: VPSs, bare metal, Docker hosts, and CI runners.
+
+Windows support is planned after the Linux agent reaches production stability.
 
 ## License
 

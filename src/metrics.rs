@@ -82,9 +82,8 @@ impl MetricsCollector {
             .to_string_lossy()
             .to_string();
 
-        // `std::env::consts::OS` returns the lowercase target OS string
-        // ("linux" / "windows" / "macos" / ...) at compile time — exactly the
-        // values the platform expects in the `X-OS` heartbeat header.
+        // `std::env::consts::OS` returns "linux" at compile time — exactly the
+        // value the platform expects in the `X-OS` heartbeat header.
         let os = std::env::consts::OS.to_string();
 
         let arch = std::env::consts::ARCH.to_string();
@@ -208,14 +207,6 @@ impl MetricsCollector {
                 {
                     continue;
                 }
-                // Skip Windows network (UNC) shares — those are remote
-                // storage, not local capacity. Local fixed drives mount as
-                // letters (e.g. `C:\`).
-                #[cfg(windows)]
-                if mount.starts_with(r"\\") {
-                    continue;
-                }
-
                 // Dedupe by device name (e.g. /dev/nvme0n1p2). Same physical
                 // device mounted at multiple paths = count only once.
                 let dedupe_key = if name.is_empty() { mount.clone() } else { name };
