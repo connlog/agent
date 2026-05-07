@@ -206,11 +206,9 @@ pub fn collect_samples(
         .filter(|d| disk_set.contains(d.key.as_str()))
         .filter_map(|d| {
             d.stat.map(|s| {
-                let used_x100 = if s.total_bytes > 0 {
-                    ((s.used_bytes * 10000) / s.total_bytes) as u32
-                } else {
-                    0
-                };
+                let used_x100 = (s.used_bytes * 10000)
+                    .checked_div(s.total_bytes)
+                    .unwrap_or(0) as u32;
                 let inode_used_x100 = match (s.inode_total, s.inode_available) {
                     (Some(total), Some(avail)) if total > 0 => {
                         Some((((total - avail) * 10000) / total) as u32)
@@ -437,7 +435,7 @@ fn stat_mount(mount_point: &str) -> Option<StatSnapshot> {
     let total = st.f_blocks.saturating_mul(st.f_frsize);
     let avail = st.f_bavail.saturating_mul(st.f_frsize);
     let used = total.saturating_sub(avail);
-    let read_only = (st.f_flag & libc::ST_RDONLY as u64) != 0;
+    let read_only = (st.f_flag & libc::ST_RDONLY) != 0;
 
     let inode_total = if st.f_files > 0 {
         Some(st.f_files)
