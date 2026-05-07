@@ -8,6 +8,20 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 
 ## [Unreleased]
 
+## [1.4.1] — 2026-05-07
+
+### Changed
+
+- Renamed public GitHub repository usage from `connlog/connlog-agent` to
+  `connlog/agent` in the updater metadata path (`src/update.rs`) and package
+  metadata (`Cargo.toml`).
+- Kept installed runtime identity stable: binary name (`connlog-agent`),
+  systemd service (`connlog-agent`), install path
+  (`/usr/local/bin/connlog-agent`), config/state paths, release artifact
+  naming, and signature/checksum verification behavior are unchanged.
+- Added repository-rename compatibility note at `docs/REPO_RENAME.md` to
+  document redirect expectations for older installed agents.
+
 ## [1.4.0] — 2026-05-07
 
 ### Added
@@ -367,7 +381,8 @@ considered stable; breaking changes from this point on require a major bump.
 
 - Last pre-1.0 release. See git history for prior changes.
 
-[Unreleased]: https://github.com/connlog/agent/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/connlog/agent/compare/v1.4.1...HEAD
+[1.4.1]: https://github.com/connlog/agent/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/connlog/agent/compare/v1.3.8...v1.4.0
 [1.3.8]: https://github.com/connlog/agent/compare/v1.0.0...v1.3.8
 [1.0.0]: https://github.com/connlog/agent/compare/v0.3.6...v1.0.0
