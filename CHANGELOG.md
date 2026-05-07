@@ -367,6 +367,8 @@ considered stable; breaking changes from this point on require a major bump.
 
 - Last pre-1.0 release. See git history for prior changes.
 
-[Unreleased]: https://github.com/connlog/agent/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/connlog/agent/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/connlog/agent/compare/v1.3.8...v1.4.0
+[1.3.8]: https://github.com/connlog/agent/compare/v1.0.0...v1.3.8
 [1.0.0]: https://github.com/connlog/agent/compare/v0.3.6...v1.0.0
 [0.3.6]: https://github.com/connlog/agent/releases/tag/v0.3.6

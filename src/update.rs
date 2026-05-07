@@ -24,8 +24,7 @@ const SIGNING_PUBLIC_KEY_HEX: &str = match option_env!("CONNLOG_SIGNING_PUBLIC_K
 
 const PLACEHOLDER_KEY: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
-const GITHUB_RELEASE_URL: &str =
-    "https://api.github.com/repos/connlog/connlog-agent/releases/latest";
+const GITHUB_RELEASE_URL: &str = "https://api.github.com/repos/connlog/agent/releases/latest";
 
 /// Returns true if a real signing key is compiled in (not the placeholder).
 pub fn has_signing_key() -> bool {
