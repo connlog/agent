@@ -216,9 +216,8 @@ fn heartbeat_200_parses_response() {
     assert_eq!(req.header("Content-Type"), Some("application/octet-stream"));
 
     // X-Machine-Id is sent whenever the agent could read a stable ID. CI
-    // runners always have /etc/machine-id (Linux) or a MachineGuid (Windows),
-    // so we expect a 64-char lowercase hex hash here. If we ever run this
-    // test on a host without one we'd want to know — assert presence + shape.
+    // runners always have /etc/machine-id (Linux), so we expect a 64-char
+    // lowercase hex hash here.
     let machine_id = req
         .header("X-Machine-Id")
         .expect("X-Machine-Id header must be present on supported OS");

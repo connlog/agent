@@ -8,10 +8,10 @@ must never be broken.
 
 ## What the agent does
 
-The agent is a small, static binary that runs as a systemd service on Linux
-(or a Windows service on Windows). Its only job is to send authenticated
-heartbeats to the ConnLog platform every ~60 seconds, carrying a small
-set of system metrics (CPU, memory, disk, load average, uptime).
+The agent is a small, static binary that runs as a systemd service on Linux.
+Its only job is to send authenticated heartbeats to the ConnLog platform every
+~60 seconds, carrying a small set of system metrics (CPU, memory, disk, load
+average, uptime).
 
 It does nothing else. There is no log shipping, no script execution, no
 service discovery, no network probing.
@@ -33,12 +33,8 @@ src/
   simulation.rs   — In-process HTTP mock used by tests (no network required)
   install/
     linux.rs      — systemd unit (embedded string), install/uninstall helpers
-    windows.rs    — Windows service install/uninstall
   platform/
     unix.rs       — Filesystem paths for Linux (installed binary, staging, markers)
-    windows.rs    — Filesystem paths for Windows
-  service/
-    windows.rs    — Windows SCM service entry point
 ```
 
 ---
@@ -47,7 +43,6 @@ src/
 
 ```
 main()
-  ├─ (Windows) SCM dispatch if --run-service
   ├─ Handle --status / --update / --check-config / --test-heartbeat / --emit-service
   ├─ Handle --install / --uninstall
   └─ run_agent_with_shutdown_inner()
