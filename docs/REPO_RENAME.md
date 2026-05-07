@@ -12,17 +12,17 @@ The public GitHub repository was renamed from `connlog/connlog-agent` to `connlo
 
 The installed agent identity is **stable**:
 
-| Attribute | Value |
-|-----------|-------|
-| Binary | `connlog-agent` |
-| Systemd service | `connlog-agent` |
-| Install path | `/usr/local/bin/connlog-agent` |
-| Config dir | `/etc/connlog/` |
-| State dir | `/var/lib/connlog/` |
-| Release artifacts | `connlog-agent-linux-x86_64`, etc. |
-| Cargo crate name | `connlog-agent` |
-| Update protocol | Unchanged |
-| Signing/verification | Unchanged |
+| Attribute            | Value                              |
+| -------------------- | ---------------------------------- |
+| Binary               | `connlog-agent`                    |
+| Systemd service      | `connlog-agent`                    |
+| Install path         | `/usr/local/bin/connlog-agent`     |
+| Config dir           | `/etc/connlog/`                    |
+| State dir            | `/var/lib/connlog/`                |
+| Release artifacts    | `connlog-agent-linux-x86_64`, etc. |
+| Cargo crate name     | `connlog-agent`                    |
+| Update protocol      | Unchanged                          |
+| Signing/verification | Unchanged                          |
 
 ## Compatibility
 
