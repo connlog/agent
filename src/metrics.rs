@@ -39,6 +39,81 @@ impl SystemMetrics {
     }
 }
 
+// ── /proc/stat CPU counters (Linux only) ─────────────────────────────────────
+//
+// We read the aggregate `cpu` line directly rather than using sysinfo's
+// two-refresh-with-sleep recipe. Storing counters between heartbeats gives a
+// true average over the full heartbeat interval (e.g. 10 s or 60 s) instead
+// of the 200 ms sysinfo window. On the first heartbeat the delta is computed
+// from the reading taken at `MetricsCollector::new()`, so no fake 0 % is
+// sent even on the very first beat.
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct CpuSnapshot {
+    user: u64,
+    nice: u64,
+    system: u64,
+    idle: u64,
+    iowait: u64,
+    irq: u64,
+    softirq: u64,
+    steal: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl CpuSnapshot {
+    fn total(&self) -> u64 {
+        self.user
+            + self.nice
+            + self.system
+            + self.idle
+            + self.iowait
+            + self.irq
+            + self.softirq
+            + self.steal
+    }
+
+    // iowait counts as "idle" from the user's perspective.
+    fn idle_total(&self) -> u64 {
+        self.idle + self.iowait
+    }
+
+    /// CPU usage % relative to a previous snapshot.
+    fn percent_since(&self, prev: &CpuSnapshot) -> f64 {
+        let delta_total = self.total().saturating_sub(prev.total());
+        let delta_idle = self.idle_total().saturating_sub(prev.idle_total());
+        if delta_total == 0 {
+            return 0.0;
+        }
+        let busy = delta_total.saturating_sub(delta_idle);
+        (busy as f64 / delta_total as f64 * 100.0).clamp(0.0, 100.0)
+    }
+}
+
+/// Parse the aggregate `cpu` line from `/proc/stat`.
+/// Returns `None` on any I/O or parse error so the caller can fall back
+/// gracefully.
+#[cfg(target_os = "linux")]
+fn read_proc_stat_cpu() -> Option<CpuSnapshot> {
+    let content = std::fs::read_to_string("/proc/stat").ok()?;
+    let line = content.lines().find(|l| l.starts_with("cpu "))?;
+    let mut it = line.split_whitespace().skip(1); // skip the "cpu" label
+    let mut next = || it.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    Some(CpuSnapshot {
+        user: next(),
+        nice: next(),
+        system: next(),
+        idle: next(),
+        iowait: next(),
+        irq: next(),
+        softirq: next(),
+        steal: next(),
+    })
+}
+
+// ── MetricsCollector ──────────────────────────────────────────────────────────
+
 /// Reusable collector that avoids re-allocating sysinfo structures.
 /// Call `new()` once at startup, then `collect()` on each sample interval.
 pub struct MetricsCollector {
@@ -48,6 +123,10 @@ pub struct MetricsCollector {
     hostname: String,
     os: String,
     arch: String,
+    /// Previous `/proc/stat` snapshot used to compute interval-based CPU %.
+    /// On Linux this replaces sysinfo's two-refresh-with-sleep recipe.
+    #[cfg(target_os = "linux")]
+    prev_cpu: Option<CpuSnapshot>,
 }
 
 impl MetricsCollector {
@@ -58,21 +137,22 @@ impl MetricsCollector {
         (&self.hostname, &self.os, &self.arch)
     }
 
-    /// Create a new collector. Performs a full initial refresh to populate CPU baseline.
+    /// Create a new collector. On Linux, reads an initial `/proc/stat` CPU
+    /// snapshot so the very first `collect()` can already return an
+    /// interval-based CPU value. On other platforms performs the sysinfo
+    /// two-refresh baseline.
     pub fn new() -> Result<Self> {
-        // IMPORTANT: `System::new()` creates an EMPTY system with no CPUs
-        // enumerated. `refresh_cpu_usage()` only refreshes CPUs that are
-        // already in the list — so on a fresh `System::new()` it's a no-op
-        // and `global_cpu_usage()` returns 0.0 forever. `new_all()` does the
-        // initial enumeration of CPUs (and processes/memory). After that we
-        // can use the cheap `refresh_cpu_usage()` per tick.
         let mut sys = System::new_all();
-        // Initial CPU sample — sysinfo needs two refreshes with a small gap
-        // to compute usage delta. The first heartbeat would otherwise read
-        // 0 % even on a busy host.
-        sys.refresh_cpu_usage();
-        std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
-        sys.refresh_cpu_usage();
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            // Non-Linux: sysinfo's documented two-refresh recipe is the only
+            // way to get a non-zero CPU reading.
+            sys.refresh_cpu_usage();
+            std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+            sys.refresh_cpu_usage();
+        }
+
         sys.refresh_memory();
 
         let disks = Disks::new_with_refreshed_list();
@@ -82,11 +162,11 @@ impl MetricsCollector {
             .to_string_lossy()
             .to_string();
 
-        // `std::env::consts::OS` returns "linux" at compile time — exactly the
-        // value the platform expects in the `X-OS` heartbeat header.
         let os = std::env::consts::OS.to_string();
-
         let arch = std::env::consts::ARCH.to_string();
+
+        #[cfg(target_os = "linux")]
+        let prev_cpu = read_proc_stat_cpu();
 
         Ok(Self {
             sys,
@@ -94,11 +174,13 @@ impl MetricsCollector {
             hostname,
             os,
             arch,
+            #[cfg(target_os = "linux")]
+            prev_cpu,
         })
     }
 
-    /// Collect current metrics. Only refreshes CPU, memory, and disks - NOT processes.
-    /// This is ~10× cheaper than `System::new_all() + refresh_all()`.
+    /// Collect current metrics. Only refreshes CPU, memory, and disks — NOT
+    /// processes. This is ~10× cheaper than `System::new_all() + refresh_all()`.
     ///
     /// Internally calls [`Self::collect_inner`] inside `catch_unwind`. A panic
     /// from `sysinfo` (e.g. a syscall returning unexpected bytes on a quirky
@@ -122,24 +204,37 @@ impl MetricsCollector {
     }
 
     fn collect_inner(&mut self) -> SystemMetrics {
-        // CPU usage in sysinfo is computed from the delta between two
-        // consecutive refreshes. The documented recipe is:
-        //   refresh_cpu_usage() → sleep(MINIMUM_CPU_UPDATE_INTERVAL) → refresh_cpu_usage()
-        // and only THEN read `global_cpu_usage()`. Skipping the inner sleep
-        // (or relying on the previous sample being from 60s ago) reliably
-        // reports 0% on Linux containers and CI runners — exactly what we
-        // were seeing on the dashboard. The 200 ms penalty is paid once per
-        // heartbeat and is invisible compared with the 60 s tick.
-        self.sys.refresh_cpu_usage();
-        std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
-        self.sys.refresh_cpu_usage();
+        // ── CPU ───────────────────────────────────────────────────────────────
+        //
+        // Linux: compute CPU average over the full heartbeat interval from the
+        // delta between the snapshot taken last cycle (or at `new()`) and a
+        // fresh reading now. No sleep needed — the interval IS the heartbeat.
+        //
+        // Non-Linux: fall back to sysinfo's two-refresh-with-sleep recipe.
+        #[cfg(target_os = "linux")]
+        let cpu_percent = {
+            let curr = read_proc_stat_cpu();
+            let pct = match (&self.prev_cpu, &curr) {
+                (Some(prev), Some(c)) => c.percent_since(prev),
+                _ => 0.0,
+            };
+            self.prev_cpu = curr;
+            pct
+        };
+
+        #[cfg(not(target_os = "linux"))]
+        let cpu_percent = {
+            self.sys.refresh_cpu_usage();
+            std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+            self.sys.refresh_cpu_usage();
+            self.sys.global_cpu_usage() as f64
+        };
 
         // Memory + disks don't need the two-step dance.
         self.sys.refresh_memory();
         self.disks.refresh();
 
         let uptime_seconds = System::uptime();
-        let cpu_percent = self.sys.global_cpu_usage() as f64;
         let memory_total_mb = self.sys.total_memory() / 1024 / 1024;
         let memory_used_mb = self.sys.used_memory() / 1024 / 1024;
 
@@ -185,6 +280,7 @@ impl MetricsCollector {
                         | "securityfs"
                         | "bpf"
                         | "iso9660"
+                        | "efivarfs"
                 ) {
                     continue;
                 }
@@ -307,27 +403,77 @@ mod tests {
         );
     }
 
-    /// Regression for v1.3.3: every `collect()` must perform the documented
-    /// sysinfo recipe of `refresh_cpu_usage → sleep ≥ MINIMUM_CPU_UPDATE_INTERVAL
-    /// → refresh_cpu_usage` so `global_cpu_usage()` returns a real delta.
-    /// Skipping the inner sleep silently reports 0 % on several Linux kernels
-    /// (notably the GitHub Actions runners), which is exactly what blanked
-    /// the dashboard in v1.3.2. We can't easily assert the CPU value itself
-    /// (a quiescent test host can legitimately report ~0 %), so instead we
-    /// assert the *recipe* is in place by measuring wall-clock duration.
+    /// CPU % must be in [0, 100] and must not be NaN or infinite.
     #[test]
-    fn collect_observes_minimum_cpu_update_interval() {
+    fn collect_cpu_percent_is_valid() {
         let mut c = MetricsCollector::new().expect("collector init must work in tests");
-        let start = std::time::Instant::now();
-        let _ = c.collect().expect("collect must succeed");
-        let elapsed = start.elapsed();
+        // Two calls: the second uses the snapshot stored after the first.
+        let _ = c.collect().expect("first collect");
+        let m = c.collect().expect("second collect");
         assert!(
-            elapsed >= sysinfo::MINIMUM_CPU_UPDATE_INTERVAL,
-            "collect() finished in {:?}, faster than MINIMUM_CPU_UPDATE_INTERVAL ({:?}) — \
-             the refresh-sleep-refresh recipe is missing and CPU readings will be 0 %",
-            elapsed,
-            sysinfo::MINIMUM_CPU_UPDATE_INTERVAL,
+            m.cpu_percent.is_finite() && m.cpu_percent >= 0.0 && m.cpu_percent <= 100.0,
+            "cpu_percent out of range: {}",
+            m.cpu_percent,
         );
+    }
+
+    /// On Linux the /proc/stat reader must parse the aggregate cpu line and
+    /// return non-zero counters on any real host.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_proc_stat_cpu_returns_nonzero_total() {
+        let snap = read_proc_stat_cpu().expect("/proc/stat must be readable in the test env");
+        assert!(
+            snap.total() > 0,
+            "cpu total counter must be > 0 on any running system"
+        );
+    }
+
+    /// Delta calculation: hand-crafted snapshots should produce the correct %.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cpu_snapshot_delta_calculation() {
+        let prev = CpuSnapshot {
+            user: 1000,
+            nice: 0,
+            system: 200,
+            idle: 7800,
+            iowait: 100,
+            irq: 0,
+            softirq: 0,
+            steal: 0,
+        };
+        // Advance 1 000 ticks: 300 busy (user+system), 700 idle.
+        let curr = CpuSnapshot {
+            user: 1200,
+            nice: 0,
+            system: 300,
+            idle: 8400,
+            iowait: 200,
+            irq: 0,
+            softirq: 0,
+            steal: 0,
+        };
+        // delta_total = 1 000, delta_idle = 700 (idle 600 + iowait 100)
+        let pct = curr.percent_since(&prev);
+        assert!((pct - 30.0).abs() < 0.001, "expected 30.0 %, got {pct}");
+    }
+
+    /// Identical snapshots (zero delta) must not panic and must return 0.0.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cpu_snapshot_zero_delta_returns_zero() {
+        let snap = CpuSnapshot {
+            user: 5000,
+            nice: 0,
+            system: 1000,
+            idle: 9000,
+            iowait: 0,
+            irq: 0,
+            softirq: 0,
+            steal: 0,
+        };
+        assert_eq!(snap.percent_since(&snap.clone()), 0.0);
     }
 
     #[test]

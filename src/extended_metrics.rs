@@ -23,6 +23,7 @@ const IGNORED_FILESYSTEMS: &[&str] = &[
     "cgroup",
     "cgroup2",
     "overlay",
+    "overlayfs",
     "squashfs",
     "debugfs",
     "tracefs",
@@ -31,6 +32,17 @@ const IGNORED_FILESYSTEMS: &[&str] = &[
     "autofs",
     "nsfs",
     "ramfs",
+    // Additional virtual / kernel-internal filesystems that are not real storage
+    "hugetlbfs",
+    "binfmt_misc",
+    "mqueue",
+    "pstore",
+    "configfs",
+    "selinuxfs",
+    "bpf",
+    "efivarfs",
+    "rpc_pipefs",
+    "iso9660",
 ];
 
 const IGNORED_INTERFACES_PREFIX: &[&str] = &[
