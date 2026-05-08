@@ -8,6 +8,18 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 
 ## [Unreleased]
 
+## [1.5.1] — 2026-05-08
+
+### Fixed
+
+- Remote uninstall now reliably cleans up all agent files. Previously, if
+  `INVOCATION_ID` was not set, the agent fell back to an in-process uninstall
+  that always failed because the runtime process is never root. The fix writes
+  the `/run/connlog/.uninstall_requested` marker unconditionally and exits;
+  the systemd `ExecStopPost=+` hook (runs as root) performs the actual
+  cleanup. If the marker write fails, a clear manual-cleanup instruction is
+  logged instead of a misleading "requires sudo" error.
+
 ## [1.5.0] — 2026-05-08
 
 ### Added

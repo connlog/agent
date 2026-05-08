@@ -593,50 +593,40 @@ fn log_config_change(old: &AgentConfig, new: &AgentConfig) {
 
 /// Trigger self-uninstallation of the agent.
 ///
-/// This writes a marker file and exits with a clean code.
-/// The systemd ExecStopPost script detects the marker and performs full cleanup:
+/// Writes the uninstall marker to /run/connlog/.uninstall_requested and exits.
+/// The systemd ExecStopPost script (runs as root via the `+` prefix) detects
+/// the marker on service stop and performs the actual root-level cleanup:
 ///   1. Disables the service
-///   2. Removes the service file
-///   3. Removes config directory
+///   2. Removes the service file + daemon-reload
+///   3. Removes /etc/connlog (token + config)
 ///   4. Removes the binary
 ///
-/// If NOT running under systemd, falls back to direct uninstall.
+/// RuntimeDirectory=connlog in the service unit ensures /run/connlog/ is owned
+/// by the connlog-agent user, so the marker write always succeeds when running
+/// under the service. If the write fails (e.g. running outside the service),
+/// we log actionable instructions and exit — the runtime process is never root
+/// so in-process cleanup is not possible regardless.
 fn trigger_self_uninstall(reason: &str) {
     error!("UNINSTALL: {}", reason);
 
-    // Prefer the marker-file path so systemd's ExecStopPost can do the
-    // actual root-only cleanup. Fall back to a direct in-process uninstall
-    // if the marker write fails (only succeeds when running with privilege).
-    let is_supervised = std::env::var("INVOCATION_ID").is_ok();
-
-    if is_supervised {
-        info!("UNINSTALL: Running under supervisor — writing uninstall marker");
-        match std::fs::write(platform::UNINSTALL_MARKER, reason) {
-            Ok(_) => {
-                info!(
-                    "UNINSTALL: Marker written to {}",
-                    platform::UNINSTALL_MARKER
-                );
-                info!("UNINSTALL: Exiting process. Supervisor will complete cleanup.");
-            }
-            Err(e) => {
-                error!(
-                    "UNINSTALL: Failed to write marker file: {}. Attempting direct uninstall.",
-                    e
-                );
-                if let Err(e) = install::uninstall() {
-                    error!("UNINSTALL: Direct uninstall also failed: {}", e);
-                }
-            }
+    match std::fs::write(platform::UNINSTALL_MARKER, reason) {
+        Ok(_) => {
+            info!(
+                "UNINSTALL: Marker written to {}. Exiting — ExecStopPost will complete cleanup.",
+                platform::UNINSTALL_MARKER
+            );
         }
-    } else {
-        info!("UNINSTALL: No supervisor detected — performing direct uninstall");
-        if let Err(e) = install::uninstall() {
-            error!("UNINSTALL: Direct uninstall failed: {}", e);
+        Err(e) => {
+            error!(
+                "UNINSTALL: Could not write uninstall marker: {}. \
+                 Agent will stop reporting, but files were not removed. \
+                 To clean up manually: sudo connlog-agent --uninstall",
+                e
+            );
         }
     }
 
-    // Exit cleanly — systemd Restart=on-failure does not restart clean exits.
+    // Exit with 0 so systemd Restart=on-failure does not restart the agent.
     std::process::exit(0);
 }
 
