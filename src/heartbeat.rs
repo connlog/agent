@@ -16,7 +16,10 @@ pub struct HeartbeatPayload {
 
 #[derive(Debug, Serialize)]
 pub struct Metrics {
-    pub cpu_percent: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_percent: Option<f64>,
+    #[serde(skip)]
+    pub cpu_peak_percent: Option<f64>,
     pub memory_used_mb: u64,
     pub memory_total_mb: u64,
     pub disk_used_mb: u64,
@@ -433,7 +436,8 @@ mod tests {
     #[test]
     fn metrics_wire_format_has_aggregate_cpu_only() {
         let m = Metrics {
-            cpu_percent: 42.5,
+            cpu_percent: Some(42.5),
+            cpu_peak_percent: Some(50.0),
             memory_used_mb: 1024,
             memory_total_mb: 8192,
             disk_used_mb: 20480,
@@ -484,7 +488,8 @@ mod tests {
     fn metrics_exact_field_set() {
         // Pin the complete set of fields so additions require deliberate review.
         let m = Metrics {
-            cpu_percent: 0.0,
+            cpu_percent: Some(0.0),
+            cpu_peak_percent: Some(0.0),
             memory_used_mb: 0,
             memory_total_mb: 0,
             disk_used_mb: 0,
@@ -529,7 +534,8 @@ mod tests {
             arch: "x86_64".into(),
             uptime_seconds: 0,
             metrics: Metrics {
-                cpu_percent: 0.0,
+                cpu_percent: Some(0.0),
+                cpu_peak_percent: Some(0.0),
                 memory_used_mb: 0,
                 memory_total_mb: 0,
                 disk_used_mb: 0,

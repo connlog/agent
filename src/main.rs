@@ -678,7 +678,12 @@ fn send_heartbeat(
             cpu_percent: if config.metrics.cpu {
                 metrics.cpu_percent
             } else {
-                0.0
+                None
+            },
+            cpu_peak_percent: if config.metrics.cpu {
+                metrics.cpu_peak_percent
+            } else {
+                None
             },
             memory_used_mb: if config.metrics.memory {
                 metrics.memory_used_mb
@@ -708,7 +713,8 @@ fn send_heartbeat(
         }
     } else {
         heartbeat::Metrics {
-            cpu_percent: 0.0,
+            cpu_percent: None,
+            cpu_peak_percent: None,
             memory_used_mb: 0,
             memory_total_mb: 0,
             disk_used_mb: 0,
@@ -736,22 +742,32 @@ fn send_heartbeat(
     // and the single best signal when "the dashboard shows zeros" — it
     // disambiguates between (a) config disabling a metric, (b) sysinfo
     // returning zero, and (c) the wire encode itself.
+    let sample_cpu = metrics
+        .cpu_percent
+        .map(|v| format!("{v:.1}%"))
+        .unwrap_or_else(|| "collecting".to_string());
+    let wire_cpu = payload
+        .metrics
+        .cpu_percent
+        .map(|v| format!("{v:.1}%"))
+        .unwrap_or_else(|| "collecting".to_string());
+
     info!(
-        "HB v={} cfg=v{}(cpu={} mem={} disk={} load={}) sample(cpu={:.1}% mem={}/{} MB disk={}/{} MB load={:.2} up={}s) → wire(cpu={:.1}% mem={}/{} MB disk={}/{} MB load={:.2})",
+        "HB v={} cfg=v{}(cpu={} mem={} disk={} load={}) sample(cpu={} mem={}/{} MB disk={}/{} MB load={:.2} up={}s) → wire(cpu={} mem={}/{} MB disk={}/{} MB load={:.2})",
         AGENT_VERSION,
         config.version,
         config.metrics.cpu,
         config.metrics.memory,
         config.metrics.disk,
         config.metrics.load,
-        metrics.cpu_percent,
+        sample_cpu,
         metrics.memory_used_mb,
         metrics.memory_total_mb,
         metrics.disk_used_mb,
         metrics.disk_total_mb,
         metrics.load_1m,
         metrics.uptime_seconds,
-        payload.metrics.cpu_percent,
+        wire_cpu,
         payload.metrics.memory_used_mb,
         payload.metrics.memory_total_mb,
         payload.metrics.disk_used_mb,

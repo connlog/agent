@@ -8,6 +8,21 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 
 ## [Unreleased]
 
+## [1.5.0] — 2026-05-08
+
+### Added
+
+- Added interval-based Linux CPU measurement from `/proc/stat` counters.
+- Added peak-core CPU reporting in the existing heartbeat frame's `cpu_max`
+  field.
+
+### Changed
+
+- The first CPU sample is now reported as unavailable until a real interval
+  delta exists, instead of sending a misleading fake zero.
+- Heartbeat JSON keeps the public metrics field set stable while omitting CPU
+  only when the first interval is still collecting.
+
 ## [1.4.1] — 2026-05-07
 
 ### Changed

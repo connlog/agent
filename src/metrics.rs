@@ -7,7 +7,8 @@ pub struct SystemMetrics {
     pub os: String,
     pub arch: String,
     pub uptime_seconds: u64,
-    pub cpu_percent: f64,
+    pub cpu_percent: Option<f64>,
+    pub cpu_peak_percent: Option<f64>,
     pub memory_used_mb: u64,
     pub memory_total_mb: u64,
     pub disk_used_mb: u64,
@@ -29,7 +30,8 @@ impl SystemMetrics {
             os: String::new(),
             arch: String::new(),
             uptime_seconds: 0,
-            cpu_percent: 0.0,
+            cpu_percent: None,
+            cpu_peak_percent: None,
             memory_used_mb: 0,
             memory_total_mb: 0,
             disk_used_mb: 0,
@@ -44,9 +46,8 @@ impl SystemMetrics {
 // We read the aggregate `cpu` line directly rather than using sysinfo's
 // two-refresh-with-sleep recipe. Storing counters between heartbeats gives a
 // true average over the full heartbeat interval (e.g. 10 s or 60 s) instead
-// of the 200 ms sysinfo window. On the first heartbeat the delta is computed
-// from the reading taken at `MetricsCollector::new()`, so no fake 0 % is
-// sent even on the very first beat.
+// of the 200 ms sysinfo window. The first heartbeat has no previous interval,
+// so CPU is unavailable until the second sample instead of pretending 0 %.
 
 #[cfg(target_os = "linux")]
 #[derive(Clone)]
@@ -59,6 +60,13 @@ struct CpuSnapshot {
     irq: u64,
     softirq: u64,
     steal: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct CpuCounters {
+    aggregate: CpuSnapshot,
+    cores: Vec<CpuSnapshot>,
 }
 
 #[cfg(target_os = "linux")]
@@ -91,14 +99,19 @@ impl CpuSnapshot {
     }
 }
 
-/// Parse the aggregate `cpu` line from `/proc/stat`.
+/// Parse CPU lines from `/proc/stat`.
 /// Returns `None` on any I/O or parse error so the caller can fall back
 /// gracefully.
 #[cfg(target_os = "linux")]
-fn read_proc_stat_cpu() -> Option<CpuSnapshot> {
+fn read_proc_stat_cpu() -> Option<CpuCounters> {
     let content = std::fs::read_to_string("/proc/stat").ok()?;
-    let line = content.lines().find(|l| l.starts_with("cpu "))?;
-    let mut it = line.split_whitespace().skip(1); // skip the "cpu" label
+    parse_proc_stat_cpu(&content)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_cpu_snapshot(line: &str) -> Option<CpuSnapshot> {
+    let mut it = line.split_whitespace();
+    let _label = it.next()?;
     let mut next = || it.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
     Some(CpuSnapshot {
         user: next(),
@@ -112,6 +125,40 @@ fn read_proc_stat_cpu() -> Option<CpuSnapshot> {
     })
 }
 
+#[cfg(target_os = "linux")]
+fn parse_proc_stat_cpu(content: &str) -> Option<CpuCounters> {
+    let mut aggregate = None;
+    let mut cores = Vec::new();
+
+    for line in content.lines() {
+        if line.starts_with("cpu ") {
+            aggregate = parse_cpu_snapshot(line);
+        } else if line.starts_with("cpu") {
+            let label = line.split_whitespace().next().unwrap_or_default();
+            if label[3..].chars().all(|c| c.is_ascii_digit()) {
+                if let Some(core) = parse_cpu_snapshot(line) {
+                    cores.push(core);
+                }
+            }
+        }
+    }
+
+    aggregate.map(|aggregate| CpuCounters { aggregate, cores })
+}
+
+#[cfg(target_os = "linux")]
+fn cpu_interval_percent(prev: &CpuCounters, curr: &CpuCounters) -> (f64, f64) {
+    let avg = curr.aggregate.percent_since(&prev.aggregate);
+    let peak = curr
+        .cores
+        .iter()
+        .zip(prev.cores.iter())
+        .map(|(core, prev_core)| core.percent_since(prev_core))
+        .reduce(f64::max)
+        .unwrap_or(avg);
+    (avg, peak)
+}
+
 // ── MetricsCollector ──────────────────────────────────────────────────────────
 
 /// Reusable collector that avoids re-allocating sysinfo structures.
@@ -123,10 +170,10 @@ pub struct MetricsCollector {
     hostname: String,
     os: String,
     arch: String,
-    /// Previous `/proc/stat` snapshot used to compute interval-based CPU %.
+    /// Previous `/proc/stat` counters used to compute interval-based CPU %.
     /// On Linux this replaces sysinfo's two-refresh-with-sleep recipe.
     #[cfg(target_os = "linux")]
-    prev_cpu: Option<CpuSnapshot>,
+    prev_cpu: Option<CpuCounters>,
 }
 
 impl MetricsCollector {
@@ -137,10 +184,9 @@ impl MetricsCollector {
         (&self.hostname, &self.os, &self.arch)
     }
 
-    /// Create a new collector. On Linux, reads an initial `/proc/stat` CPU
-    /// snapshot so the very first `collect()` can already return an
-    /// interval-based CPU value. On other platforms performs the sysinfo
-    /// two-refresh baseline.
+    /// Create a new collector. On Linux, the first `collect()` seeds the
+    /// `/proc/stat` baseline and returns CPU as unavailable. On other platforms
+    /// performs the sysinfo two-refresh baseline.
     pub fn new() -> Result<Self> {
         let mut sys = System::new_all();
 
@@ -166,7 +212,7 @@ impl MetricsCollector {
         let arch = std::env::consts::ARCH.to_string();
 
         #[cfg(target_os = "linux")]
-        let prev_cpu = read_proc_stat_cpu();
+        let prev_cpu = None;
 
         Ok(Self {
             sys,
@@ -214,12 +260,15 @@ impl MetricsCollector {
         #[cfg(target_os = "linux")]
         let cpu_percent = {
             let curr = read_proc_stat_cpu();
-            let pct = match (&self.prev_cpu, &curr) {
-                (Some(prev), Some(c)) => c.percent_since(prev),
-                _ => 0.0,
+            let (avg, peak) = match (&self.prev_cpu, &curr) {
+                (Some(prev), Some(c)) => {
+                    let (avg, peak) = cpu_interval_percent(prev, c);
+                    (Some(avg), Some(peak))
+                }
+                _ => (None, None),
             };
             self.prev_cpu = curr;
-            pct
+            (avg, peak)
         };
 
         #[cfg(not(target_os = "linux"))]
@@ -227,7 +276,8 @@ impl MetricsCollector {
             self.sys.refresh_cpu_usage();
             std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
             self.sys.refresh_cpu_usage();
-            self.sys.global_cpu_usage() as f64
+            let avg = Some(self.sys.global_cpu_usage() as f64);
+            (avg, avg)
         };
 
         // Memory + disks don't need the two-step dance.
@@ -337,7 +387,8 @@ impl MetricsCollector {
             os: self.os.clone(),
             arch: self.arch.clone(),
             uptime_seconds,
-            cpu_percent,
+            cpu_percent: cpu_percent.0,
+            cpu_peak_percent: cpu_percent.1,
             memory_used_mb,
             memory_total_mb,
             disk_used_mb,
@@ -403,6 +454,19 @@ mod tests {
         );
     }
 
+    /// CPU % must be unavailable on the first Linux sample because no interval
+    /// delta exists yet.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn first_linux_collect_returns_cpu_unavailable() {
+        let mut c = MetricsCollector::new().expect("collector init must work in tests");
+        let m = c.collect().expect("first collect");
+        assert!(
+            m.cpu_percent.is_none(),
+            "first CPU sample should be unavailable, not a fake zero"
+        );
+    }
+
     /// CPU % must be in [0, 100] and must not be NaN or infinite.
     #[test]
     fn collect_cpu_percent_is_valid() {
@@ -410,10 +474,13 @@ mod tests {
         // Two calls: the second uses the snapshot stored after the first.
         let _ = c.collect().expect("first collect");
         let m = c.collect().expect("second collect");
+        let cpu_percent = m
+            .cpu_percent
+            .expect("second collect should have interval-based CPU");
         assert!(
-            m.cpu_percent.is_finite() && m.cpu_percent >= 0.0 && m.cpu_percent <= 100.0,
+            cpu_percent.is_finite() && (0.0..=100.0).contains(&cpu_percent),
             "cpu_percent out of range: {}",
-            m.cpu_percent,
+            cpu_percent,
         );
     }
 
@@ -424,9 +491,21 @@ mod tests {
     fn read_proc_stat_cpu_returns_nonzero_total() {
         let snap = read_proc_stat_cpu().expect("/proc/stat must be readable in the test env");
         assert!(
-            snap.total() > 0,
+            snap.aggregate.total() > 0,
             "cpu total counter must be > 0 on any running system"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_proc_stat_cpu_reads_aggregate_and_cores() {
+        let counters = parse_proc_stat_cpu(
+            "cpu  100 0 100 800 0 0 0 0 0 0\ncpu0 50 0 50 400 0 0 0 0 0 0\ncpu1 50 0 50 400 0 0 0 0 0 0\nintr 1\n",
+        )
+        .expect("valid proc stat");
+        assert_eq!(counters.aggregate.total(), 1000);
+        assert_eq!(counters.cores.len(), 2);
+        assert_eq!(counters.cores[0].total(), 500);
     }
 
     /// Delta calculation: hand-crafted snapshots should produce the correct %.
@@ -457,6 +536,23 @@ mod tests {
         // delta_total = 1 000, delta_idle = 700 (idle 600 + iowait 100)
         let pct = curr.percent_since(&prev);
         assert!((pct - 30.0).abs() < 0.001, "expected 30.0 %, got {pct}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cpu_interval_calculates_peak_core() {
+        let prev = parse_proc_stat_cpu(
+            "cpu  200 0 0 1800 0 0 0 0\ncpu0 100 0 0 900 0 0 0 0\ncpu1 100 0 0 900 0 0 0 0\n",
+        )
+        .expect("prev counters");
+        let curr = parse_proc_stat_cpu(
+            "cpu  300 0 0 2700 0 0 0 0\ncpu0 150 0 0 950 0 0 0 0\ncpu1 150 0 0 1750 0 0 0 0\n",
+        )
+        .expect("curr counters");
+
+        let (avg, peak) = cpu_interval_percent(&prev, &curr);
+        assert!((avg - 10.0).abs() < 0.001, "expected 10.0 %, got {avg}");
+        assert!((peak - 50.0).abs() < 0.001, "expected 50.0 %, got {peak}");
     }
 
     /// Identical snapshots (zero delta) must not panic and must return 0.0.

@@ -7,6 +7,8 @@ use std::time::Duration;
 use crate::extended_metrics::{DiscoveryPayload, SamplesPayload};
 use crate::heartbeat::{AgentConfig, HeartbeatPayload, HeartbeatResponse};
 
+const CPU_UNAVAILABLE_X100: u16 = u16::MAX;
+
 /// Error types for API calls
 #[derive(Debug)]
 pub enum ApiError {
@@ -301,8 +303,8 @@ impl ApiClient {
 /// | Offset | Size | Field                        |
 /// |--------|------|------------------------------|
 /// | 0      | 8    | uptime_seconds (u64 LE)      |
-/// | 8      | 2    | cpu_percent × 100 (u16 LE)   |
-/// | 10     | 2    | cpu_max × 100 (u16 LE)       |
+/// | 8      | 2    | cpu_percent × 100, or 0xffff when unavailable |
+/// | 10     | 2    | cpu_max × 100, or 0xffff when unavailable     |
 /// | 12     | 4    | memory_used_mb (u32 LE)      |
 /// | 16     | 4    | memory_total_mb (u32 LE)     |
 /// | 20     | 4    | disk_used_mb (u32 LE)        |
@@ -319,11 +321,24 @@ pub(crate) fn encode_heartbeat(payload: &HeartbeatPayload) -> [u8; 32] {
     // [0..8] uptime_seconds as u64 LE
     frame[0..8].copy_from_slice(&payload.uptime_seconds.to_le_bytes());
 
-    // [8..10] cpu_percent × 100 as u16 LE
-    let cpu_x100 = (payload.metrics.cpu_percent * 100.0) as u16;
+    // [8..10] cpu_percent × 100 as u16 LE. 0xffff is a
+    // protocol-compatible sentinel for "CPU interval unavailable"; valid CPU
+    // values are clamped to 0..=10000.
+    let encode_cpu = |value: Option<f64>| {
+        value
+            .map(|v| (v.clamp(0.0, 100.0) * 100.0).round() as u16)
+            .unwrap_or(CPU_UNAVAILABLE_X100)
+    };
+    let cpu_x100 = encode_cpu(payload.metrics.cpu_percent);
     frame[8..10].copy_from_slice(&cpu_x100.to_le_bytes());
-    // [10..12] cpu_max mirrors cpu_avg (no multi-sample aggregation yet)
-    frame[10..12].copy_from_slice(&cpu_x100.to_le_bytes());
+    // [10..12] cpu_max is peak core over the same interval, if available.
+    let cpu_max_x100 = encode_cpu(
+        payload
+            .metrics
+            .cpu_peak_percent
+            .or(payload.metrics.cpu_percent),
+    );
+    frame[10..12].copy_from_slice(&cpu_max_x100.to_le_bytes());
 
     // [12..16] memory_used_mb as u32 LE
     frame[12..16].copy_from_slice(&(payload.metrics.memory_used_mb as u32).to_le_bytes());
@@ -389,7 +404,8 @@ mod tests {
             arch: "x86_64".to_string(),
             uptime_seconds: uptime,
             metrics: Metrics {
-                cpu_percent: cpu,
+                cpu_percent: Some(cpu),
+                cpu_peak_percent: Some(cpu),
                 memory_used_mb: mem_used,
                 memory_total_mb: mem_total,
                 disk_used_mb: disk_used,
@@ -494,5 +510,28 @@ mod tests {
         assert_eq!(cpu_x100, 10000, "100% × 100 = 10000");
         let load_x100 = u16::from_le_bytes(frame[28..30].try_into().unwrap());
         assert_eq!(load_x100, 9999, "99.99 × 100 = 9999");
+    }
+
+    #[test]
+    fn test_frame_cpu_unavailable_uses_sentinel() {
+        let mut payload = make_payload(0, 0.0, 0, 0, 0, 0, 0.0);
+        payload.metrics.cpu_percent = None;
+        payload.metrics.cpu_peak_percent = None;
+        let frame = encode_heartbeat(&payload);
+        let cpu_x100 = u16::from_le_bytes(frame[8..10].try_into().unwrap());
+        let cpu_max_x100 = u16::from_le_bytes(frame[10..12].try_into().unwrap());
+        assert_eq!(cpu_x100, CPU_UNAVAILABLE_X100);
+        assert_eq!(cpu_max_x100, CPU_UNAVAILABLE_X100);
+    }
+
+    #[test]
+    fn test_frame_cpu_peak_core_encodes_separately() {
+        let mut payload = make_payload(0, 12.5, 0, 0, 0, 0, 0.0);
+        payload.metrics.cpu_peak_percent = Some(28.25);
+        let frame = encode_heartbeat(&payload);
+        let cpu_x100 = u16::from_le_bytes(frame[8..10].try_into().unwrap());
+        let cpu_max_x100 = u16::from_le_bytes(frame[10..12].try_into().unwrap());
+        assert_eq!(cpu_x100, 1250);
+        assert_eq!(cpu_max_x100, 2825);
     }
 }
