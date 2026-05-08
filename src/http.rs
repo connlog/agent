@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use crate::extended_metrics::{DiscoveryPayload, SamplesPayload};
 use crate::heartbeat::{AgentConfig, HeartbeatPayload, HeartbeatResponse};
+use crate::quick_actions::{QuickActionResultPayload, QuickActionsManifestPayload};
 
 const CPU_UNAVAILABLE_X100: u16 = u16::MAX;
 
@@ -283,6 +284,62 @@ impl ApiClient {
             .json(payload)
             .send()
             .context("Failed to send resource samples")?;
+
+        if !response.status().is_success() {
+            return Err(ApiError::HttpError {
+                status: response.status().as_u16(),
+                message: response
+                    .text()
+                    .unwrap_or_else(|_| "Unknown error".to_string()),
+            });
+        }
+
+        Ok(())
+    }
+
+    pub fn send_quick_actions_manifest(
+        &self,
+        payload: &QuickActionsManifestPayload,
+    ) -> Result<(), ApiError> {
+        let url = format!("{}/api/agents/actions/manifest", self.base_url);
+        let auth_value = format!("Bearer {}", self.token);
+
+        let response = self
+            .client
+            .post(&url)
+            .header(CONTENT_TYPE, "application/json")
+            .header(AUTHORIZATION, auth_value)
+            .json(payload)
+            .send()
+            .context("Failed to send quick actions manifest")?;
+
+        if !response.status().is_success() {
+            return Err(ApiError::HttpError {
+                status: response.status().as_u16(),
+                message: response
+                    .text()
+                    .unwrap_or_else(|_| "Unknown error".to_string()),
+            });
+        }
+
+        Ok(())
+    }
+
+    pub fn send_quick_action_result(
+        &self,
+        payload: &QuickActionResultPayload,
+    ) -> Result<(), ApiError> {
+        let url = format!("{}/api/agents/actions/results", self.base_url);
+        let auth_value = format!("Bearer {}", self.token);
+
+        let response = self
+            .client
+            .post(&url)
+            .header(CONTENT_TYPE, "application/json")
+            .header(AUTHORIZATION, auth_value)
+            .json(payload)
+            .send()
+            .context("Failed to send quick action result")?;
 
         if !response.status().is_success() {
             return Err(ApiError::HttpError {

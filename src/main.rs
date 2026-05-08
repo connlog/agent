@@ -15,6 +15,7 @@ mod identity;
 mod install;
 mod metrics;
 mod platform;
+mod quick_actions;
 mod update;
 
 #[cfg(test)]
@@ -25,6 +26,7 @@ use defaults::{CONFIG_FETCH_RETRY_DELAY_SECS, DEFAULT_ENDPOINT, DISABLED_BACKOFF
 use heartbeat::{AgentConfig, HeartbeatPayload};
 use http::{ApiClient, ApiError};
 use metrics::MetricsCollector;
+use quick_actions::QuickActionsRegistry;
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Wire protocol version. v1 = 32-byte little-endian binary frame over
@@ -220,6 +222,10 @@ fn run_agent_with_shutdown_inner(
         warn!("Using fallback config - will retry fetching real config on next heartbeat");
     }
 
+    let mut quick_actions = QuickActionsRegistry::load();
+    let mut quick_actions_fingerprint = quick_actions.fingerprint();
+    publish_quick_actions_manifest(&client, &quick_actions);
+
     let mut first_heartbeat = true;
     let mut consecutive_unauthorized = 0u32;
     let mut consecutive_errors = 0u32;
@@ -347,6 +353,22 @@ fn run_agent_with_shutdown_inner(
                             error!("Failed to fetch updated config: {}", e);
                             // Continue with old config - it still works
                         }
+                    }
+                }
+
+                let reloaded_quick_actions = QuickActionsRegistry::load();
+                let reloaded_fingerprint = reloaded_quick_actions.fingerprint();
+                if reloaded_fingerprint != quick_actions_fingerprint {
+                    quick_actions = reloaded_quick_actions;
+                    quick_actions_fingerprint = reloaded_fingerprint;
+                    publish_quick_actions_manifest(&client, &quick_actions);
+                }
+
+                for request in &response.quick_actions {
+                    info!("Running quick action request {}", request.action_id);
+                    let result = quick_actions.execute(request);
+                    if let Err(e) = client.send_quick_action_result(&result) {
+                        warn!("Quick action result send failed: {}", e);
                     }
                 }
 
@@ -499,6 +521,18 @@ fn fetch_config_with_retry(client: &ApiClient) -> AgentConfig {
     AgentConfig::safe_fallback()
 }
 
+fn publish_quick_actions_manifest(client: &ApiClient, registry: &QuickActionsRegistry) {
+    let manifest = registry.manifest();
+    match client.send_quick_actions_manifest(&manifest) {
+        Ok(_) => info!(
+            "Quick actions manifest sent (enabled={}, actions={})",
+            manifest.enabled,
+            manifest.actions.len()
+        ),
+        Err(e) => warn!("Quick actions manifest send failed: {}", e),
+    }
+}
+
 /// Diagnostic: fetch the agent config from the platform and print the parsed
 /// fields. Token comes from CLI/env; endpoint from `resolve_endpoint`. Never
 /// touches the heartbeat loop and never prints the token.
@@ -551,6 +585,7 @@ fn run_test_heartbeat(token: String, endpoint: String) -> Result<()> {
                 println!("  latest_config_version:  {v}");
             }
             println!("  uninstall:              {}", result.uninstall);
+            println!("  quick_actions:          {}", result.quick_actions.len());
             match result.update {
                 Some(u) if u.available => {
                     println!(
@@ -636,6 +671,7 @@ struct HeartbeatResult {
     latest_config_version: Option<u32>,
     uninstall: bool,
     update: Option<heartbeat::UpdateInfo>,
+    quick_actions: Vec<quick_actions::QuickActionRequest>,
 }
 
 fn send_heartbeat(
@@ -785,6 +821,7 @@ fn send_heartbeat(
         latest_config_version: response.latest_config_version,
         uninstall: response.uninstall,
         update: response.update,
+        quick_actions: response.quick_actions,
     })
 }
 

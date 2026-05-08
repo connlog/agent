@@ -8,6 +8,22 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 
 ## [Unreleased]
 
+## [1.6.0] — 2026-05-09
+
+### Added
+
+- Added locally registered quick actions. The platform can request registered
+  action IDs, and the agent remains the authority for what executable argv may
+  run.
+- Added per-action output controls for hidden vs ephemeral output, bounded
+  stdout/stderr capture, timeout enforcement, and a local quick-actions kill
+  switch.
+
+### Security
+
+- Quick actions execute without `sh -c`, receive no dashboard-provided stdin or
+  arguments, and refuse unknown or disabled action IDs.
+
 ## [1.5.1] — 2026-05-08
 
 ### Fixed
@@ -408,7 +424,10 @@ considered stable; breaking changes from this point on require a major bump.
 
 - Last pre-1.0 release. See git history for prior changes.
 
-[Unreleased]: https://github.com/connlog/agent/compare/v1.4.1...HEAD
+[Unreleased]: https://github.com/connlog/agent/compare/v1.6.0...HEAD
+[1.6.0]: https://github.com/connlog/agent/compare/v1.5.1...v1.6.0
+[1.5.1]: https://github.com/connlog/agent/compare/v1.5.0...v1.5.1
+[1.5.0]: https://github.com/connlog/agent/compare/v1.4.1...v1.5.0
 [1.4.1]: https://github.com/connlog/agent/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/connlog/agent/compare/v1.3.8...v1.4.0
 [1.3.8]: https://github.com/connlog/agent/compare/v1.0.0...v1.3.8
