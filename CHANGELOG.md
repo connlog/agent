@@ -6,7 +6,22 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 [`VERSIONING.md`](./VERSIONING.md) for the full policy. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [1.8.2] — 2026-05-09
+
+### Fixed
+
+- Allowed `AF_NETLINK` in the systemd service sandbox so locally registered
+  Quick Actions can run read-only network inspection tools such as `ip a`,
+  `ip route`, and `ss`. The previous sandbox only allowed `AF_INET`,
+  `AF_INET6`, and `AF_UNIX`, causing `iproute2` commands to fail with
+  `Bad system call` when executed from the unprivileged `connlog-agent`
+  service.
+
+### Security
+
+- Kept the existing systemd hardening intact and added only the minimal address
+  family required for network diagnostics. Privileged syscalls, reboot, mount,
+  raw I/O, module loading, and other denied syscall groups remain blocked.
 
 ## [1.8.1] — 2026-05-09
 
@@ -494,7 +509,9 @@ considered stable; breaking changes from this point on require a major bump.
 
 - Last pre-1.0 release. See git history for prior changes.
 
-[Unreleased]: https://github.com/connlog/agent/compare/v1.8.0...HEAD
+[Unreleased]: https://github.com/connlog/agent/compare/v1.8.2...HEAD
+[1.8.2]: https://github.com/connlog/agent/compare/v1.8.1...v1.8.2
+[1.8.1]: https://github.com/connlog/agent/compare/v1.8.0...v1.8.1
 [1.8.0]: https://github.com/connlog/agent/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/connlog/agent/compare/v1.6.1...v1.7.0
 [1.6.1]: https://github.com/connlog/agent/compare/v1.6.0...v1.6.1
