@@ -42,9 +42,14 @@ RestrictRealtime=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
+
+# AF_NETLINK is required for read-only network inspection Quick Actions
+# such as `ip a`, `ip route`, and `ss`.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
 CapabilityBoundingSet=
 AmbientCapabilities=
+
 # NOTE: We deliberately DO NOT restrict /proc visibility for this service.
 # `sysinfo` reads /proc/stat, /proc/meminfo, /proc/loadavg, /proc/uptime, and
 # /proc/diskstats to compute CPU, memory, load, uptime and disk metrics —
@@ -52,12 +57,19 @@ AmbientCapabilities=
 # `systemd-analyze security` recommends) makes every read return ENOENT and
 # the agent silently sends a perfectly-formed heartbeat full of zeros. The
 # remaining hardening (NoNewPrivileges, ProtectSystem=strict, ProtectHome,
-# syscall filter, RestrictAddressFamilies, capability drop, etc.) keeps the
-# agent tightly contained without breaking metric collection.
+# RestrictAddressFamilies, capability drop, etc.) keeps the agent tightly
+# contained without breaking metric collection.
+#
+# NOTE: We also deliberately DO NOT apply a syscall allowlist here.
+# Local Quick Actions may run normal host diagnostic tools such as `ip`, `ss`,
+# `df`, `docker ps`, and `systemctl status`. A strict SystemCallFilter breaks
+# those tools with SIGSYS/"Bad system call".
+#
+# We keep the rest of the sandboxing in place: unprivileged user,
+# NoNewPrivileges, empty capabilities, strict filesystem protection,
+# restricted address families, namespace/realtime/SUID restrictions, etc.
 RemoveIPC=yes
 UMask=0077
-SystemCallFilter=@system-service
-SystemCallFilter=~@privileged @resources @mount @debug @cpu-emulation @obsolete @raw-io @reboot @swap @module
 
 # Post-stop hook: handles self-update and self-uninstall (runs as root via + prefix)
 ExecStopPost=+/bin/bash -c '\
@@ -531,12 +543,24 @@ mod tests {
             "ProtectSystem=strict",
             "ProtectHome=yes",
             "PrivateTmp=yes",
+            "PrivateDevices=yes",
+            "ProtectKernelTunables=yes",
             "ProtectKernelModules=yes",
-            "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX",
+            "ProtectKernelLogs=yes",
+            "ProtectControlGroups=yes",
+            "ProtectClock=yes",
+            "ProtectHostname=yes",
+            "RestrictSUIDSGID=yes",
+            "RestrictNamespaces=yes",
+            "RestrictRealtime=yes",
+            "LockPersonality=yes",
+            "MemoryDenyWriteExecute=yes",
+            "SystemCallArchitectures=native",
+            "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK",
             "CapabilityBoundingSet=",
+            "AmbientCapabilities=",
             "RemoveIPC=yes",
             "UMask=0077",
-            "SystemCallFilter=@system-service",
         ] {
             assert!(
                 SYSTEMD_SERVICE.contains(flag),
@@ -544,6 +568,14 @@ mod tests {
                 flag
             );
         }
+    }
+
+    #[test]
+    fn systemd_unit_does_not_use_syscall_filter() {
+        assert!(
+            !SYSTEMD_SERVICE.contains("\nSystemCallFilter="),
+            "SystemCallFilter breaks local Quick Actions by killing normal diagnostic tools with SIGSYS"
+        );
     }
 
     /// Regression for the v1.3.x "dashboard shows zeros" bug. With
