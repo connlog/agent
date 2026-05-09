@@ -6,6 +6,21 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 [`VERSIONING.md`](./VERSIONING.md) for the full policy. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.8.4] — 2026-05-10
+
+### Added
+
+- Added a lightweight quick-action command poll while the agent is waiting for
+  the next heartbeat. Agents now check `/api/agents/actions/pending` every
+  10 seconds during the heartbeat sleep window so dashboard-requested commands
+  start much faster without increasing the full metric heartbeat rate.
+
+### Fixed
+
+- Kept the existing heartbeat-delivered quick-action path intact and covered
+  the new poll endpoint with a simulation test so pending requests are still
+  claimed and executed by ID only.
+
 ## [1.8.3] — 2026-05-09
 
 ### Fixed

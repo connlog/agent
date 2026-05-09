@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use crate::extended_metrics::{DiscoveryPayload, SamplesPayload};
 use crate::heartbeat::{AgentConfig, HeartbeatPayload, HeartbeatResponse};
-use crate::quick_actions::{QuickActionResultPayload, QuickActionsManifestPayload};
+use crate::quick_actions::{
+    QuickActionRequest, QuickActionResultPayload, QuickActionsManifestPayload,
+};
 
 const CPU_UNAVAILABLE_X100: u16 = u16::MAX;
 
@@ -53,6 +55,12 @@ pub struct ApiClient {
     /// source is available (e.g. an unsupported OS); platform falls back to
     /// hostname binding in that case.
     machine_id: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct QuickActionPollResponse {
+    #[serde(default)]
+    quick_actions: Vec<QuickActionRequest>,
 }
 
 /// Total per-request timeout (connect + read + write). Tight on purpose: the
@@ -351,6 +359,47 @@ impl ApiClient {
         }
 
         Ok(())
+    }
+
+    pub fn poll_quick_actions(&self) -> Result<Vec<QuickActionRequest>, ApiError> {
+        let url = format!("{}/api/agents/actions/pending", self.base_url);
+        let auth_value = format!("Bearer {}", self.token);
+
+        let response = self
+            .client
+            .get(&url)
+            .header(CONTENT_TYPE, "application/json")
+            .header(AUTHORIZATION, auth_value)
+            .send()
+            .context("Failed to poll quick action queue")?;
+
+        let status = response.status();
+        if status == StatusCode::UNAUTHORIZED {
+            return Err(ApiError::Unauthorized);
+        }
+
+        if status == StatusCode::GONE {
+            return Err(ApiError::Decommissioned);
+        }
+
+        if status == StatusCode::LOCKED {
+            return Err(ApiError::Disabled);
+        }
+
+        if !status.is_success() {
+            return Err(ApiError::HttpError {
+                status: status.as_u16(),
+                message: response
+                    .text()
+                    .unwrap_or_else(|_| "Unknown error".to_string()),
+            });
+        }
+
+        let poll_response: QuickActionPollResponse = response
+            .json()
+            .context("Failed to parse quick action poll response")?;
+
+        Ok(poll_response.quick_actions)
     }
 }
 

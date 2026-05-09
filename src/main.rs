@@ -4,7 +4,7 @@ use log::{error, info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod action_cli;
 mod config;
@@ -28,7 +28,7 @@ use defaults::{CONFIG_FETCH_RETRY_DELAY_SECS, DEFAULT_ENDPOINT, DISABLED_BACKOFF
 use heartbeat::{AgentConfig, HeartbeatPayload};
 use http::{ApiClient, ApiError};
 use metrics::MetricsCollector;
-use quick_actions::QuickActionsRegistry;
+use quick_actions::{QuickActionRequest, QuickActionsRegistry};
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Wire protocol version. v1 = 32-byte little-endian binary frame over
@@ -56,6 +56,11 @@ const MAX_CONFIG_FETCH_RETRIES: u32 = 3;
 /// installed at the same minute would otherwise all hit the platform on the
 /// same second every interval.
 const HEARTBEAT_JITTER_PCT: u64 = 10;
+
+/// While waiting for the next heartbeat, check for dashboard-requested quick
+/// actions on this cadence so command pickup is not tied to metric heartbeat
+/// frequency.
+const QUICK_ACTION_POLL_INTERVAL_SECS: u64 = 10;
 
 /// Initialise the logger with a structured, grep-friendly line format:
 ///
@@ -295,20 +300,6 @@ fn run_agent_with_shutdown_inner(
     // the signed hash against its compiled-in public key, so the platform
     // proxy is untrusted by design.
 
-    // Cooperative sleep helper: returns Err(()) if shutdown was requested
-    // mid-sleep, otherwise Ok(()). Sleeps in 500 ms ticks for responsiveness.
-    let stop_for_sleep = Arc::clone(&stop);
-    let interruptible_sleep = move |total_secs: u64| -> Result<(), ()> {
-        let deadline = std::time::Instant::now() + Duration::from_secs(total_secs);
-        while std::time::Instant::now() < deadline {
-            if stop_for_sleep.load(Ordering::SeqCst) {
-                return Err(());
-            }
-            thread::sleep(Duration::from_millis(500));
-        }
-        Ok(())
-    };
-
     // Main loop
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -405,21 +396,12 @@ fn run_agent_with_shutdown_inner(
                     }
                 }
 
-                let reloaded_quick_actions = QuickActionsRegistry::load();
-                let reloaded_fingerprint = reloaded_quick_actions.fingerprint();
-                if reloaded_fingerprint != quick_actions_fingerprint {
-                    quick_actions = reloaded_quick_actions;
-                    quick_actions_fingerprint = reloaded_fingerprint;
-                    publish_quick_actions_manifest(&client, &quick_actions);
-                }
-
-                for request in &response.quick_actions {
-                    info!("Running quick action request {}", request.action_id);
-                    let result = quick_actions.execute(request);
-                    if let Err(e) = client.send_quick_action_result(&result) {
-                        warn!("Quick action result send failed: {}", e);
-                    }
-                }
+                reload_quick_actions_if_changed(
+                    &client,
+                    &mut quick_actions,
+                    &mut quick_actions_fingerprint,
+                );
+                run_quick_action_requests(&client, &quick_actions, &response.quick_actions);
 
                 // Extended Linux metrics (opt-in): discovery + compact samples
                 if extended_metrics::is_linux_runtime()
@@ -470,7 +452,15 @@ fn run_agent_with_shutdown_inner(
                     "Heartbeat sent successfully, next in {}s",
                     config.heartbeat_interval_secs
                 );
-                if interruptible_sleep(jittered(config.heartbeat_interval_secs)).is_err() {
+                if sleep_with_quick_action_polling(
+                    &stop,
+                    jittered(config.heartbeat_interval_secs),
+                    &client,
+                    &mut quick_actions,
+                    &mut quick_actions_fingerprint,
+                )
+                .is_err()
+                {
                     return Ok(());
                 }
             }
@@ -499,7 +489,7 @@ fn run_agent_with_shutdown_inner(
                 // platform glitch. At the cap, 50 attempts ≈ 95 minutes total
                 // before self-uninstall.
                 let backoff = std::cmp::min(30 + 10 * consecutive_unauthorized as u64, 120);
-                if interruptible_sleep(backoff).is_err() {
+                if interruptible_sleep(&stop, backoff).is_err() {
                     return Ok(());
                 }
             }
@@ -524,7 +514,7 @@ fn run_agent_with_shutdown_inner(
                     "Agent is disabled in ConnLog (423 Locked). Backing off for {}s before checking again. Re-enable from the dashboard.",
                     DISABLED_BACKOFF_SECS
                 );
-                if interruptible_sleep(DISABLED_BACKOFF_SECS).is_err() {
+                if interruptible_sleep(&stop, DISABLED_BACKOFF_SECS).is_err() {
                     return Ok(());
                 }
             }
@@ -536,10 +526,105 @@ fn run_agent_with_shutdown_inner(
                     3600,
                 );
                 error!("Heartbeat failed: {} (retry in {}s)", e, backoff);
-                if interruptible_sleep(backoff).is_err() {
+                if interruptible_sleep(&stop, backoff).is_err() {
                     return Ok(());
                 }
             }
+        }
+    }
+}
+
+/// Cooperative sleep helper: returns Err(()) if shutdown was requested
+/// mid-sleep, otherwise Ok(()). Sleeps in 500 ms ticks for responsiveness.
+fn interruptible_sleep(stop: &Arc<AtomicBool>, total_secs: u64) -> Result<(), ()> {
+    let deadline = Instant::now() + Duration::from_secs(total_secs);
+    while Instant::now() < deadline {
+        if stop.load(Ordering::SeqCst) {
+            return Err(());
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    Ok(())
+}
+
+fn sleep_with_quick_action_polling(
+    stop: &Arc<AtomicBool>,
+    total_secs: u64,
+    client: &ApiClient,
+    quick_actions: &mut QuickActionsRegistry,
+    quick_actions_fingerprint: &mut String,
+) -> Result<(), ()> {
+    let deadline = Instant::now() + Duration::from_secs(total_secs);
+    let poll_interval = Duration::from_secs(QUICK_ACTION_POLL_INTERVAL_SECS);
+    let mut next_poll = Instant::now() + poll_interval;
+
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return Err(());
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(());
+        }
+
+        if now >= next_poll {
+            poll_quick_actions_once(client, quick_actions, quick_actions_fingerprint);
+            next_poll = Instant::now() + poll_interval;
+            continue;
+        }
+
+        let next_wake = std::cmp::min(deadline, next_poll);
+        let sleep_for = std::cmp::min(
+            Duration::from_millis(500),
+            next_wake.saturating_duration_since(now),
+        );
+
+        if sleep_for > Duration::from_millis(0) {
+            thread::sleep(sleep_for);
+        } else {
+            thread::yield_now();
+        }
+    }
+}
+
+fn reload_quick_actions_if_changed(
+    client: &ApiClient,
+    quick_actions: &mut QuickActionsRegistry,
+    quick_actions_fingerprint: &mut String,
+) {
+    let reloaded_quick_actions = QuickActionsRegistry::load();
+    let reloaded_fingerprint = reloaded_quick_actions.fingerprint();
+    if reloaded_fingerprint != *quick_actions_fingerprint {
+        *quick_actions = reloaded_quick_actions;
+        *quick_actions_fingerprint = reloaded_fingerprint;
+        publish_quick_actions_manifest(client, quick_actions);
+    }
+}
+
+fn poll_quick_actions_once(
+    client: &ApiClient,
+    quick_actions: &mut QuickActionsRegistry,
+    quick_actions_fingerprint: &mut String,
+) {
+    reload_quick_actions_if_changed(client, quick_actions, quick_actions_fingerprint);
+
+    match client.poll_quick_actions() {
+        Ok(requests) => run_quick_action_requests(client, quick_actions, &requests),
+        Err(e) => warn!("Quick action poll failed: {}", e),
+    }
+}
+
+fn run_quick_action_requests(
+    client: &ApiClient,
+    quick_actions: &QuickActionsRegistry,
+    requests: &[QuickActionRequest],
+) {
+    for request in requests {
+        info!("Running quick action request {}", request.action_id);
+        let result = quick_actions.execute(request);
+        if let Err(e) = client.send_quick_action_result(&result) {
+            warn!("Quick action result send failed: {}", e);
         }
     }
 }

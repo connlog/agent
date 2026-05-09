@@ -270,6 +270,28 @@ fn heartbeat_200_with_update_info() {
     assert!(!update.force_update);
 }
 
+#[test]
+fn quick_action_poll_claims_pending_request() {
+    let body = br#"{"ok":true,"quick_actions":[{"request_id":"00000000-0000-0000-0000-000000000001","action_id":"disk_usage"}]}"#
+        .to_vec();
+    let (base, rx) = one_shot_server("200 OK", body);
+
+    let client = ApiClient::new(base, "test-token".into()).expect("ApiClient::new");
+    let requests = client.poll_quick_actions().expect("poll ok");
+
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].request_id,
+        "00000000-0000-0000-0000-000000000001"
+    );
+    assert_eq!(requests[0].action_id, "disk_usage");
+
+    let req = recv_request(&rx);
+    assert_eq!(req.method, "GET");
+    assert_eq!(req.path, "/api/agents/actions/pending");
+    assert_eq!(req.header("Authorization"), Some("Bearer test-token"));
+}
+
 // ────────────────────────────────────────────────────────────────────────
 // Error responses → typed ApiError variants
 // ────────────────────────────────────────────────────────────────────────
