@@ -8,6 +8,13 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::ffi::CString;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 const DEFAULT_CONFIG_PATH: &str = "/etc/connlog/actions.toml";
 pub const DEFAULT_ACTION_CATEGORY: &str = "Custom";
 pub const DEFAULT_TIMEOUT_SECONDS: u64 = 15;
@@ -152,6 +159,7 @@ impl QuickActionsRegistry {
 
     fn load_result() -> Result<Self> {
         let path = config_path();
+        repair_default_actions_config_permissions_for_root(&path)?;
         if !path.exists() {
             return Ok(Self::disabled());
         }
@@ -306,7 +314,84 @@ fn write_actions_config(path: &Path, text: &str) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))
+    fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))?;
+    make_default_actions_config_readable_by_service(path)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_default_actions_config_readable_by_service(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn repair_default_actions_config_permissions_for_root(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn repair_default_actions_config_permissions_for_root(path: &Path) -> Result<()> {
+    if unsafe { libc::geteuid() } != 0 || !path.exists() {
+        return Ok(());
+    }
+    make_default_actions_config_readable_by_service(path)
+}
+
+#[cfg(unix)]
+fn make_default_actions_config_readable_by_service(path: &Path) -> Result<()> {
+    if path != Path::new(DEFAULT_CONFIG_PATH) {
+        return Ok(());
+    }
+
+    let Some(gid) = connlog_agent_group_id() else {
+        log::warn!(
+            "System group `connlog-agent` not found; the running service may not be able to read {}",
+            path.display()
+        );
+        return Ok(());
+    };
+
+    if let Some(parent) = path.parent() {
+        chown_group(parent, gid)?;
+        set_mode(parent, 0o750)?;
+    }
+    chown_group(path, gid)?;
+    set_mode(path, 0o640)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn connlog_agent_group_id() -> Option<libc::gid_t> {
+    let group_name = CString::new("connlog-agent").ok()?;
+    let group = unsafe { libc::getgrnam(group_name.as_ptr()) };
+    if group.is_null() {
+        None
+    } else {
+        Some(unsafe { (*group).gr_gid })
+    }
+}
+
+#[cfg(unix)]
+fn chown_group(path: &Path, gid: libc::gid_t) -> Result<()> {
+    let path_c = CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("failed to prepare path {}", path.display()))?;
+    let unchanged_uid = !0 as libc::uid_t;
+    let result = unsafe { libc::chown(path_c.as_ptr(), unchanged_uid, gid) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to set group on {}", path.display()));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> Result<()> {
+    let mut perms = fs::metadata(path)
+        .with_context(|| format!("failed to read {} metadata", path.display()))?
+        .permissions();
+    perms.set_mode(mode);
+    fs::set_permissions(path, perms)
+        .with_context(|| format!("failed to set {} permissions", path.display()))
 }
 
 fn ensure_quick_actions_enabled(text: &str) -> String {

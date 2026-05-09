@@ -229,15 +229,25 @@ fn create_system_user() -> Result<()> {
 fn create_config_dir() -> Result<()> {
     fs::create_dir_all("/etc/connlog").context("Failed to create /etc/connlog directory")?;
 
-    // Set directory permissions to 0700 (root-only, prevents other users listing contents)
+    let chown_status = Command::new("chown")
+        .args(["root:connlog-agent", "/etc/connlog"])
+        .status()
+        .context("Failed to set /etc/connlog ownership")?;
+    if !chown_status.success() {
+        anyhow::bail!("Failed to set /etc/connlog ownership");
+    }
+
+    // Allow the service group to traverse the directory for actions.toml.
+    // The token file remains 0600 root-only and is read by systemd before the
+    // service drops to User=connlog-agent.
     let dir_path = Path::new("/etc/connlog");
     let mut dir_perms = fs::metadata(dir_path)
         .context("Failed to read /etc/connlog metadata")?
         .permissions();
-    dir_perms.set_mode(0o700);
+    dir_perms.set_mode(0o750);
     fs::set_permissions(dir_path, dir_perms).context("Failed to set /etc/connlog permissions")?;
 
-    println!("  Created /etc/connlog directory (700 root:root)");
+    println!("  Created /etc/connlog directory (750 root:connlog-agent)");
     Ok(())
 }
 
