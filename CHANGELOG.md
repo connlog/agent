@@ -8,6 +8,37 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 
 ## [Unreleased]
 
+## [1.8.0] — 2026-05-09
+
+### Added
+
+- Added `connlog-agent action add`, a beginner-friendly interactive flow for
+  registering local dashboard actions with a label, description, command,
+  output preference, and confirmation preference.
+- Added `connlog-agent action list`, `action remove`, `action enable`,
+  `action disable`, and `action test`, while keeping the plural `actions`
+  command working as an alias.
+- Added simple shell-like command-line parsing for interactive action setup so
+  commands such as `df -h` and `systemctl status nginx` are stored as argv
+  arrays without running through a shell.
+- Added risky-command detection for common state-changing commands, defaulting
+  dashboard confirmation to required when a command looks risky.
+
+### Changed
+
+- Simplified root `--help` around common install/status/action workflows and
+  moved detailed action usage into `connlog-agent action --help`.
+- Added a `diagnostics` command group for config and heartbeat checks while
+  keeping the previous top-level diagnostic commands and legacy flags working.
+- Default simple actions now use category `Custom`, risk `medium`, a 15-second
+  timeout, and bounded ephemeral output when users choose to show output.
+
+### Security
+
+- Preserved the existing local action security contract: ConnLog receives only
+  action metadata and IDs, raw command argv remains local on the agent host, and
+  dashboard requests still validate action IDs locally before execution.
+
 ## [1.7.0] — 2026-05-09
 
 ### Added
@@ -451,7 +482,8 @@ considered stable; breaking changes from this point on require a major bump.
 
 - Last pre-1.0 release. See git history for prior changes.
 
-[Unreleased]: https://github.com/connlog/agent/compare/v1.7.0...HEAD
+[Unreleased]: https://github.com/connlog/agent/compare/v1.8.0...HEAD
+[1.8.0]: https://github.com/connlog/agent/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/connlog/agent/compare/v1.6.1...v1.7.0
 [1.6.1]: https://github.com/connlog/agent/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/connlog/agent/compare/v1.5.1...v1.6.0

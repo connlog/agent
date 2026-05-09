@@ -9,10 +9,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/connlog/actions.toml";
-const DEFAULT_TIMEOUT_SECONDS: u64 = 15;
-const MAX_TIMEOUT_SECONDS: u64 = 60;
-const DEFAULT_MAX_OUTPUT_BYTES: usize = 8192;
-const HARD_MAX_OUTPUT_BYTES: usize = 64 * 1024;
+pub const DEFAULT_ACTION_CATEGORY: &str = "Custom";
+pub const DEFAULT_TIMEOUT_SECONDS: u64 = 15;
+pub const MAX_TIMEOUT_SECONDS: u64 = 60;
+pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 8192;
+pub const HARD_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutputMode {
@@ -21,7 +22,7 @@ pub enum OutputMode {
 }
 
 impl OutputMode {
-    fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             OutputMode::Hidden => "hidden",
             OutputMode::Ephemeral => "ephemeral",
@@ -37,16 +38,12 @@ pub enum Risk {
 }
 
 impl Risk {
-    fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Risk::Low => "low",
             Risk::Medium => "medium",
             Risk::High => "high",
         }
-    }
-
-    fn requires_confirmation(&self) -> bool {
-        matches!(self, Risk::Medium | Risk::High)
     }
 }
 
@@ -58,6 +55,7 @@ pub struct QuickAction {
     pub category: Option<String>,
     pub risk: Risk,
     pub requires_confirmation: bool,
+    pub enabled: bool,
     pub timeout_seconds: u64,
     pub output_mode: OutputMode,
     pub max_output_bytes: usize,
@@ -72,6 +70,7 @@ pub struct QuickActionRegistration {
     pub category: Option<String>,
     pub risk: Risk,
     pub requires_confirmation: bool,
+    pub enabled: bool,
     pub timeout_seconds: u64,
     pub output_mode: OutputMode,
     pub max_output_bytes: usize,
@@ -133,6 +132,7 @@ struct ActionBuilder {
     category: Option<String>,
     risk: Option<Risk>,
     requires_confirmation: Option<bool>,
+    enabled: Option<bool>,
     timeout_seconds: Option<u64>,
     output_mode: Option<OutputMode>,
     max_output_bytes: Option<usize>,
@@ -179,6 +179,7 @@ impl QuickActionsRegistry {
         let mut actions = self
             .actions
             .values()
+            .filter(|action| action.enabled)
             .map(|action| QuickActionManifestItem {
                 action_id: action.id.clone(),
                 label: action.label.clone(),
@@ -217,7 +218,7 @@ impl QuickActionsRegistry {
             };
         };
 
-        if !self.enabled {
+        if !self.enabled || !action.enabled {
             return QuickActionResultPayload {
                 request_id: request.request_id.clone(),
                 action_id: request.action_id.clone(),
@@ -231,6 +232,20 @@ impl QuickActionsRegistry {
         }
 
         run_action(request, action)
+    }
+
+    pub fn action(&self, action_id: &str) -> Option<&QuickAction> {
+        self.actions.get(action_id)
+    }
+
+    pub fn actions(&self) -> Vec<&QuickAction> {
+        let mut actions = self.actions.values().collect::<Vec<_>>();
+        actions.sort_by(|a, b| a.id.cmp(&b.id));
+        actions
+    }
+
+    pub fn has_action(&self, action_id: &str) -> bool {
+        self.actions.contains_key(action_id)
     }
 }
 
@@ -267,6 +282,21 @@ pub fn remove_local_action(action_id: &str) -> Result<PathBuf> {
     let existing =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
     let next = remove_action_section(&existing, action_id);
+    write_actions_config(&path, &next)?;
+    Ok(path)
+}
+
+pub fn set_local_action_enabled(action_id: &str, enabled: bool) -> Result<PathBuf> {
+    validate_action_id(action_id)?;
+    let path = config_path();
+    let existing =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let base = if enabled {
+        ensure_quick_actions_enabled(&existing)
+    } else {
+        existing
+    };
+    let next = set_action_enabled_in_config(&base, action_id, enabled)?;
     write_actions_config(&path, &next)?;
     Ok(path)
 }
@@ -372,8 +402,9 @@ fn format_action_section(action: &QuickActionRegistration) -> String {
     ));
     lines.push(format!(
         "requires_confirmation = {}",
-        action.requires_confirmation || action.risk.requires_confirmation()
+        action.requires_confirmation
     ));
+    lines.push(format!("enabled = {}", action.enabled));
     lines.push(format!("timeout_seconds = {}", action.timeout_seconds));
     lines.push(format!(
         "output_mode = {}",
@@ -391,6 +422,54 @@ fn format_action_section(action: &QuickActionRegistration) -> String {
     ));
 
     lines.join("\n")
+}
+
+fn set_action_enabled_in_config(text: &str, action_id: &str, enabled: bool) -> Result<String> {
+    let target = format!("[quick_actions.{action_id}]");
+    let enabled_line = format!("enabled = {enabled}");
+    let mut lines = Vec::new();
+    let mut in_target = false;
+    let mut found_target = false;
+    let mut wrote_enabled = false;
+
+    for line in text.lines() {
+        let uncommented = strip_comment(line);
+        let trimmed = uncommented.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if in_target && !wrote_enabled {
+                lines.push(enabled_line.clone());
+                wrote_enabled = true;
+            }
+            in_target = trimmed == target;
+            if in_target {
+                found_target = true;
+                wrote_enabled = false;
+            }
+        }
+
+        if in_target {
+            let is_enabled_key = split_key_value(trimmed).is_some_and(|(key, _)| key == "enabled");
+            if is_enabled_key {
+                if !wrote_enabled {
+                    lines.push(enabled_line.clone());
+                    wrote_enabled = true;
+                }
+                continue;
+            }
+        }
+
+        lines.push(line.to_string());
+    }
+
+    if in_target && !wrote_enabled {
+        lines.push(enabled_line);
+    }
+
+    if !found_target {
+        anyhow::bail!("local action `{action_id}` is not registered");
+    }
+
+    Ok(lines.join("\n"))
 }
 
 fn quote_toml_string(value: &str) -> String {
@@ -474,8 +553,8 @@ fn parse_config(text: &str) -> Result<QuickActionsRegistry> {
         }
 
         let risk = builder.risk.unwrap_or(Risk::Low);
-        let requires_confirmation =
-            builder.requires_confirmation.unwrap_or(false) || risk.requires_confirmation();
+        let requires_confirmation = builder.requires_confirmation.unwrap_or(false);
+        let enabled = builder.enabled.unwrap_or(true);
         let max_output_bytes = builder
             .max_output_bytes
             .unwrap_or(DEFAULT_MAX_OUTPUT_BYTES)
@@ -490,6 +569,7 @@ fn parse_config(text: &str) -> Result<QuickActionsRegistry> {
                 category: builder.category,
                 risk,
                 requires_confirmation,
+                enabled,
                 timeout_seconds: builder
                     .timeout_seconds
                     .unwrap_or(DEFAULT_TIMEOUT_SECONDS)
@@ -521,6 +601,7 @@ fn apply_action_value(builder: &mut ActionBuilder, key: &str, value: &str) -> Re
             });
         }
         "requires_confirmation" => builder.requires_confirmation = Some(parse_bool(value)?),
+        "enabled" => builder.enabled = Some(parse_bool(value)?),
         "timeout_seconds" => builder.timeout_seconds = Some(parse_u64(value)?),
         "output_mode" => {
             builder.output_mode = Some(match parse_string(value)?.as_str() {
@@ -654,6 +735,134 @@ fn validate_action_id(action_id: &str) -> Result<()> {
         anyhow::bail!("action id contains unsupported characters");
     }
     Ok(())
+}
+
+pub fn is_valid_action_id(action_id: &str) -> bool {
+    validate_action_id(action_id).is_ok()
+}
+
+pub fn label_to_action_id(label: &str) -> String {
+    let mut id = String::new();
+    let mut last_was_separator = false;
+
+    for ch in label.chars() {
+        if ch.is_ascii_alphanumeric() {
+            id.push(ch.to_ascii_lowercase());
+            last_was_separator = false;
+        } else if !last_was_separator && !id.is_empty() {
+            id.push('_');
+            last_was_separator = true;
+        }
+    }
+
+    while id.ends_with('_') {
+        id.pop();
+    }
+
+    if id.len() > 80 {
+        id.truncate(80);
+        while id.ends_with('_') {
+            id.pop();
+        }
+    }
+
+    id
+}
+
+pub fn parse_command_line(input: &str) -> Result<Vec<String>> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut chars = input.chars().peekable();
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut token_started = false;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' if !in_double_quote => {
+                in_single_quote = !in_single_quote;
+                token_started = true;
+            }
+            '"' if !in_single_quote => {
+                in_double_quote = !in_double_quote;
+                token_started = true;
+            }
+            '\\' if !in_single_quote => {
+                let Some(next) = chars.next() else {
+                    anyhow::bail!("command line ends with an unfinished escape");
+                };
+                current.push(next);
+                token_started = true;
+            }
+            ch if ch.is_whitespace() && !in_single_quote && !in_double_quote => {
+                if token_started {
+                    args.push(current);
+                    current = String::new();
+                    token_started = false;
+                }
+            }
+            other => {
+                current.push(other);
+                token_started = true;
+            }
+        }
+    }
+
+    if in_single_quote || in_double_quote {
+        anyhow::bail!("command line has an unfinished quote");
+    }
+
+    if token_started {
+        args.push(current);
+    }
+
+    if args.is_empty() {
+        anyhow::bail!("command must not be empty");
+    }
+
+    Ok(args)
+}
+
+pub fn command_looks_risky(argv: &[String]) -> bool {
+    if argv.is_empty() {
+        return false;
+    }
+
+    let words = argv
+        .iter()
+        .map(|part| part.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let program = words[0]
+        .rsplit('/')
+        .next()
+        .unwrap_or(words[0].as_str())
+        .to_string();
+
+    if matches!(program.as_str(), "reboot" | "shutdown" | "rm" | "dd") {
+        return true;
+    }
+    if program == "mkfs" || program.starts_with("mkfs.") {
+        return true;
+    }
+    if program == "systemctl" && words.get(1).is_some_and(|arg| arg == "restart") {
+        return true;
+    }
+    if program == "docker" {
+        if words.get(1).is_some_and(|arg| arg == "rm") {
+            return true;
+        }
+        if words.get(1).is_some_and(|arg| arg == "compose")
+            && words.get(2).is_some_and(|arg| arg == "down")
+        {
+            return true;
+        }
+    }
+
+    matches!(program.as_str(), "curl" | "wget")
+        && words.iter().any(|arg| arg == "|")
+        && words
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "sh" | "bash"))
 }
 
 fn run_action(request: &QuickActionRequest, action: &QuickAction) -> QuickActionResultPayload {
@@ -946,6 +1155,7 @@ exec = ["printf", "ok"]
             category: Some("Diagnostics".to_string()),
             risk: Risk::Low,
             requires_confirmation: false,
+            enabled: true,
             timeout_seconds: 10,
             output_mode: OutputMode::Ephemeral,
             max_output_bytes: 8192,
@@ -986,6 +1196,7 @@ exec = ["uptime"]
             category: None,
             risk: Risk::Medium,
             requires_confirmation: false,
+            enabled: true,
             timeout_seconds: 10,
             output_mode: OutputMode::Hidden,
             max_output_bytes: 8192,
@@ -1001,7 +1212,111 @@ exec = ["uptime"]
         assert!(next.contains("enabled = true"));
         assert!(!next.contains("label = \"Old\""));
         assert!(next.contains("label = \"New disk usage\""));
-        assert!(next.contains("requires_confirmation = true"));
+        assert!(next.contains("requires_confirmation = false"));
         assert!(next.contains("[quick_actions.uptime]"));
+    }
+
+    #[test]
+    fn disabled_action_is_omitted_from_manifest_and_execution() {
+        let registry = parse_config(
+            r#"
+[quick_actions.echo]
+label = "Echo"
+enabled = false
+output_mode = "ephemeral"
+exec = ["printf", "ok"]
+"#,
+        )
+        .expect("config parses");
+
+        assert!(registry.action("echo").is_some());
+        assert!(registry.manifest().actions.is_empty());
+
+        let result = registry.execute(&request("echo"));
+        assert_eq!(result.status, "unsupported");
+        assert!(result.stdout.is_none());
+    }
+
+    #[test]
+    fn command_line_parser_handles_quotes_and_escapes() {
+        assert_eq!(
+            parse_command_line(r#"systemctl status "nginx service""#).unwrap(),
+            ["systemctl", "status", "nginx service"]
+        );
+        assert_eq!(
+            parse_command_line(r#"printf 'hello world' escaped\ value"#).unwrap(),
+            ["printf", "hello world", "escaped value"]
+        );
+        assert!(parse_command_line(r#"printf "unterminated"#).is_err());
+    }
+
+    #[test]
+    fn risky_command_detection_catches_state_changers() {
+        assert!(command_looks_risky(&["reboot".to_string()]));
+        assert!(command_looks_risky(&[
+            "systemctl".to_string(),
+            "restart".to_string(),
+            "nginx".to_string()
+        ]));
+        assert!(command_looks_risky(&[
+            "docker".to_string(),
+            "compose".to_string(),
+            "down".to_string()
+        ]));
+        assert!(command_looks_risky(&[
+            "curl".to_string(),
+            "https://example.test/install.sh".to_string(),
+            "|".to_string(),
+            "sh".to_string()
+        ]));
+        assert!(!command_looks_risky(&["df".to_string(), "-h".to_string()]));
+    }
+
+    #[test]
+    fn label_to_action_id_generates_stable_snake_case() {
+        assert_eq!(label_to_action_id("Check disk usage"), "check_disk_usage");
+        assert_eq!(
+            label_to_action_id("  Docker containers! "),
+            "docker_containers"
+        );
+    }
+
+    #[test]
+    fn existing_config_without_new_fields_remains_compatible() {
+        let registry = parse_config(
+            r#"
+[quick_actions.disk_usage]
+label = "Check disk usage"
+exec = ["df", "-h"]
+"#,
+        )
+        .expect("legacy config parses");
+        let action = registry.action("disk_usage").expect("action exists");
+
+        assert!(action.enabled);
+        assert_eq!(action.risk, Risk::Low);
+        assert_eq!(action.output_mode, OutputMode::Hidden);
+        assert_eq!(action.timeout_seconds, DEFAULT_TIMEOUT_SECONDS);
+        assert_eq!(action.max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn set_action_enabled_updates_or_inserts_key() {
+        let existing = r#"
+[quick_actions]
+enabled = true
+
+[quick_actions.disk_usage]
+label = "Check disk usage"
+exec = ["df", "-h"]
+"#;
+
+        let disabled = set_action_enabled_in_config(existing, "disk_usage", false)
+            .expect("action can be disabled");
+        assert!(disabled.contains("enabled = false"));
+
+        let enabled =
+            set_action_enabled_in_config(&disabled, "disk_usage", true).expect("action can enable");
+        assert!(enabled.contains("enabled = true"));
     }
 }

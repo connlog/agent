@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+mod action_cli;
 mod config;
 mod defaults;
 mod extended_metrics;
@@ -21,17 +22,13 @@ mod update;
 #[cfg(test)]
 mod simulation;
 
-use config::{
-    ActionCommand, AgentCommand, CliActionOutputMode, CliActionRisk, Config, RegisterActionArgs,
-};
+use action_cli::run_action_command;
+use config::{AgentCommand, Config, DiagnosticCommand};
 use defaults::{CONFIG_FETCH_RETRY_DELAY_SECS, DEFAULT_ENDPOINT, DISABLED_BACKOFF_SECS};
 use heartbeat::{AgentConfig, HeartbeatPayload};
 use http::{ApiClient, ApiError};
 use metrics::MetricsCollector;
-use quick_actions::{
-    register_local_action, remove_local_action, OutputMode, QuickActionRegistration,
-    QuickActionsRegistry, Risk,
-};
+use quick_actions::QuickActionsRegistry;
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Wire protocol version. v1 = 32-byte little-endian binary frame over
@@ -156,7 +153,25 @@ fn main() -> Result<()> {
                 let endpoint = config.resolve_endpoint(DEFAULT_ENDPOINT);
                 return run_test_heartbeat(token, endpoint);
             }
-            AgentCommand::Actions { command } => return run_action_command(command),
+            AgentCommand::Action { command } => return run_action_command(command),
+            AgentCommand::Diagnostics { command } => match command {
+                DiagnosticCommand::CheckConfig => {
+                    let token = config
+                        .token
+                        .clone()
+                        .context("Token required for diagnostics check-config")?;
+                    let endpoint = config.resolve_endpoint(DEFAULT_ENDPOINT);
+                    return run_check_config(token, endpoint);
+                }
+                DiagnosticCommand::TestHeartbeat => {
+                    let token = config
+                        .token
+                        .clone()
+                        .context("Token required for diagnostics test-heartbeat")?;
+                    let endpoint = config.resolve_endpoint(DEFAULT_ENDPOINT);
+                    return run_test_heartbeat(token, endpoint);
+                }
+            },
         }
     }
 
@@ -214,81 +229,6 @@ fn main() -> Result<()> {
     let endpoint = config.resolve_endpoint(DEFAULT_ENDPOINT);
 
     run_agent_with_shutdown_inner(token, endpoint, Arc::new(AtomicBool::new(false)))
-}
-
-fn run_action_command(command: ActionCommand) -> Result<()> {
-    match command {
-        ActionCommand::Register(args) => register_cli_action(args),
-        ActionCommand::List => {
-            let manifest = QuickActionsRegistry::load().manifest();
-            if manifest.actions.is_empty() {
-                println!("No local actions registered.");
-                println!(
-                    "Add one with: sudo connlog-agent actions register <id> --label <label> -- <exec> [args...]"
-                );
-                return Ok(());
-            }
-
-            println!("Local dashboard actions:");
-            for action in manifest.actions {
-                println!(
-                    "  {}  {}  risk={} output={} timeout={}s max_output={}B",
-                    action.action_id,
-                    action.label,
-                    action.risk,
-                    action.output_mode,
-                    action.timeout_seconds,
-                    action.max_output_bytes
-                );
-            }
-            Ok(())
-        }
-        ActionCommand::Remove { action_id } => {
-            let path = remove_local_action(&action_id)?;
-            println!("Removed local action `{action_id}` from {}", path.display());
-            println!("The dashboard will update after the agent's next heartbeat.");
-            Ok(())
-        }
-    }
-}
-
-fn register_cli_action(args: RegisterActionArgs) -> Result<()> {
-    let action_id = args.action_id.clone();
-    let path = register_local_action(QuickActionRegistration {
-        id: args.action_id,
-        label: args.label,
-        description: args.description,
-        category: args.category,
-        risk: cli_risk(args.risk),
-        requires_confirmation: args.requires_confirmation,
-        timeout_seconds: args.timeout_seconds,
-        output_mode: cli_output_mode(args.output_mode),
-        max_output_bytes: args.max_output_bytes,
-        exec: args.exec,
-    })?;
-
-    println!(
-        "Registered local action `{action_id}` in {}",
-        path.display()
-    );
-    println!("The running agent will publish it to the dashboard on the next heartbeat.");
-    println!("List local dashboard actions with: connlog-agent actions list");
-    Ok(())
-}
-
-fn cli_risk(risk: CliActionRisk) -> Risk {
-    match risk {
-        CliActionRisk::Low => Risk::Low,
-        CliActionRisk::Medium => Risk::Medium,
-        CliActionRisk::High => Risk::High,
-    }
-}
-
-fn cli_output_mode(mode: CliActionOutputMode) -> OutputMode {
-    match mode {
-        CliActionOutputMode::Hidden => OutputMode::Hidden,
-        CliActionOutputMode::Ephemeral => OutputMode::Ephemeral,
-    }
 }
 
 fn run_agent_with_shutdown_inner(

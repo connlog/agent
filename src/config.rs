@@ -4,11 +4,9 @@ use std::fmt;
 #[derive(Parser)]
 #[command(name = "connlog-agent")]
 #[command(about = "ConnLog monitoring agent")]
+#[command(long_about = "ConnLog monitoring agent")]
 #[command(
-    long_about = "ConnLog monitoring agent\n\nRegister with a token from the ConnLog dashboard, then keep sending heartbeats. For production hosts, install the agent as a systemd service instead of leaving a foreground shell running."
-)]
-#[command(
-    after_help = "Common usage:\n  Register and run in the foreground:\n    connlog-agent register --token agent_xxxxxxxxxxxx\n\n  Install, register, and start as a systemd service:\n    sudo connlog-agent install --token agent_xxxxxxxxxxxx\n\n  Add a local dashboard action:\n    sudo connlog-agent actions register disk_usage --label \"Check disk usage\" --output-mode ephemeral -- df -h\n\n  Use an environment variable instead of putting the token in shell history:\n    sudo CONNLOG_TOKEN=agent_xxxxxxxxxxxx connlog-agent install\n\n  Verify an existing install without starting another heartbeat loop:\n    sudo CONNLOG_TOKEN=agent_xxxxxxxxxxxx connlog-agent check-config\n    sudo CONNLOG_TOKEN=agent_xxxxxxxxxxxx connlog-agent test-heartbeat\n\nNotes:\n  The token is shown once in ConnLog under Agents -> Add Agent and must start with agent_.\n  The register command does not install a service; it runs until stopped. Use install for servers.\n  The actions register command writes local action config; the running agent publishes it to the dashboard on the next heartbeat."
+    after_help = "Common usage:\n  sudo connlog-agent install --token agent_xxxxxxxxxxxx\n  sudo connlog-agent action add\n  sudo connlog-agent status\n\nTip:\n  Use `connlog-agent action --help` to manage dashboard buttons.\n  Use `connlog-agent diagnostics --help` for heartbeat/config checks.\n\nLegacy flags still work for existing scripts: --install, --uninstall, --status, --update, --check-config, --test-heartbeat."
 )]
 #[command(version)]
 pub struct Config {
@@ -26,29 +24,29 @@ pub struct Config {
     pub token: Option<String>,
 
     /// Legacy alias for `install`
-    #[arg(short, long, help_heading = "Legacy flags")]
+    #[arg(short, long, hide = true)]
     pub install: bool,
 
     /// Legacy alias for `uninstall`
-    #[arg(short, long, help_heading = "Legacy flags")]
+    #[arg(short, long, hide = true)]
     pub uninstall: bool,
 
     /// Legacy alias for `status`
-    #[arg(short, long, help_heading = "Legacy flags")]
+    #[arg(short, long, hide = true)]
     pub status: bool,
 
     /// Legacy alias for `update`
-    #[arg(long, help_heading = "Legacy flags")]
+    #[arg(long, hide = true)]
     pub update: bool,
 
     /// Diagnostic: fetch + print the agent config from the platform without
     /// starting the heartbeat loop. Exits non-zero on auth/network failure.
-    #[arg(long = "check-config", help_heading = "Legacy flags")]
+    #[arg(long = "check-config", hide = true)]
     pub check_config: bool,
 
     /// Diagnostic: send exactly one heartbeat and print the platform's
     /// response, then exit. Exits non-zero on auth/network failure.
-    #[arg(long = "test-heartbeat", help_heading = "Legacy flags")]
+    #[arg(long = "test-heartbeat", hide = true)]
     pub test_heartbeat: bool,
 
     /// Print the embedded systemd service file and exit (used by self-updater)
@@ -69,20 +67,17 @@ pub struct Config {
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum AgentCommand {
-    /// Register with ConnLog and run in the foreground
-    #[command(
-        long_about = "Register with ConnLog using an agent token and run the heartbeat loop in the foreground.\n\nThis command is useful for manual testing and containers. It does not install or start a systemd service, and it keeps running until stopped.\n\nExamples:\n  connlog-agent register --token agent_xxxxxxxxxxxx\n  CONNLOG_TOKEN=agent_xxxxxxxxxxxx connlog-agent register"
-    )]
-    Register,
-
     /// Install, register, and start as a systemd service
     #[command(
         long_about = "Install connlog-agent as a systemd service, write the token to /etc/connlog/agent.conf, start the service, and let the service register with ConnLog.\n\nUse this on normal Linux servers.\n\nExamples:\n  sudo connlog-agent install --token agent_xxxxxxxxxxxx\n  sudo CONNLOG_TOKEN=agent_xxxxxxxxxxxx connlog-agent install"
     )]
     Install,
 
-    /// Uninstall the systemd service and remove agent files
-    Uninstall,
+    /// Register with ConnLog and run in the foreground
+    #[command(
+        long_about = "Register with ConnLog using an agent token and run the heartbeat loop in the foreground.\n\nThis command is useful for manual testing and containers. It does not install or start a systemd service, and it keeps running until stopped.\n\nExamples:\n  connlog-agent register --token agent_xxxxxxxxxxxx\n  CONNLOG_TOKEN=agent_xxxxxxxxxxxx connlog-agent register"
+    )]
+    Register,
 
     /// Show the systemd service status
     Status,
@@ -90,33 +85,67 @@ pub enum AgentCommand {
     /// Check for and apply the latest release
     Update,
 
+    /// Manage local dashboard actions
+    #[command(
+        alias = "actions",
+        long_about = "Manage dashboard actions registered on this agent host.\n\nActions are stored locally in /etc/connlog/actions.toml by default. The running agent reloads that file and publishes action metadata to ConnLog on the next heartbeat.\n\nThe dashboard can request registered action IDs only. Command argv stays on the agent host.",
+        after_help = "Examples:\n  sudo connlog-agent action add\n  sudo connlog-agent action list\n  sudo connlog-agent action test check_disk_usage\n  sudo connlog-agent action remove check_disk_usage"
+    )]
+    Action {
+        #[command(subcommand)]
+        command: ActionCommand,
+    },
+
+    /// Diagnostic tools
+    Diagnostics {
+        #[command(subcommand)]
+        command: DiagnosticCommand,
+    },
+
+    /// Uninstall the agent
+    Uninstall,
+
     /// Fetch and print platform config, then exit
     #[command(
+        hide = true,
         long_about = "Fetch the agent config from the platform and print it, then exit without starting another heartbeat loop.\n\nUse this after installing to verify that the token and platform connectivity are correct.\n\nExamples:\n  sudo CONNLOG_TOKEN=agent_xxxxxxxxxxxx connlog-agent check-config\n  connlog-agent check-config --token agent_xxxxxxxxxxxx"
     )]
     CheckConfig,
 
     /// Send one heartbeat, print the response, then exit
     #[command(
+        hide = true,
         long_about = "Send exactly one heartbeat to the platform, print the response, then exit without starting the normal retry loop.\n\nUse this as a smoke test after registration or service changes.\n\nExamples:\n  sudo CONNLOG_TOKEN=agent_xxxxxxxxxxxx connlog-agent test-heartbeat\n  connlog-agent test-heartbeat --token agent_xxxxxxxxxxxx"
     )]
     TestHeartbeat,
+}
 
-    /// Add, list, or remove local actions shown in the dashboard
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum DiagnosticCommand {
+    /// Fetch and print platform config, then exit
     #[command(
-        long_about = "Add, list, or remove dashboard actions registered on this agent host.\n\nActions are stored locally in /etc/connlog/actions.toml by default. The running agent reloads that file and publishes action metadata to ConnLog on the next heartbeat.\n\nThe dashboard can request registered action IDs only. Command argv stays on the agent host."
+        long_about = "Fetch the agent config from the platform and print it, then exit without starting another heartbeat loop.\n\nExamples:\n  sudo CONNLOG_TOKEN=agent_xxxxxxxxxxxx connlog-agent diagnostics check-config\n  connlog-agent diagnostics check-config --token agent_xxxxxxxxxxxx"
     )]
-    Actions {
-        #[command(subcommand)]
-        command: ActionCommand,
-    },
+    CheckConfig,
+
+    /// Send one heartbeat, print the response, then exit
+    #[command(
+        long_about = "Send exactly one heartbeat to the platform, print the response, then exit without starting the normal retry loop.\n\nExamples:\n  sudo CONNLOG_TOKEN=agent_xxxxxxxxxxxx connlog-agent diagnostics test-heartbeat\n  connlog-agent diagnostics test-heartbeat --token agent_xxxxxxxxxxxx"
+    )]
+    TestHeartbeat,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum ActionCommand {
-    /// Add or update a local action shown in the dashboard
+    /// Add a local dashboard action
     #[command(
-        long_about = "Add or update a local action on this agent host.\n\nThis writes /etc/connlog/actions.toml by default. The running service reloads that file and sends the action metadata to ConnLog on the next heartbeat, so it appears in the agent's dashboard actions.\n\nEverything after `--` is stored as an argv array and executed directly by the agent. No shell is used, and the dashboard cannot provide command text or arguments.\n\nExample:\n  sudo connlog-agent actions register disk_usage \\\n    --label \"Check disk usage\" \\\n    --description \"Shows mounted filesystem usage\" \\\n    --category Diagnostics \\\n    --risk low \\\n    --output-mode ephemeral \\\n    --timeout-seconds 10 \\\n    --max-output-bytes 8192 \\\n    -- df -h"
+        long_about = "Add a local dashboard action.\n\nRun without arguments for a beginner-friendly prompt:\n  sudo connlog-agent action add\n\nScripted usage keeps command argv local and executes without a shell:\n  sudo connlog-agent action add disk_usage --label \"Check disk usage\" --description \"Shows disk usage\" --output -- df -h"
+    )]
+    Add(AddActionArgs),
+
+    /// Advanced/backward-compatible action registration
+    #[command(
+        long_about = "Advanced registration for local dashboard actions.\n\nThis keeps the original `actions register` workflow working. Everything after `--` is stored as an argv array and executed directly by the agent. No shell is used, and the dashboard cannot provide command text or arguments.\n\nExample:\n  sudo connlog-agent actions register disk_usage \\\n    --label \"Check disk usage\" \\\n    --description \"Shows mounted filesystem usage\" \\\n    --category Diagnostics \\\n    --risk low \\\n    --output-mode ephemeral \\\n    --timeout-seconds 10 \\\n    --max-output-bytes 8192 \\\n    -- df -h"
     )]
     Register(RegisterActionArgs),
 
@@ -128,16 +157,34 @@ pub enum ActionCommand {
         /// Local action ID to remove
         action_id: String,
     },
+
+    /// Enable a local dashboard action
+    Enable {
+        /// Local action ID to enable
+        action_id: String,
+    },
+
+    /// Disable a local dashboard action
+    Disable {
+        /// Local action ID to disable
+        action_id: String,
+    },
+
+    /// Run a local action directly on this host
+    Test {
+        /// Local action ID to run
+        action_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
-pub struct RegisterActionArgs {
+pub struct AddActionArgs {
     /// Stable local action ID, for example `disk_usage`
-    pub action_id: String,
+    pub action_id: Option<String>,
 
     /// Label shown in the dashboard
     #[arg(long)]
-    pub label: String,
+    pub label: Option<String>,
 
     /// Optional dashboard description
     #[arg(long)]
@@ -148,27 +195,93 @@ pub struct RegisterActionArgs {
     pub category: Option<String>,
 
     /// Risk level shown in the dashboard
-    #[arg(long, value_enum, default_value_t = CliActionRisk::Low)]
-    pub risk: CliActionRisk,
+    #[arg(long, value_enum)]
+    pub risk: Option<CliActionRisk>,
 
     /// Require confirmation before the dashboard can request this action
     #[arg(long)]
     pub requires_confirmation: bool,
 
-    /// Whether command output is hidden or shown once to the requesting browser
-    #[arg(long, value_enum, default_value_t = CliActionOutputMode::Hidden)]
-    pub output_mode: CliActionOutputMode,
+    /// Do not require confirmation, even if the command looks risky
+    #[arg(long, conflicts_with = "requires_confirmation")]
+    pub no_confirmation: bool,
 
-    /// Action timeout in seconds, clamped by the agent to 60 seconds
-    #[arg(long, default_value_t = 15)]
-    pub timeout_seconds: u64,
+    /// Show command output once in the dashboard
+    #[arg(long, conflicts_with = "no_output")]
+    pub output: bool,
 
-    /// Maximum combined stdout/stderr bytes, clamped by the agent
-    #[arg(long, default_value_t = 8192)]
-    pub max_output_bytes: usize,
+    /// Hide command output from the dashboard
+    #[arg(long, conflicts_with = "output")]
+    pub no_output: bool,
+
+    /// Advanced output mode override
+    #[arg(long, value_enum)]
+    pub output_mode: Option<CliActionOutputMode>,
+
+    /// Action timeout in seconds, 1..=60
+    #[arg(long)]
+    pub timeout_seconds: Option<u64>,
+
+    /// Maximum combined stdout/stderr bytes, up to 65536
+    #[arg(long)]
+    pub max_output_bytes: Option<usize>,
 
     /// Command argv to run on this host. Put this after `--`, for example `-- df -h`.
-    #[arg(last = true, required = true, num_args = 1.., value_name = "EXEC_ARG")]
+    #[arg(last = true, num_args = 1.., value_name = "EXEC_ARG")]
+    pub exec: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct RegisterActionArgs {
+    /// Stable local action ID, for example `disk_usage`
+    pub action_id: Option<String>,
+
+    /// Label shown in the dashboard
+    #[arg(long)]
+    pub label: Option<String>,
+
+    /// Optional dashboard description
+    #[arg(long)]
+    pub description: Option<String>,
+
+    /// Optional dashboard category
+    #[arg(long)]
+    pub category: Option<String>,
+
+    /// Risk level shown in the dashboard
+    #[arg(long, value_enum)]
+    pub risk: Option<CliActionRisk>,
+
+    /// Require confirmation before the dashboard can request this action
+    #[arg(long)]
+    pub requires_confirmation: bool,
+
+    /// Do not require confirmation, even if the command looks risky
+    #[arg(long, conflicts_with = "requires_confirmation")]
+    pub no_confirmation: bool,
+
+    /// Show command output once in the dashboard
+    #[arg(long, conflicts_with = "no_output")]
+    pub output: bool,
+
+    /// Hide command output from the dashboard
+    #[arg(long, conflicts_with = "output")]
+    pub no_output: bool,
+
+    /// Whether command output is hidden or shown once to the requesting browser
+    #[arg(long, value_enum)]
+    pub output_mode: Option<CliActionOutputMode>,
+
+    /// Action timeout in seconds, 1..=60
+    #[arg(long)]
+    pub timeout_seconds: Option<u64>,
+
+    /// Maximum combined stdout/stderr bytes, up to 65536
+    #[arg(long)]
+    pub max_output_bytes: Option<usize>,
+
+    /// Command argv to run on this host. Put this after `--`, for example `-- df -h`.
+    #[arg(last = true, num_args = 1.., value_name = "EXEC_ARG")]
     pub exec: Vec<String>,
 }
 
@@ -294,6 +407,20 @@ mod tests {
         ]);
         assert_eq!(cfg.command, Some(AgentCommand::TestHeartbeat));
         assert_eq!(cfg.token.as_deref(), Some("agent_example"));
+
+        let cfg = Config::parse_from([
+            "connlog-agent",
+            "diagnostics",
+            "check-config",
+            "--token",
+            "agent_example",
+        ]);
+        assert_eq!(
+            cfg.command,
+            Some(AgentCommand::Diagnostics {
+                command: DiagnosticCommand::CheckConfig
+            })
+        );
     }
 
     #[test]
@@ -312,17 +439,63 @@ mod tests {
             "-h",
         ]);
 
-        let Some(AgentCommand::Actions {
+        let Some(AgentCommand::Action {
             command: ActionCommand::Register(args),
         }) = cfg.command
         else {
             panic!("expected actions register command");
         };
 
-        assert_eq!(args.action_id, "disk_usage");
-        assert_eq!(args.label, "Check disk usage");
-        assert_eq!(args.output_mode, CliActionOutputMode::Ephemeral);
+        assert_eq!(args.action_id.as_deref(), Some("disk_usage"));
+        assert_eq!(args.label.as_deref(), Some("Check disk usage"));
+        assert_eq!(args.output_mode, Some(CliActionOutputMode::Ephemeral));
         assert_eq!(args.exec, ["df", "-h"]);
+    }
+
+    #[test]
+    fn action_add_subcommand_supports_simple_and_scripted_forms() {
+        let cfg = Config::parse_from(["connlog-agent", "action", "add"]);
+        let Some(AgentCommand::Action {
+            command: ActionCommand::Add(args),
+        }) = cfg.command
+        else {
+            panic!("expected action add command");
+        };
+        assert!(args.action_id.is_none());
+        assert!(args.exec.is_empty());
+
+        let cfg = Config::parse_from([
+            "connlog-agent",
+            "action",
+            "add",
+            "disk_usage",
+            "--label",
+            "Check disk usage",
+            "--description",
+            "Shows disk usage",
+            "--output",
+            "--",
+            "df",
+            "-h",
+        ]);
+        let Some(AgentCommand::Action {
+            command: ActionCommand::Add(args),
+        }) = cfg.command
+        else {
+            panic!("expected action add command");
+        };
+        assert_eq!(args.action_id.as_deref(), Some("disk_usage"));
+        assert_eq!(args.label.as_deref(), Some("Check disk usage"));
+        assert!(args.output);
+        assert_eq!(args.exec, ["df", "-h"]);
+
+        let cfg = Config::parse_from(["connlog-agent", "actions", "add"]);
+        assert!(matches!(
+            cfg.command,
+            Some(AgentCommand::Action {
+                command: ActionCommand::Add(_)
+            })
+        ));
     }
 
     #[test]
@@ -330,12 +503,30 @@ mod tests {
         use clap::CommandFactory;
 
         let help = Config::command().render_long_help().to_string();
-        assert!(help.contains("connlog-agent register --token agent_xxxxxxxxxxxx"));
-        assert!(help.contains("The register command does not install a service"));
         assert!(help.contains("sudo connlog-agent install --token agent_xxxxxxxxxxxx"));
+        assert!(help.contains("sudo connlog-agent action add"));
         assert!(help.contains("Commands:"));
-        assert!(help.contains("actions"));
-        assert!(help.contains("check-config"));
-        assert!(help.contains("test-heartbeat"));
+        assert!(help.contains("action"));
+        assert!(help.contains("diagnostics"));
+        assert!(help.contains("Legacy flags still work"));
+    }
+
+    #[test]
+    fn action_help_contains_action_examples() {
+        use clap::CommandFactory;
+
+        let mut command = Config::command();
+        let action = command
+            .find_subcommand_mut("action")
+            .expect("action command exists");
+        let help = action.render_long_help().to_string();
+
+        assert!(help.contains("add"));
+        assert!(help.contains("list"));
+        assert!(help.contains("remove"));
+        assert!(help.contains("enable"));
+        assert!(help.contains("disable"));
+        assert!(help.contains("test"));
+        assert!(help.contains("sudo connlog-agent action add"));
     }
 }

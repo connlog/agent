@@ -71,17 +71,60 @@ You can also trigger a remote uninstall from the ConnLog dashboard.
 
 ```bash
 # Fetch and print the agent config from the platform
-connlog-agent check-config --token <TOKEN>
+connlog-agent diagnostics check-config --token <TOKEN>
 
 # Send one heartbeat and print the platform response
-connlog-agent test-heartbeat --token <TOKEN>
+connlog-agent diagnostics test-heartbeat --token <TOKEN>
 ```
+
+The older top-level commands `connlog-agent check-config` and
+`connlog-agent test-heartbeat` still work for existing scripts.
 
 ## Local dashboard actions
 
-Register local actions from the agent host. They are stored in
-`/etc/connlog/actions.toml`, reloaded by the running service, and published to
-the dashboard on the next heartbeat.
+Local dashboard actions are buttons shown in ConnLog that run pre-registered
+commands on the agent host. They are stored in `/etc/connlog/actions.toml`,
+reloaded by the running service, and published to the dashboard on the next
+heartbeat.
+
+The simple setup flow asks for a label, description, command, output preference,
+and confirmation preference:
+
+```bash
+sudo connlog-agent action add
+```
+
+Examples:
+
+```bash
+# Check disk usage and show the output in the dashboard
+sudo connlog-agent action add disk_usage \
+  --label "Check disk usage" \
+  --description "Shows current disk usage" \
+  --output \
+  -- df -h
+
+# Check Docker containers
+sudo connlog-agent action add docker_containers \
+  --label "Check Docker containers" \
+  --description "Lists running Docker containers" \
+  --output \
+  -- docker ps
+
+# Restart nginx with dashboard confirmation
+sudo connlog-agent action add restart_nginx \
+  --label "Restart nginx" \
+  --description "Restarts the nginx service" \
+  --requires-confirmation \
+  -- systemctl restart nginx
+
+connlog-agent action list
+sudo connlog-agent action test disk_usage
+sudo connlog-agent action remove disk_usage
+```
+
+Advanced registration is still available and keeps the original plural command
+working:
 
 ```bash
 sudo connlog-agent actions register disk_usage \
@@ -98,8 +141,10 @@ connlog-agent actions list
 sudo connlog-agent actions remove disk_usage
 ```
 
-Everything after `--` is stored as an argv array and executed directly by the
-agent without a shell.
+Everything after `--` is stored locally as an argv array and executed directly by
+the agent without a shell. ConnLog only receives safe metadata and action IDs:
+the raw command remains on the agent machine, and the dashboard cannot send
+arbitrary shell commands or command arguments.
 
 ## How it works
 
