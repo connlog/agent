@@ -6,6 +6,25 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 [`VERSIONING.md`](./VERSIONING.md) for the full policy. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.8.3] — 2026-05-09
+
+### Fixed
+
+- Removed the systemd `SystemCallFilter` sandbox from the agent service because
+  it caused locally registered Quick Actions to fail with `Bad system call`
+  when running common host diagnostic tools such as `ip a`, `ip route`, `ss`,
+  `df`, `docker ps`, and `systemctl status`.
+
+### Security
+
+- Kept the rest of the service hardening intact: the agent still runs as the
+  unprivileged `connlog-agent` user with `NoNewPrivileges`, strict filesystem
+  protection, empty capabilities, namespace restrictions, and restricted address
+  families.
+- Kept `AF_NETLINK` allowed in `RestrictAddressFamilies` so network inspection
+  tools can query interface and route information without removing the broader
+  sandbox.
+
 ## [1.8.2] — 2026-05-09
 
 ### Fixed
@@ -509,7 +528,8 @@ considered stable; breaking changes from this point on require a major bump.
 
 - Last pre-1.0 release. See git history for prior changes.
 
-[Unreleased]: https://github.com/connlog/agent/compare/v1.8.2...HEAD
+[Unreleased]: https://github.com/connlog/agent/compare/v1.8.3...HEAD
+[1.8.3]: https://github.com/connlog/agent/compare/v1.8.2...v1.8.3
 [1.8.2]: https://github.com/connlog/agent/compare/v1.8.1...v1.8.2
 [1.8.1]: https://github.com/connlog/agent/compare/v1.8.0...v1.8.1
 [1.8.0]: https://github.com/connlog/agent/compare/v1.7.0...v1.8.0
