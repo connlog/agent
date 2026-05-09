@@ -8,6 +8,21 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 
 ## [Unreleased]
 
+## [1.7.0] — 2026-05-09
+
+### Added
+
+- Added `connlog-agent actions register` so operators can register a local
+  action from the agent CLI and have it appear in the dashboard after the next
+  heartbeat.
+- Added `connlog-agent actions list` and `connlog-agent actions remove` for
+  inspecting and removing local action definitions.
+
+### Changed
+
+- The local action config file remains the source of truth, but operators
+  no longer need to hand-edit it for the common add/list/remove workflow.
+
 ## [1.6.1] — 2026-05-09
 
 ### Changed
@@ -436,7 +451,8 @@ considered stable; breaking changes from this point on require a major bump.
 
 - Last pre-1.0 release. See git history for prior changes.
 
-[Unreleased]: https://github.com/connlog/agent/compare/v1.6.1...HEAD
+[Unreleased]: https://github.com/connlog/agent/compare/v1.7.0...HEAD
+[1.7.0]: https://github.com/connlog/agent/compare/v1.6.1...v1.7.0
 [1.6.1]: https://github.com/connlog/agent/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/connlog/agent/compare/v1.5.1...v1.6.0
 [1.5.1]: https://github.com/connlog/agent/compare/v1.5.0...v1.5.1

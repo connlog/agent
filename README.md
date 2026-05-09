@@ -77,6 +77,30 @@ connlog-agent check-config --token <TOKEN>
 connlog-agent test-heartbeat --token <TOKEN>
 ```
 
+## Local dashboard actions
+
+Register local actions from the agent host. They are stored in
+`/etc/connlog/actions.toml`, reloaded by the running service, and published to
+the dashboard on the next heartbeat.
+
+```bash
+sudo connlog-agent actions register disk_usage \
+  --label "Check disk usage" \
+  --description "Shows mounted filesystem usage" \
+  --category Diagnostics \
+  --risk low \
+  --output-mode ephemeral \
+  --timeout-seconds 10 \
+  --max-output-bytes 8192 \
+  -- df -h
+
+connlog-agent actions list
+sudo connlog-agent actions remove disk_usage
+```
+
+Everything after `--` is stored as an argv array and executed directly by the
+agent without a shell.
+
 ## How it works
 
 1. Agent sends a heartbeat to the platform every 60 seconds (configurable server-side)
