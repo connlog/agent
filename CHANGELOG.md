@@ -8,6 +8,18 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 
 ## [Unreleased]
 
+## [1.8.1] — 2026-05-09
+
+### Fixed
+
+- `/etc/connlog` is now installed as `0750 root:connlog-agent` (was `0700
+  root:root`), and `actions.toml` is written as `0640`. The unprivileged
+  service user (`connlog-agent`) could not traverse the directory, so it
+  silently published an empty action list on every heartbeat — newly registered
+  local actions never appeared in the dashboard. Running as root (e.g.
+  `connlog-agent action add`) also auto-repairs the permissions on load so
+  existing installs are fixed without a reinstall.
+
 ## [1.8.0] — 2026-05-09
 
 ### Added
