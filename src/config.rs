@@ -1,39 +1,54 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::fmt;
 
 #[derive(Parser)]
 #[command(name = "connlog-agent")]
-#[command(about = "ConnLog monitoring agent", long_about = None)]
+#[command(about = "ConnLog monitoring agent")]
+#[command(
+    long_about = "ConnLog monitoring agent\n\nRegister with a token from the ConnLog dashboard, then keep sending heartbeats. For production hosts, install the agent as a systemd service instead of leaving a foreground shell running."
+)]
+#[command(
+    after_help = "Common usage:\n  Register and run in the foreground:\n    connlog-agent register --token agent_xxxxxxxxxxxx\n\n  Install, register, and start as a systemd service:\n    sudo connlog-agent install --token agent_xxxxxxxxxxxx\n\n  Use an environment variable instead of putting the token in shell history:\n    sudo CONNLOG_TOKEN=agent_xxxxxxxxxxxx connlog-agent install\n\n  Verify an existing install without starting another heartbeat loop:\n    sudo CONNLOG_TOKEN=agent_xxxxxxxxxxxx connlog-agent check-config\n    sudo CONNLOG_TOKEN=agent_xxxxxxxxxxxx connlog-agent test-heartbeat\n\nNotes:\n  The token is shown once in ConnLog under Agents -> Add Agent and must start with agent_.\n  The register command does not install a service; it runs until stopped. Use install for servers."
+)]
 #[command(version)]
 pub struct Config {
+    #[command(subcommand)]
+    pub command: Option<AgentCommand>,
+
     /// Agent authentication token
-    #[arg(short, long, env = "CONNLOG_TOKEN")]
+    #[arg(
+        short,
+        long,
+        env = "CONNLOG_TOKEN",
+        global = true,
+        value_name = "TOKEN"
+    )]
     pub token: Option<String>,
 
-    /// Install agent as systemd service and start it
-    #[arg(short, long)]
+    /// Legacy alias for `install`
+    #[arg(short, long, help_heading = "Legacy flags")]
     pub install: bool,
 
-    /// Uninstall agent (stop service, remove files)
-    #[arg(short, long)]
+    /// Legacy alias for `uninstall`
+    #[arg(short, long, help_heading = "Legacy flags")]
     pub uninstall: bool,
 
-    /// Show agent service status
-    #[arg(short, long)]
+    /// Legacy alias for `status`
+    #[arg(short, long, help_heading = "Legacy flags")]
     pub status: bool,
 
-    /// Check for and apply the latest update from GitHub
-    #[arg(long)]
+    /// Legacy alias for `update`
+    #[arg(long, help_heading = "Legacy flags")]
     pub update: bool,
 
     /// Diagnostic: fetch + print the agent config from the platform without
     /// starting the heartbeat loop. Exits non-zero on auth/network failure.
-    #[arg(long = "check-config")]
+    #[arg(long = "check-config", help_heading = "Legacy flags")]
     pub check_config: bool,
 
     /// Diagnostic: send exactly one heartbeat and print the platform's
     /// response, then exit. Exits non-zero on auth/network failure.
-    #[arg(long = "test-heartbeat")]
+    #[arg(long = "test-heartbeat", help_heading = "Legacy flags")]
     pub test_heartbeat: bool,
 
     /// Print the embedded systemd service file and exit (used by self-updater)
@@ -46,14 +61,52 @@ pub struct Config {
         short,
         long,
         env = "CONNLOG_ENDPOINT",
-        help = "Platform endpoint URL (debug builds only)"
+        help = "Platform endpoint URL (debug builds only)",
+        global = true
     )]
     pub endpoint: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
+pub enum AgentCommand {
+    /// Register with ConnLog and run in the foreground
+    #[command(
+        long_about = "Register with ConnLog using an agent token and run the heartbeat loop in the foreground.\n\nThis command is useful for manual testing and containers. It does not install or start a systemd service, and it keeps running until stopped.\n\nExamples:\n  connlog-agent register --token agent_xxxxxxxxxxxx\n  CONNLOG_TOKEN=agent_xxxxxxxxxxxx connlog-agent register"
+    )]
+    Register,
+
+    /// Install, register, and start as a systemd service
+    #[command(
+        long_about = "Install connlog-agent as a systemd service, write the token to /etc/connlog/agent.conf, start the service, and let the service register with ConnLog.\n\nUse this on normal Linux servers.\n\nExamples:\n  sudo connlog-agent install --token agent_xxxxxxxxxxxx\n  sudo CONNLOG_TOKEN=agent_xxxxxxxxxxxx connlog-agent install"
+    )]
+    Install,
+
+    /// Uninstall the systemd service and remove agent files
+    Uninstall,
+
+    /// Show the systemd service status
+    Status,
+
+    /// Check for and apply the latest release
+    Update,
+
+    /// Fetch and print platform config, then exit
+    #[command(
+        long_about = "Fetch the agent config from the platform and print it, then exit without starting another heartbeat loop.\n\nUse this after installing to verify that the token and platform connectivity are correct.\n\nExamples:\n  sudo CONNLOG_TOKEN=agent_xxxxxxxxxxxx connlog-agent check-config\n  connlog-agent check-config --token agent_xxxxxxxxxxxx"
+    )]
+    CheckConfig,
+
+    /// Send one heartbeat, print the response, then exit
+    #[command(
+        long_about = "Send exactly one heartbeat to the platform, print the response, then exit without starting the normal retry loop.\n\nUse this as a smoke test after registration or service changes.\n\nExamples:\n  sudo CONNLOG_TOKEN=agent_xxxxxxxxxxxx connlog-agent test-heartbeat\n  connlog-agent test-heartbeat --token agent_xxxxxxxxxxxx"
+    )]
+    TestHeartbeat,
 }
 
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
+            .field("command", &self.command)
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
             .field("install", &self.install)
             .field("uninstall", &self.uninstall)
@@ -123,5 +176,54 @@ mod tests {
         // Either "None" or absence of REDACTED is fine — the only thing that's
         // not fine is a panic or a leaked token (and there's no token here).
         assert!(rendered.contains("token"));
+    }
+
+    #[test]
+    fn register_subcommand_accepts_token_after_command() {
+        let cfg = Config::parse_from(["connlog-agent", "register", "--token", "agent_example"]);
+        assert_eq!(cfg.command, Some(AgentCommand::Register));
+        assert_eq!(cfg.token.as_deref(), Some("agent_example"));
+    }
+
+    #[test]
+    fn install_subcommand_accepts_env_token_style() {
+        let cfg = Config::parse_from(["connlog-agent", "install"]);
+        assert_eq!(cfg.command, Some(AgentCommand::Install));
+    }
+
+    #[test]
+    fn legacy_install_flag_still_parses() {
+        let cfg = Config::parse_from(["connlog-agent", "--install", "--token", "agent_example"]);
+        assert!(cfg.install);
+        assert_eq!(cfg.token.as_deref(), Some("agent_example"));
+    }
+
+    #[test]
+    fn diagnostic_subcommands_parse() {
+        let cfg = Config::parse_from(["connlog-agent", "check-config", "--token", "agent_example"]);
+        assert_eq!(cfg.command, Some(AgentCommand::CheckConfig));
+        assert_eq!(cfg.token.as_deref(), Some("agent_example"));
+
+        let cfg = Config::parse_from([
+            "connlog-agent",
+            "test-heartbeat",
+            "--token",
+            "agent_example",
+        ]);
+        assert_eq!(cfg.command, Some(AgentCommand::TestHeartbeat));
+        assert_eq!(cfg.token.as_deref(), Some("agent_example"));
+    }
+
+    #[test]
+    fn help_explains_register_command() {
+        use clap::CommandFactory;
+
+        let help = Config::command().render_long_help().to_string();
+        assert!(help.contains("connlog-agent register --token agent_xxxxxxxxxxxx"));
+        assert!(help.contains("The register command does not install a service"));
+        assert!(help.contains("sudo connlog-agent install --token agent_xxxxxxxxxxxx"));
+        assert!(help.contains("Commands:"));
+        assert!(help.contains("check-config"));
+        assert!(help.contains("test-heartbeat"));
     }
 }

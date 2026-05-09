@@ -8,6 +8,18 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 
 ## [Unreleased]
 
+## [1.6.1] — 2026-05-09
+
+### Changed
+
+- Modernized the CLI help around first-run setup:
+  - Added first-class `register`, `install`, `uninstall`, `status`,
+    `update`, `check-config`, and `test-heartbeat` subcommands.
+  - Kept legacy flags such as `--install`, `--status`, `--check-config`,
+    and `--test-heartbeat` working for existing scripts.
+  - Clarified that `register` runs in the foreground and `install` is the
+    normal systemd service path for servers.
+
 ## [1.6.0] — 2026-05-09
 
 ### Added
@@ -424,7 +436,8 @@ considered stable; breaking changes from this point on require a major bump.
 
 - Last pre-1.0 release. See git history for prior changes.
 
-[Unreleased]: https://github.com/connlog/agent/compare/v1.6.0...HEAD
+[Unreleased]: https://github.com/connlog/agent/compare/v1.6.1...HEAD
+[1.6.1]: https://github.com/connlog/agent/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/connlog/agent/compare/v1.5.1...v1.6.0
 [1.5.1]: https://github.com/connlog/agent/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/connlog/agent/compare/v1.4.1...v1.5.0

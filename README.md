@@ -32,27 +32,27 @@ Get your token from the [ConnLog dashboard](https://connlog.com) under **Agents 
 curl -fsSL https://connlog.com/install.sh | sh
 
 # 2. Install as systemd service
-sudo connlog-agent --install --token <TOKEN>
+sudo connlog-agent install --token <TOKEN>
 ```
 
 ### Run without systemd
 
 ```bash
-connlog-agent --token <TOKEN>
+connlog-agent register --token <TOKEN>
 ```
 
 You can also pass the token via the `CONNLOG_TOKEN` environment variable:
 
 ```bash
 export CONNLOG_TOKEN=agent_xxxxxxxxxxxx
-connlog-agent
+connlog-agent register
 ```
 
 ## Management
 
 ```bash
 # Check service status
-connlog-agent --status
+connlog-agent status
 # or
 systemctl status connlog-agent
 
@@ -60,7 +60,7 @@ systemctl status connlog-agent
 journalctl -u connlog-agent -f
 
 # Uninstall (stops service, removes all files)
-sudo connlog-agent --uninstall
+sudo connlog-agent uninstall
 ```
 
 Note: uninstall preserves the `connlog-agent` system user. Remove it manually if needed: `sudo userdel connlog-agent`.
@@ -71,10 +71,10 @@ You can also trigger a remote uninstall from the ConnLog dashboard.
 
 ```bash
 # Fetch and print the agent config from the platform
-connlog-agent --check-config --token <TOKEN>
+connlog-agent check-config --token <TOKEN>
 
 # Send one heartbeat and print the platform response
-connlog-agent --test-heartbeat --token <TOKEN>
+connlog-agent test-heartbeat --token <TOKEN>
 ```
 
 ## How it works

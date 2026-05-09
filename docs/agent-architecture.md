@@ -156,7 +156,7 @@ These invariants must never be broken. They are pinned by tests in
 
 ## Install / uninstall flow
 
-### Install (`--install --token agent_<token>`)
+### Install (`install --token agent_<token>`)
 
 1. Require root (`geteuid() == 0`)
 2. Create system user `connlog-agent` (no home, no login shell)
@@ -168,7 +168,7 @@ These invariants must never be broken. They are pinned by tests in
 6. Write the embedded systemd unit to `/etc/systemd/system/connlog-agent.service`
 7. `systemctl daemon-reload && systemctl enable && systemctl start`
 
-### Uninstall (`--uninstall`)
+### Uninstall (`uninstall`)
 
 Reverse order, most critical last:
 1. `systemctl stop` → prevents resurrection

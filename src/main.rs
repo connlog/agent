@@ -21,7 +21,7 @@ mod update;
 #[cfg(test)]
 mod simulation;
 
-use config::Config;
+use config::{AgentCommand, Config};
 use defaults::{CONFIG_FETCH_RETRY_DELAY_SECS, DEFAULT_ENDPOINT, DISABLED_BACKOFF_SECS};
 use heartbeat::{AgentConfig, HeartbeatPayload};
 use http::{ApiClient, ApiError};
@@ -125,6 +125,35 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if let Some(command) = config.command {
+        match command {
+            AgentCommand::Register => {}
+            AgentCommand::Install => {
+                let token = config.token.clone().context("Token required for install")?;
+                return install::install(&token);
+            }
+            AgentCommand::Uninstall => return install::uninstall(),
+            AgentCommand::Status => return install::status(),
+            AgentCommand::Update => return update::run_manual_update(),
+            AgentCommand::CheckConfig => {
+                let token = config
+                    .token
+                    .clone()
+                    .context("Token required for check-config")?;
+                let endpoint = config.resolve_endpoint(DEFAULT_ENDPOINT);
+                return run_check_config(token, endpoint);
+            }
+            AgentCommand::TestHeartbeat => {
+                let token = config
+                    .token
+                    .clone()
+                    .context("Token required for test-heartbeat")?;
+                let endpoint = config.resolve_endpoint(DEFAULT_ENDPOINT);
+                return run_test_heartbeat(token, endpoint);
+            }
+        }
+    }
+
     // Handle status check
     if config.status {
         return install::status();
@@ -136,8 +165,8 @@ fn main() -> Result<()> {
     }
 
     // Diagnostic commands — both require a token but never start the heartbeat
-    // loop. They make running `connlog-agent --check-config` or
-    // `--test-heartbeat` from a shell a fast way to confirm an install before
+    // loop. They make running `connlog-agent check-config` or
+    // `test-heartbeat` from a shell a fast way to confirm an install before
     // declaring it healthy.
     if config.check_config {
         let token = config
@@ -172,10 +201,9 @@ fn main() -> Result<()> {
     }
 
     // Run mode - require token
-    let token = config
-        .token
-        .clone()
-        .context("Token is required. Use --token or set CONNLOG_TOKEN environment variable.")?;
+    let token = config.token.clone().context(
+        "Token is required. Use `connlog-agent register --token <token>` or set CONNLOG_TOKEN.",
+    )?;
 
     let endpoint = config.resolve_endpoint(DEFAULT_ENDPOINT);
 
@@ -655,7 +683,7 @@ fn trigger_self_uninstall(reason: &str) {
             error!(
                 "UNINSTALL: Could not write uninstall marker: {}. \
                  Agent will stop reporting, but files were not removed. \
-                 To clean up manually: sudo connlog-agent --uninstall",
+                 To clean up manually: sudo connlog-agent uninstall",
                 e
             );
         }
