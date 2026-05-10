@@ -252,6 +252,10 @@ impl QuickActionsRegistry {
         actions
     }
 
+    pub fn has_enabled_actions(&self) -> bool {
+        self.enabled && self.actions.values().any(|action| action.enabled)
+    }
+
     pub fn has_action(&self, action_id: &str) -> bool {
         self.actions.contains_key(action_id)
     }

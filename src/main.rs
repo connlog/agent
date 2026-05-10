@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod action_cli;
 mod config;
@@ -25,8 +25,8 @@ mod simulation;
 use action_cli::run_action_command;
 use config::{AgentCommand, Config, DiagnosticCommand};
 use defaults::{CONFIG_FETCH_RETRY_DELAY_SECS, DEFAULT_ENDPOINT, DISABLED_BACKOFF_SECS};
-use heartbeat::{AgentConfig, HeartbeatPayload};
-use http::{ApiClient, ApiError};
+use heartbeat::{AgentConfig, HeartbeatPayload, QuickActionsConfig};
+use http::{ApiClient, ApiError, QuickActionPollingReport};
 use metrics::MetricsCollector;
 use quick_actions::{QuickActionRequest, QuickActionsRegistry};
 
@@ -57,10 +57,9 @@ const MAX_CONFIG_FETCH_RETRIES: u32 = 3;
 /// same second every interval.
 const HEARTBEAT_JITTER_PCT: u64 = 10;
 
-/// While waiting for the next heartbeat, check for dashboard-requested quick
-/// actions on this cadence so command pickup is not tied to metric heartbeat
-/// frequency.
-const QUICK_ACTION_POLL_INTERVAL_SECS: u64 = 10;
+/// Quick-action poll jitter, ±10%. A 5s interval becomes roughly 4.5s..5.5s,
+/// enough to spread fleet polling without making dashboard pickup feel slow.
+const QUICK_ACTION_POLL_JITTER_PCT: u64 = 10;
 
 /// Initialise the logger with a structured, grep-friendly line format:
 ///
@@ -108,6 +107,123 @@ fn jittered(secs: u64) -> u64 {
     jittered.max(1) as u64
 }
 
+fn jittered_duration(base: Duration, pct: u64) -> Duration {
+    if base.is_zero() || pct == 0 {
+        return base;
+    }
+
+    let base_ms = base.as_millis();
+    let span = (base_ms * pct as u128) / 100;
+    if span == 0 {
+        return base;
+    }
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u128)
+        .unwrap_or(0);
+    let offset = (nanos % (2 * span + 1)) as i128 - span as i128;
+    let jittered_ms = (base_ms as i128 + offset).max(1) as u64;
+    Duration::from_millis(jittered_ms)
+}
+
+fn unix_ms(time: SystemTime) -> Option<u128> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis())
+}
+
+#[derive(Debug, Clone)]
+struct QuickActionPollState {
+    enabled: bool,
+    interval_secs: u64,
+    last_poll_at: Option<SystemTime>,
+    next_poll_at: Option<SystemTime>,
+    next_due: Option<Instant>,
+}
+
+impl QuickActionPollState {
+    fn new(config: &QuickActionsConfig, registry: &QuickActionsRegistry) -> Self {
+        let mut state = Self {
+            enabled: false,
+            interval_secs: config.poll_interval_seconds,
+            last_poll_at: None,
+            next_poll_at: None,
+            next_due: None,
+        };
+        state.sync(config, registry);
+        state
+    }
+
+    fn sync(&mut self, config: &QuickActionsConfig, registry: &QuickActionsRegistry) {
+        let next_enabled = config.enabled && registry.has_enabled_actions();
+        let next_interval_secs = config.poll_interval_seconds;
+        let changed = self.enabled != next_enabled || self.interval_secs != next_interval_secs;
+        let was_enabled = self.enabled;
+
+        self.enabled = next_enabled;
+        self.interval_secs = next_interval_secs;
+
+        if !self.enabled {
+            self.next_due = None;
+            self.next_poll_at = None;
+        } else if !was_enabled || changed || self.next_due.is_none() {
+            self.schedule_next(Instant::now(), SystemTime::now());
+        }
+
+        if changed {
+            if self.enabled {
+                info!(
+                    "Quick action polling enabled (interval={}s)",
+                    self.interval_secs
+                );
+            } else if config.enabled {
+                info!("Quick action polling disabled (no enabled local actions)");
+            } else {
+                info!("Quick action polling disabled by platform config");
+            }
+        }
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        self.enabled
+            && self
+                .next_due
+                .map(|next_due| now >= next_due)
+                .unwrap_or(false)
+    }
+
+    fn next_due(&self) -> Option<Instant> {
+        self.next_due
+    }
+
+    fn mark_poll_started(&mut self) -> QuickActionPollingReport {
+        let now_instant = Instant::now();
+        let now_wall = SystemTime::now();
+        self.last_poll_at = Some(now_wall);
+        self.schedule_next(now_instant, now_wall);
+        self.report()
+    }
+
+    fn report(&self) -> QuickActionPollingReport {
+        QuickActionPollingReport {
+            enabled: self.enabled,
+            poll_interval_seconds: self.interval_secs,
+            last_poll_at_unix_ms: self.last_poll_at.and_then(unix_ms),
+            next_poll_at_unix_ms: self.next_poll_at.and_then(unix_ms),
+        }
+    }
+
+    fn schedule_next(&mut self, from_instant: Instant, from_wall: SystemTime) {
+        let wait = jittered_duration(
+            Duration::from_secs(self.interval_secs),
+            QUICK_ACTION_POLL_JITTER_PCT,
+        );
+        self.next_due = Some(from_instant + wait);
+        self.next_poll_at = from_wall.checked_add(wait);
+    }
+}
+
 /// Validate that a bearer token has the `agent_` prefix the platform requires.
 ///
 /// Three call sites used to inline this check with three slightly-different
@@ -141,6 +257,7 @@ fn main() -> Result<()> {
             }
             AgentCommand::Uninstall => return install::uninstall(),
             AgentCommand::Status => return install::status(),
+            AgentCommand::RefreshService { restart } => return install::refresh_service(restart),
             AgentCommand::Update => return update::run_manual_update(),
             AgentCommand::CheckConfig => {
                 let token = config
@@ -176,6 +293,7 @@ fn main() -> Result<()> {
                     let endpoint = config.resolve_endpoint(DEFAULT_ENDPOINT);
                     return run_test_heartbeat(token, endpoint);
                 }
+                DiagnosticCommand::Service => return install::print_service_diagnostics(),
             },
         }
     }
@@ -242,6 +360,7 @@ fn run_agent_with_shutdown_inner(
     stop: Arc<AtomicBool>,
 ) -> Result<()> {
     info!("ConnLog Agent v{} starting", AGENT_VERSION);
+    install::warn_if_installed_service_stale_once();
 
     #[cfg(debug_assertions)]
     info!("Endpoint: {} (debug build)", endpoint);
@@ -279,6 +398,7 @@ fn run_agent_with_shutdown_inner(
     let mut quick_actions = QuickActionsRegistry::load();
     let mut quick_actions_fingerprint = quick_actions.fingerprint();
     publish_quick_actions_manifest(&client, &quick_actions);
+    let mut quick_action_polling = QuickActionPollState::new(&config.quick_actions, &quick_actions);
 
     let mut first_heartbeat = true;
     let mut consecutive_unauthorized = 0u32;
@@ -306,7 +426,12 @@ fn run_agent_with_shutdown_inner(
             info!("Shutdown requested (service stop) — exiting agent loop");
             return Ok(());
         }
-        match send_heartbeat(&client, &config, &mut collector) {
+        match send_heartbeat(
+            &client,
+            &config,
+            &mut collector,
+            Some(&quick_action_polling),
+        ) {
             Ok(response) => {
                 // Reset error counters on success
                 consecutive_unauthorized = 0;
@@ -388,6 +513,7 @@ fn run_agent_with_shutdown_inner(
                             new_config.clamp();
                             log_config_change(&config, &new_config);
                             config = new_config;
+                            quick_action_polling.sync(&config.quick_actions, &quick_actions);
                         }
                         Err(e) => {
                             error!("Failed to fetch updated config: {}", e);
@@ -396,11 +522,13 @@ fn run_agent_with_shutdown_inner(
                     }
                 }
 
-                reload_quick_actions_if_changed(
+                if reload_quick_actions_if_changed(
                     &client,
                     &mut quick_actions,
                     &mut quick_actions_fingerprint,
-                );
+                ) {
+                    quick_action_polling.sync(&config.quick_actions, &quick_actions);
+                }
                 run_quick_action_requests(&client, &quick_actions, &response.quick_actions);
 
                 // Extended Linux metrics (opt-in): discovery + compact samples
@@ -458,6 +586,8 @@ fn run_agent_with_shutdown_inner(
                     &client,
                     &mut quick_actions,
                     &mut quick_actions_fingerprint,
+                    &config.quick_actions,
+                    &mut quick_action_polling,
                 )
                 .is_err()
                 {
@@ -553,10 +683,10 @@ fn sleep_with_quick_action_polling(
     client: &ApiClient,
     quick_actions: &mut QuickActionsRegistry,
     quick_actions_fingerprint: &mut String,
+    quick_actions_config: &QuickActionsConfig,
+    quick_action_polling: &mut QuickActionPollState,
 ) -> Result<(), ()> {
     let deadline = Instant::now() + Duration::from_secs(total_secs);
-    let poll_interval = Duration::from_secs(QUICK_ACTION_POLL_INTERVAL_SECS);
-    let mut next_poll = Instant::now() + poll_interval;
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -568,13 +698,21 @@ fn sleep_with_quick_action_polling(
             return Ok(());
         }
 
-        if now >= next_poll {
-            poll_quick_actions_once(client, quick_actions, quick_actions_fingerprint);
-            next_poll = Instant::now() + poll_interval;
+        if quick_action_polling.due(now) {
+            poll_quick_actions_once(
+                client,
+                quick_actions,
+                quick_actions_fingerprint,
+                quick_actions_config,
+                quick_action_polling,
+            );
             continue;
         }
 
-        let next_wake = std::cmp::min(deadline, next_poll);
+        let next_wake = quick_action_polling
+            .next_due()
+            .map(|next_due| std::cmp::min(deadline, next_due))
+            .unwrap_or(deadline);
         let sleep_for = std::cmp::min(
             Duration::from_millis(500),
             next_wake.saturating_duration_since(now),
@@ -592,25 +730,43 @@ fn reload_quick_actions_if_changed(
     client: &ApiClient,
     quick_actions: &mut QuickActionsRegistry,
     quick_actions_fingerprint: &mut String,
-) {
+) -> bool {
     let reloaded_quick_actions = QuickActionsRegistry::load();
     let reloaded_fingerprint = reloaded_quick_actions.fingerprint();
     if reloaded_fingerprint != *quick_actions_fingerprint {
         *quick_actions = reloaded_quick_actions;
         *quick_actions_fingerprint = reloaded_fingerprint;
         publish_quick_actions_manifest(client, quick_actions);
+        return true;
     }
+    false
 }
 
 fn poll_quick_actions_once(
     client: &ApiClient,
     quick_actions: &mut QuickActionsRegistry,
     quick_actions_fingerprint: &mut String,
+    quick_actions_config: &QuickActionsConfig,
+    quick_action_polling: &mut QuickActionPollState,
 ) {
-    reload_quick_actions_if_changed(client, quick_actions, quick_actions_fingerprint);
+    if reload_quick_actions_if_changed(client, quick_actions, quick_actions_fingerprint) {
+        quick_action_polling.sync(quick_actions_config, quick_actions);
+    }
 
-    match client.poll_quick_actions() {
-        Ok(requests) => run_quick_action_requests(client, quick_actions, &requests),
+    if !quick_action_polling.enabled {
+        return;
+    }
+
+    let report = quick_action_polling.mark_poll_started();
+    match client.poll_quick_actions(&report) {
+        Ok(requests) => {
+            if requests.is_empty() {
+                debug!("Quick action poll completed with no pending requests");
+            } else {
+                info!("Quick action poll claimed {} request(s)", requests.len());
+            }
+            run_quick_action_requests(client, quick_actions, &requests);
+        }
         Err(e) => warn!("Quick action poll failed: {}", e),
     }
 }
@@ -685,6 +841,10 @@ fn run_check_config(token: String, endpoint: String) -> Result<()> {
         "  heartbeat_interval_secs:  {}",
         cfg.heartbeat_interval_secs
     );
+    println!(
+        "  quick_action_poll_secs:   {} (enabled={})",
+        cfg.quick_actions.poll_interval_seconds, cfg.quick_actions.enabled
+    );
     println!("  missed_threshold:         {}", cfg.missed_threshold);
     println!(
         "  metrics:                  cpu={} memory={} disk={} load={}",
@@ -711,7 +871,7 @@ fn run_test_heartbeat(token: String, endpoint: String) -> Result<()> {
 
     println!("Endpoint: {endpoint}");
     println!("Sending one heartbeat...");
-    match send_heartbeat(&client, &cfg, &mut collector) {
+    match send_heartbeat(&client, &cfg, &mut collector, None) {
         Ok(result) => {
             println!("✓ Heartbeat accepted");
             println!("  config_outdated:        {}", result.config_outdated);
@@ -812,6 +972,7 @@ fn send_heartbeat(
     client: &ApiClient,
     config: &AgentConfig,
     collector: &mut MetricsCollector,
+    quick_action_polling: Option<&QuickActionPollState>,
 ) -> Result<HeartbeatResult, ApiError> {
     // Collect system metrics. Isolated against panics inside `sysinfo` —
     // the heartbeat MUST keep going even if a metric source briefly explodes
@@ -948,7 +1109,8 @@ fn send_heartbeat(
     }
 
     // Send heartbeat
-    let response = client.send_heartbeat(&payload)?;
+    let quick_action_polling_report = quick_action_polling.map(QuickActionPollState::report);
+    let response = client.send_heartbeat(&payload, quick_action_polling_report.as_ref())?;
 
     Ok(HeartbeatResult {
         config_outdated: response.config_outdated.unwrap_or(false),
@@ -961,7 +1123,16 @@ fn send_heartbeat(
 
 #[cfg(test)]
 mod jitter_tests {
-    use super::{jittered, HEARTBEAT_JITTER_PCT};
+    use crate::heartbeat::{
+        QuickActionsConfig, QUICK_ACTION_DEFAULT_POLL_INTERVAL_SECS,
+        QUICK_ACTION_MIN_POLL_INTERVAL_SECS,
+    };
+    use crate::quick_actions::QuickActionsRegistry;
+
+    use super::{
+        jittered, jittered_duration, QuickActionPollState, HEARTBEAT_JITTER_PCT,
+        QUICK_ACTION_POLL_JITTER_PCT,
+    };
 
     #[test]
     fn jittered_zero_stays_zero() {
@@ -989,5 +1160,49 @@ mod jitter_tests {
         // For very short intervals the span rounds to 0 — the result is
         // returned unchanged, which is fine: spreading a 1s herd is moot.
         assert_eq!(jittered(1), 1);
+    }
+
+    #[test]
+    fn jittered_duration_stays_within_bounds() {
+        let base = std::time::Duration::from_secs(5);
+        let span_ms = base.as_millis() * QUICK_ACTION_POLL_JITTER_PCT as u128 / 100;
+        for _ in 0..20 {
+            let value = jittered_duration(base, QUICK_ACTION_POLL_JITTER_PCT);
+            assert!(value.as_millis() >= base.as_millis() - span_ms);
+            assert!(value.as_millis() <= base.as_millis() + span_ms);
+            assert!(value.as_millis() >= 1);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn quick_action_polling_disabled_when_registry_has_no_actions() {
+        let config = QuickActionsConfig {
+            enabled: true,
+            poll_interval_seconds: QUICK_ACTION_DEFAULT_POLL_INTERVAL_SECS,
+        };
+        let state = QuickActionPollState::new(&config, &QuickActionsRegistry::disabled());
+
+        assert!(!state.report().enabled);
+        assert_eq!(
+            state.report().poll_interval_seconds,
+            QUICK_ACTION_DEFAULT_POLL_INTERVAL_SECS
+        );
+        assert!(state.report().next_poll_at_unix_ms.is_none());
+    }
+
+    #[test]
+    fn quick_action_polling_report_uses_configured_interval() {
+        let config = QuickActionsConfig {
+            enabled: false,
+            poll_interval_seconds: QUICK_ACTION_MIN_POLL_INTERVAL_SECS,
+        };
+        let state = QuickActionPollState::new(&config, &QuickActionsRegistry::disabled());
+
+        assert!(!state.report().enabled);
+        assert_eq!(
+            state.report().poll_interval_seconds,
+            QUICK_ACTION_MIN_POLL_INTERVAL_SECS
+        );
     }
 }

@@ -6,20 +6,27 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 [`VERSIONING.md`](./VERSIONING.md) for the full policy. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [1.8.4] — 2026-05-10
+## [1.8.5] — 2026-05-10
 
 ### Added
 
 - Added a lightweight quick-action command poll while the agent is waiting for
   the next heartbeat. Agents now check `/api/agents/actions/pending` every
-  10 seconds during the heartbeat sleep window so dashboard-requested commands
+  5 seconds by default during the heartbeat sleep window so dashboard-requested commands
   start much faster without increasing the full metric heartbeat rate.
+- Added `connlog-agent refresh-service [--restart]` and
+  `connlog-agent diagnostics service` so operators can refresh or inspect the
+  installed systemd unit without reinstalling the agent.
 
 ### Fixed
 
 - Kept the existing heartbeat-delivered quick-action path intact and covered
   the new poll endpoint with a simulation test so pending requests are still
   claimed and executed by ID only.
+- Self-update now refreshes the installed systemd service from the new binary
+  before restarting. If refresh fails, the update hook logs loudly, rolls the
+  binary back, and leaves the service stopped instead of silently running a new
+  binary under a stale unit file.
 
 ## [1.8.3] — 2026-05-09
 
@@ -543,7 +550,9 @@ considered stable; breaking changes from this point on require a major bump.
 
 - Last pre-1.0 release. See git history for prior changes.
 
-[Unreleased]: https://github.com/connlog/agent/compare/v1.8.3...HEAD
+[Unreleased]: https://github.com/connlog/agent/compare/v1.8.5...HEAD
+[1.8.5]: https://github.com/connlog/agent/compare/v1.8.4...v1.8.5
+[1.8.4]: https://github.com/connlog/agent/compare/v1.8.3...v1.8.4
 [1.8.3]: https://github.com/connlog/agent/compare/v1.8.2...v1.8.3
 [1.8.2]: https://github.com/connlog/agent/compare/v1.8.1...v1.8.2
 [1.8.1]: https://github.com/connlog/agent/compare/v1.8.0...v1.8.1

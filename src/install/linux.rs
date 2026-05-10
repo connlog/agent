@@ -4,6 +4,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
+pub const SYSTEMD_SERVICE_PATH: &str = "/etc/systemd/system/connlog-agent.service";
+const SYSTEMD_SERVICE_TMP_PATH: &str = "/etc/systemd/system/connlog-agent.service.new";
+
 pub const SYSTEMD_SERVICE: &str = r#"[Unit]
 Description=ConnLog Monitoring Agent
 After=network-online.target
@@ -75,17 +78,18 @@ UMask=0077
 ExecStopPost=+/bin/bash -c '\
 if [ -f /run/connlog/.update_requested ]; then \
     echo "ConnLog: Update marker detected, applying update..."; \
+    cp /usr/local/bin/connlog-agent /run/connlog/connlog-agent-old && \
     cp /run/connlog/connlog-agent-new /usr/local/bin/connlog-agent.new && \
     chmod 755 /usr/local/bin/connlog-agent.new && \
     mv /usr/local/bin/connlog-agent.new /usr/local/bin/connlog-agent; \
-    if /usr/local/bin/connlog-agent --emit-service > /etc/systemd/system/connlog-agent.service.new 2>/dev/null; then \
-        mv /etc/systemd/system/connlog-agent.service.new /etc/systemd/system/connlog-agent.service; \
-        echo "ConnLog: Service file refreshed from new binary."; \
-    else \
-        echo "ConnLog: Warning - could not refresh service file, keeping existing."; \
+    if ! /usr/local/bin/connlog-agent refresh-service; then \
+        echo "ConnLog: ERROR - service refresh failed after binary replacement."; \
+        echo "ConnLog: Rolling back binary and leaving service stopped."; \
+        mv /run/connlog/connlog-agent-old /usr/local/bin/connlog-agent; \
+        rm -f /run/connlog/.update_requested /run/connlog/connlog-agent-new; \
+        exit 1; \
     fi; \
-    systemctl daemon-reload; \
-    rm -f /run/connlog/.update_requested /run/connlog/connlog-agent-new; \
+    rm -f /run/connlog/.update_requested /run/connlog/connlog-agent-new /run/connlog/connlog-agent-old; \
     systemctl start connlog-agent; \
     echo "ConnLog: Update complete."; \
 elif [ -f /run/connlog/.uninstall_requested ]; then \
@@ -202,7 +206,157 @@ pub fn status() -> Result<()> {
         println!("  sudo connlog-agent install --token <your-token>");
     }
 
+    println!();
+    print_service_diagnostics()?;
+
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct ServiceDiagnostics {
+    pub binary_version: &'static str,
+    pub service_path: &'static str,
+    pub installed: bool,
+    pub matches_embedded: bool,
+    pub needs_daemon_reload: Option<bool>,
+}
+
+pub fn refresh_service(restart: bool) -> Result<()> {
+    if !is_root() {
+        anyhow::bail!(
+            "Refreshing the systemd service requires root privileges. Please run with sudo."
+        );
+    }
+
+    write_service_atomically(Path::new(SYSTEMD_SERVICE_PATH), SYSTEMD_SERVICE)?;
+    run_systemctl(&["daemon-reload"]).context("Failed to reload systemd after service refresh")?;
+    println!("  Refreshed {}", SYSTEMD_SERVICE_PATH);
+    println!("  Reloaded systemd");
+
+    if restart {
+        run_systemctl(&["restart", "connlog-agent"])
+            .context("Failed to restart connlog-agent after service refresh")?;
+        println!("  Restarted connlog-agent");
+    }
+
+    Ok(())
+}
+
+pub fn diagnostics() -> Result<ServiceDiagnostics> {
+    let matches_embedded =
+        installed_service_matches_embedded_path(Path::new(SYSTEMD_SERVICE_PATH))?;
+    Ok(ServiceDiagnostics {
+        binary_version: env!("CARGO_PKG_VERSION"),
+        service_path: SYSTEMD_SERVICE_PATH,
+        installed: Path::new(SYSTEMD_SERVICE_PATH).exists(),
+        matches_embedded,
+        needs_daemon_reload: systemd_needs_daemon_reload(),
+    })
+}
+
+pub fn print_service_diagnostics() -> Result<()> {
+    let diagnostics = diagnostics()?;
+    println!("Service template diagnostics:");
+    println!("  binary_version:          v{}", diagnostics.binary_version);
+    println!("  installed_service_path:  {}", diagnostics.service_path);
+    println!("  installed:               {}", diagnostics.installed);
+    println!(
+        "  matches_embedded:        {}",
+        diagnostics.matches_embedded
+    );
+    match diagnostics.needs_daemon_reload {
+        Some(value) => println!("  systemd_needs_reload:    {}", value),
+        None => println!("  systemd_needs_reload:    unknown"),
+    }
+    if diagnostics.installed && !diagnostics.matches_embedded {
+        println!();
+        println!("Installed systemd service differs from this agent version. Run:");
+        println!("  sudo connlog-agent refresh-service --restart");
+    }
+    Ok(())
+}
+
+pub fn warn_if_installed_service_stale_once() {
+    match installed_service_matches_embedded_path(Path::new(SYSTEMD_SERVICE_PATH)) {
+        Ok(false) => log::warn!(
+            "Installed systemd service differs from this agent version. Run: sudo connlog-agent refresh-service --restart"
+        ),
+        Ok(true) => {}
+        Err(e) => log::debug!("Could not inspect installed systemd service: {}", e),
+    }
+}
+
+fn installed_service_matches_embedded_path(path: &Path) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let installed = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read installed service {}", path.display()))?;
+    Ok(normalize_service_text(&installed) == normalize_service_text(SYSTEMD_SERVICE))
+}
+
+fn normalize_service_text(text: &str) -> String {
+    text.replace("\r\n", "\n")
+}
+
+fn write_service_atomically(path: &Path, service_text: &str) -> Result<()> {
+    let tmp = Path::new(SYSTEMD_SERVICE_TMP_PATH);
+    let tmp = if path == Path::new(SYSTEMD_SERVICE_PATH) {
+        tmp.to_path_buf()
+    } else {
+        path.with_extension("service.new")
+    };
+
+    fs::write(&tmp, service_text)
+        .with_context(|| format!("Failed to write service temp file {}", tmp.display()))?;
+
+    let mut perms = fs::metadata(&tmp)
+        .with_context(|| format!("Failed to read metadata for {}", tmp.display()))?
+        .permissions();
+    perms.set_mode(0o644);
+    fs::set_permissions(&tmp, perms)
+        .with_context(|| format!("Failed to set permissions on {}", tmp.display()))?;
+
+    fs::rename(&tmp, path).with_context(|| {
+        format!(
+            "Failed to atomically replace service file {} with {}",
+            path.display(),
+            tmp.display()
+        )
+    })?;
+
+    Ok(())
+}
+
+fn run_systemctl(args: &[&str]) -> Result<()> {
+    let status = Command::new("systemctl")
+        .args(args)
+        .status()
+        .with_context(|| format!("Failed to run systemctl {}", args.join(" ")))?;
+    if !status.success() {
+        anyhow::bail!("systemctl {} returned non-zero status", args.join(" "));
+    }
+    Ok(())
+}
+
+fn systemd_needs_daemon_reload() -> Option<bool> {
+    let output = Command::new("systemctl")
+        .args([
+            "show",
+            "connlog-agent",
+            "--property=NeedDaemonReload",
+            "--value",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    match String::from_utf8_lossy(&output.stdout).trim() {
+        "yes" => Some(true),
+        "no" => Some(false),
+        _ => None,
+    }
 }
 
 fn is_root() -> bool {
@@ -325,14 +479,9 @@ fn install_binary() -> Result<()> {
 }
 
 fn create_systemd_service() -> Result<()> {
-    fs::write("/etc/systemd/system/connlog-agent.service", SYSTEMD_SERVICE)
+    write_service_atomically(Path::new(SYSTEMD_SERVICE_PATH), SYSTEMD_SERVICE)
         .context("Failed to create systemd service file")?;
-
-    // Reload systemd
-    Command::new("systemctl")
-        .arg("daemon-reload")
-        .status()
-        .context("Failed to reload systemd")?;
+    run_systemctl(&["daemon-reload"]).context("Failed to reload systemd")?;
 
     println!("  Created systemd service");
     Ok(())
@@ -494,7 +643,8 @@ mod tests {
         );
         assert!(SYSTEMD_SERVICE.contains("/run/connlog/.update_requested"));
         assert!(SYSTEMD_SERVICE.contains("/run/connlog/.uninstall_requested"));
-        assert!(SYSTEMD_SERVICE.contains("systemctl daemon-reload"));
+        assert!(SYSTEMD_SERVICE.contains("refresh-service"));
+        assert!(SYSTEMD_SERVICE.contains("ConnLog: ERROR - service refresh failed"));
     }
 
     /// The binary replacement in ExecStopPost MUST NOT overwrite the live binary
@@ -526,13 +676,48 @@ mod tests {
     #[test]
     fn systemd_unit_service_file_refresh_is_atomic() {
         assert!(
-            SYSTEMD_SERVICE.contains("/etc/systemd/system/connlog-agent.service.new"),
-            "service file temp must be on the same fs as the target (/etc/systemd/system)"
+            SYSTEMD_SERVICE.contains("connlog-agent refresh-service"),
+            "self-update must use the shared refresh-service implementation"
         );
         assert!(
             !SYSTEMD_SERVICE.contains("/run/connlog/connlog-agent.service.new"),
             "service file temp must NOT be on /run (tmpfs) — cross-fs mv is not atomic"
         );
+    }
+
+    #[test]
+    fn write_service_atomically_replaces_target() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("connlog-agent-service-{unique}.service"));
+        fs::write(&path, "old").expect("write old service");
+
+        write_service_atomically(&path, "new service\n").expect("atomic service write");
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new service\n");
+        assert!(
+            !path.with_extension("service.new").exists(),
+            "temp file must be renamed into place"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn installed_service_match_detection_compares_embedded_template() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("connlog-agent-service-match-{unique}.service"));
+        fs::write(&path, SYSTEMD_SERVICE).expect("write matching service");
+        assert!(installed_service_matches_embedded_path(&path).unwrap());
+
+        fs::write(&path, "stale service").expect("write stale service");
+        assert!(!installed_service_matches_embedded_path(&path).unwrap());
+        let _ = fs::remove_file(path);
     }
 
     #[test]

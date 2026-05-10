@@ -82,6 +82,13 @@ pub enum AgentCommand {
     /// Show the systemd service status
     Status,
 
+    /// Refresh the installed systemd service file from this binary
+    RefreshService {
+        /// Restart connlog-agent after writing the service and daemon-reload
+        #[arg(long)]
+        restart: bool,
+    },
+
     /// Check for and apply the latest release
     Update,
 
@@ -133,6 +140,12 @@ pub enum DiagnosticCommand {
         long_about = "Send exactly one heartbeat to the platform, print the response, then exit without starting the normal retry loop.\n\nExamples:\n  sudo CONNLOG_TOKEN=agent_xxxxxxxxxxxx connlog-agent diagnostics test-heartbeat\n  connlog-agent diagnostics test-heartbeat --token agent_xxxxxxxxxxxx"
     )]
     TestHeartbeat,
+
+    /// Inspect the installed systemd service template
+    #[command(
+        long_about = "Compare the installed systemd service with the template embedded in this binary.\n\nExamples:\n  connlog-agent diagnostics service\n  sudo connlog-agent refresh-service --restart"
+    )]
+    Service,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
@@ -421,6 +434,23 @@ mod tests {
                 command: DiagnosticCommand::CheckConfig
             })
         );
+
+        let cfg = Config::parse_from(["connlog-agent", "diagnostics", "service"]);
+        assert_eq!(
+            cfg.command,
+            Some(AgentCommand::Diagnostics {
+                command: DiagnosticCommand::Service
+            })
+        );
+    }
+
+    #[test]
+    fn refresh_service_subcommand_parses_restart_flag() {
+        let cfg = Config::parse_from(["connlog-agent", "refresh-service", "--restart"]);
+        assert_eq!(
+            cfg.command,
+            Some(AgentCommand::RefreshService { restart: true })
+        );
     }
 
     #[test]
@@ -508,6 +538,7 @@ mod tests {
         assert!(help.contains("Commands:"));
         assert!(help.contains("action"));
         assert!(help.contains("diagnostics"));
+        assert!(help.contains("refresh-service"));
         assert!(help.contains("Legacy flags still work"));
     }
 

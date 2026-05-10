@@ -59,6 +59,9 @@ systemctl status connlog-agent
 # View logs
 journalctl -u connlog-agent -f
 
+# Refresh the installed systemd unit from the current binary
+sudo connlog-agent refresh-service --restart
+
 # Uninstall (stops service, removes all files)
 sudo connlog-agent uninstall
 ```
@@ -75,6 +78,9 @@ connlog-agent diagnostics check-config --token <TOKEN>
 
 # Send one heartbeat and print the platform response
 connlog-agent diagnostics test-heartbeat --token <TOKEN>
+
+# Compare the installed systemd unit with this binary's embedded template
+connlog-agent diagnostics service
 ```
 
 The older top-level commands `connlog-agent check-config` and
@@ -86,6 +92,12 @@ Local dashboard actions are buttons shown in ConnLog that run pre-registered
 commands on the agent host. They are stored in `/etc/connlog/actions.toml`,
 reloaded by the running service, and published to the dashboard on the next
 heartbeat.
+
+Action requests are picked up independently from the normal metrics heartbeat.
+The platform sends a `quickActions` config block and the agent polls
+`/api/agents/actions/pending` every 5 seconds by default, clamped to 2..60
+seconds. The dashboard shows the latest known last/next action check times, so
+queued actions can estimate when the agent should pick them up.
 
 The simple setup flow asks for a label, description, command, output preference,
 and confirmation preference:
@@ -150,8 +162,10 @@ arbitrary shell commands or command arguments.
 
 1. Agent sends a heartbeat to the platform every 60 seconds (configurable server-side)
 2. Platform responds with the latest config (metric toggles, intervals, payload limits)
-3. Agent applies config changes without restart
-4. If the platform marks the agent for uninstall (HTTP 410), the agent triggers a self-cleanup via systemd `ExecStopPost`
+3. Agent polls Quick Action requests on its own short interval when local actions are enabled
+4. Agent applies config changes without restart
+5. Self-updates refresh the systemd unit from the new binary before the service restarts
+6. If the platform marks the agent for uninstall (HTTP 410), the agent triggers a self-cleanup via systemd `ExecStopPost`
 
 ### Collected metrics
 

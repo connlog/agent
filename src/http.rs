@@ -57,6 +57,14 @@ pub struct ApiClient {
     machine_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct QuickActionPollingReport {
+    pub enabled: bool,
+    pub poll_interval_seconds: u64,
+    pub last_poll_at_unix_ms: Option<u128>,
+    pub next_poll_at_unix_ms: Option<u128>,
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct QuickActionPollResponse {
     #[serde(default)]
@@ -101,6 +109,7 @@ impl ApiClient {
     pub fn send_heartbeat(
         &self,
         payload: &HeartbeatPayload,
+        quick_action_polling: Option<&QuickActionPollingReport>,
     ) -> Result<HeartbeatResponse, ApiError> {
         let url = format!("{}/api/agents/heartbeat", self.base_url);
 
@@ -145,6 +154,8 @@ impl ApiClient {
                 HeaderValue::from_str(mid).context("Failed to create machine-id header")?,
             );
         }
+
+        add_quick_action_polling_headers(&mut headers, quick_action_polling)?;
 
         // SECURITY: Never log the token
         let auth_value = format!("Bearer {}", self.token);
@@ -361,15 +372,24 @@ impl ApiClient {
         Ok(())
     }
 
-    pub fn poll_quick_actions(&self) -> Result<Vec<QuickActionRequest>, ApiError> {
+    pub fn poll_quick_actions(
+        &self,
+        quick_action_polling: &QuickActionPollingReport,
+    ) -> Result<Vec<QuickActionRequest>, ApiError> {
         let url = format!("{}/api/agents/actions/pending", self.base_url);
         let auth_value = format!("Bearer {}", self.token);
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&auth_value).context("Failed to create authorization header")?,
+        );
+        add_quick_action_polling_headers(&mut headers, Some(quick_action_polling))?;
 
         let response = self
             .client
             .get(&url)
-            .header(CONTENT_TYPE, "application/json")
-            .header(AUTHORIZATION, auth_value)
+            .headers(headers)
             .send()
             .context("Failed to poll quick action queue")?;
 
@@ -401,6 +421,41 @@ impl ApiClient {
 
         Ok(poll_response.quick_actions)
     }
+}
+
+fn add_quick_action_polling_headers(
+    headers: &mut HeaderMap,
+    report: Option<&QuickActionPollingReport>,
+) -> Result<()> {
+    let Some(report) = report else {
+        return Ok(());
+    };
+
+    headers.insert(
+        "X-Quick-Action-Polling-Enabled",
+        HeaderValue::from_static(if report.enabled { "true" } else { "false" }),
+    );
+    headers.insert(
+        "X-Quick-Action-Poll-Interval-Seconds",
+        HeaderValue::from_str(&report.poll_interval_seconds.to_string())
+            .context("Failed to create quick action poll interval header")?,
+    );
+    if let Some(value) = report.last_poll_at_unix_ms {
+        headers.insert(
+            "X-Quick-Action-Last-Poll-At-Ms",
+            HeaderValue::from_str(&value.to_string())
+                .context("Failed to create quick action last poll header")?,
+        );
+    }
+    if let Some(value) = report.next_poll_at_unix_ms {
+        headers.insert(
+            "X-Quick-Action-Next-Poll-At-Ms",
+            HeaderValue::from_str(&value.to_string())
+                .context("Failed to create quick action next poll header")?,
+        );
+    }
+
+    Ok(())
 }
 
 /// Encode a heartbeat payload into the 32-byte protocol v1 binary wire frame.

@@ -9,6 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
 use crate::heartbeat::UpdateInfo;
+use crate::install;
 use crate::platform::{INSTALLED_BINARY, STAGED_BINARY, UPDATE_MARKER};
 
 /// Ed25519 public key (hex) for verifying update signatures.
@@ -626,43 +627,40 @@ pub fn run_manual_update() -> Result<()> {
     verify_ed25519(&hash, &sig_data)?;
     println!("Ed25519 signature verified ✓");
 
+    let previous_binary = fs::read(INSTALLED_BINARY)
+        .with_context(|| format!("Failed to read existing binary at {}", INSTALLED_BINARY))?;
+
     // Atomically replace the installed binary
     atomic_replace(&binary_data, INSTALLED_BINARY)?;
     println!("Binary replaced at {}", INSTALLED_BINARY);
 
-    reload_service_if_active()?;
+    let restart_service = service_is_active();
+    if let Err(err) = install::refresh_service(restart_service) {
+        let rollback_result = atomic_replace(&previous_binary, INSTALLED_BINARY);
+        if let Err(rollback_err) = rollback_result {
+            anyhow::bail!(
+                "Service refresh failed after binary replacement: {err}. \
+                 Rollback also failed: {rollback_err}. \
+                 Run: sudo connlog-agent refresh-service --restart"
+            );
+        }
+        anyhow::bail!(
+            "Service refresh failed after binary replacement: {err}. \
+             Rolled back to the previous binary. \
+             Run: sudo connlog-agent refresh-service --restart"
+        );
+    }
 
     println!("\n✓ Updated to v{}", latest_version);
     Ok(())
 }
 
-/// Restart the connlog-agent service if it is currently active.
-fn reload_service_if_active() -> Result<()> {
-    let is_active = std::process::Command::new("systemctl")
+fn service_is_active() -> bool {
+    std::process::Command::new("systemctl")
         .args(["is-active", "--quiet", "connlog-agent"])
         .status()
         .map(|s| s.success())
-        .unwrap_or(false);
-
-    if is_active {
-        println!("Restarting connlog-agent service...");
-        let status = std::process::Command::new("systemctl")
-            .args(["restart", "connlog-agent"])
-            .status()
-            .context("Failed to restart connlog-agent service")?;
-
-        if status.success() {
-            println!("Service restarted successfully.");
-        } else {
-            println!("Warning: systemctl restart returned non-zero exit code.");
-            println!("Check with: systemctl status connlog-agent");
-        }
-    } else {
-        println!("connlog-agent service is not running. Start it with:");
-        println!("  systemctl start connlog-agent");
-    }
-
-    Ok(())
+        .unwrap_or(false)
 }
 
 // ── Version comparison (avoids adding `semver` crate) ──────────

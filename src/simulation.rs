@@ -29,7 +29,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::heartbeat::{HeartbeatPayload, Metrics};
-use crate::http::{ApiClient, ApiError};
+use crate::http::{ApiClient, ApiError, QuickActionPollingReport};
 
 /// Captured request data the test thread passes back to the assertions.
 #[derive(Debug, Default, Clone)]
@@ -195,7 +195,7 @@ fn heartbeat_200_parses_response() {
 
     let client = ApiClient::new(base, "test-token".into()).expect("ApiClient::new");
     let resp = client
-        .send_heartbeat(&make_payload())
+        .send_heartbeat(&make_payload(), None)
         .expect("heartbeat ok");
 
     assert!(resp.ok);
@@ -240,7 +240,7 @@ fn heartbeat_200_with_uninstall_flag() {
         .to_vec();
     let (base, _rx) = one_shot_server("200 OK", body);
     let client = ApiClient::new(base, "tok".into()).unwrap();
-    let resp = client.send_heartbeat(&make_payload()).unwrap();
+    let resp = client.send_heartbeat(&make_payload(), None).unwrap();
     assert!(resp.uninstall, "uninstall flag must be surfaced to caller");
 }
 
@@ -262,7 +262,7 @@ fn heartbeat_200_with_update_info() {
     .to_vec();
     let (base, _rx) = one_shot_server("200 OK", body);
     let client = ApiClient::new(base, "tok".into()).unwrap();
-    let resp = client.send_heartbeat(&make_payload()).unwrap();
+    let resp = client.send_heartbeat(&make_payload(), None).unwrap();
     let update = resp.update.expect("update info parsed");
     assert!(update.available);
     assert_eq!(update.latest_version, "1.3.0");
@@ -277,7 +277,13 @@ fn quick_action_poll_claims_pending_request() {
     let (base, rx) = one_shot_server("200 OK", body);
 
     let client = ApiClient::new(base, "test-token".into()).expect("ApiClient::new");
-    let requests = client.poll_quick_actions().expect("poll ok");
+    let report = QuickActionPollingReport {
+        enabled: true,
+        poll_interval_seconds: 5,
+        last_poll_at_unix_ms: Some(1_777_777_000_000),
+        next_poll_at_unix_ms: Some(1_777_777_005_000),
+    };
+    let requests = client.poll_quick_actions(&report).expect("poll ok");
 
     assert_eq!(requests.len(), 1);
     assert_eq!(
@@ -290,6 +296,19 @@ fn quick_action_poll_claims_pending_request() {
     assert_eq!(req.method, "GET");
     assert_eq!(req.path, "/api/agents/actions/pending");
     assert_eq!(req.header("Authorization"), Some("Bearer test-token"));
+    assert_eq!(req.header("X-Quick-Action-Polling-Enabled"), Some("true"));
+    assert_eq!(
+        req.header("X-Quick-Action-Poll-Interval-Seconds"),
+        Some("5")
+    );
+    assert_eq!(
+        req.header("X-Quick-Action-Last-Poll-At-Ms"),
+        Some("1777777000000")
+    );
+    assert_eq!(
+        req.header("X-Quick-Action-Next-Poll-At-Ms"),
+        Some("1777777005000")
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -300,7 +319,7 @@ fn quick_action_poll_claims_pending_request() {
 fn heartbeat_401_unauthorized() {
     let (base, _rx) = one_shot_server("401 Unauthorized", b"unauthorized".to_vec());
     let client = ApiClient::new(base, "tok".into()).unwrap();
-    let err = client.send_heartbeat(&make_payload()).unwrap_err();
+    let err = client.send_heartbeat(&make_payload(), None).unwrap_err();
     assert!(matches!(err, ApiError::Unauthorized), "got {err:?}");
 }
 
@@ -308,7 +327,7 @@ fn heartbeat_401_unauthorized() {
 fn heartbeat_410_decommissioned() {
     let (base, _rx) = one_shot_server("410 Gone", b"gone".to_vec());
     let client = ApiClient::new(base, "tok".into()).unwrap();
-    let err = client.send_heartbeat(&make_payload()).unwrap_err();
+    let err = client.send_heartbeat(&make_payload(), None).unwrap_err();
     assert!(matches!(err, ApiError::Decommissioned), "got {err:?}");
 }
 
@@ -316,7 +335,7 @@ fn heartbeat_410_decommissioned() {
 fn heartbeat_423_disabled() {
     let (base, _rx) = one_shot_server("423 Locked", b"disabled".to_vec());
     let client = ApiClient::new(base, "tok".into()).unwrap();
-    let err = client.send_heartbeat(&make_payload()).unwrap_err();
+    let err = client.send_heartbeat(&make_payload(), None).unwrap_err();
     assert!(matches!(err, ApiError::Disabled), "got {err:?}");
 }
 
@@ -324,7 +343,7 @@ fn heartbeat_423_disabled() {
 fn heartbeat_500_surfaces_status_and_body() {
     let (base, _rx) = one_shot_server("500 Internal Server Error", b"boom".to_vec());
     let client = ApiClient::new(base, "tok".into()).unwrap();
-    let err = client.send_heartbeat(&make_payload()).unwrap_err();
+    let err = client.send_heartbeat(&make_payload(), None).unwrap_err();
     match err {
         ApiError::HttpError { status, message } => {
             assert_eq!(status, 500);
@@ -348,7 +367,7 @@ fn heartbeat_redirect_is_not_followed() {
     // prevents this — assert the request fails before reaching anywhere.
     let (base, rx) = one_shot_redirect("https://attacker.example/steal");
     let client = ApiClient::new(base, "leak-me-if-you-can".into()).unwrap();
-    let err = client.send_heartbeat(&make_payload()).unwrap_err();
+    let err = client.send_heartbeat(&make_payload(), None).unwrap_err();
 
     // We expect *some* error: either an HttpError(302) (because reqwest
     // returns the redirect response unfollowed) or a network error.

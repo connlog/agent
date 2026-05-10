@@ -87,6 +87,10 @@ pub struct AgentConfig {
     /// Extended Linux resource metrics (opt-in per agent)
     #[serde(rename = "extendedMetrics", default)]
     pub extended_metrics: ExtendedMetricsConfig,
+
+    /// Local dashboard action request polling.
+    #[serde(rename = "quickActions", default)]
+    pub quick_actions: QuickActionsConfig,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -103,6 +107,38 @@ pub struct ExtendedMetricsConfig {
     pub monitored_disk_keys: Vec<String>,
     #[serde(rename = "monitoredNetworkKeys", default)]
     pub monitored_network_keys: Vec<String>,
+}
+
+pub const QUICK_ACTION_MIN_POLL_INTERVAL_SECS: u64 = 2;
+pub const QUICK_ACTION_DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
+pub const QUICK_ACTION_MAX_POLL_INTERVAL_SECS: u64 = 60;
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct QuickActionsConfig {
+    #[serde(default = "default_quick_actions_enabled")]
+    pub enabled: bool,
+    #[serde(
+        rename = "pollIntervalSeconds",
+        default = "default_quick_action_poll_interval_seconds"
+    )]
+    pub poll_interval_seconds: u64,
+}
+
+impl Default for QuickActionsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_quick_actions_enabled(),
+            poll_interval_seconds: default_quick_action_poll_interval_seconds(),
+        }
+    }
+}
+
+fn default_quick_actions_enabled() -> bool {
+    true
+}
+
+fn default_quick_action_poll_interval_seconds() -> u64 {
+    QUICK_ACTION_DEFAULT_POLL_INTERVAL_SECS
 }
 
 /// Configuration for which metrics to collect
@@ -130,6 +166,7 @@ impl AgentConfig {
             },
             max_payload_size_kb: 32,
             extended_metrics: ExtendedMetricsConfig::default(),
+            quick_actions: QuickActionsConfig::default(),
         }
     }
 
@@ -147,6 +184,11 @@ impl AgentConfig {
         if self.max_payload_size_kb > 0 {
             self.max_payload_size_kb = self.max_payload_size_kb.clamp(1, 1024);
         }
+
+        self.quick_actions.poll_interval_seconds = self.quick_actions.poll_interval_seconds.clamp(
+            QUICK_ACTION_MIN_POLL_INTERVAL_SECS,
+            QUICK_ACTION_MAX_POLL_INTERVAL_SECS,
+        );
     }
 
     /// Check if any metrics collection is enabled
@@ -186,6 +228,7 @@ mod tests {
             },
             max_payload_size_kb: payload,
             extended_metrics: ExtendedMetricsConfig::default(),
+            quick_actions: QuickActionsConfig::default(),
         }
     }
 
@@ -259,6 +302,25 @@ mod tests {
     }
 
     #[test]
+    fn clamp_quick_action_poll_interval_bounds() {
+        let mut low = cfg(60, 3, 32);
+        low.quick_actions.poll_interval_seconds = 1;
+        low.clamp();
+        assert_eq!(
+            low.quick_actions.poll_interval_seconds,
+            QUICK_ACTION_MIN_POLL_INTERVAL_SECS
+        );
+
+        let mut high = cfg(60, 3, 32);
+        high.quick_actions.poll_interval_seconds = 600;
+        high.clamp();
+        assert_eq!(
+            high.quick_actions.poll_interval_seconds,
+            QUICK_ACTION_MAX_POLL_INTERVAL_SECS
+        );
+    }
+
+    #[test]
     fn clamp_does_not_touch_metrics_or_version() {
         let mut c = cfg(60, 3, 32);
         c.metrics.cpu = false;
@@ -289,6 +351,16 @@ mod tests {
     fn safe_fallback_is_marked_v0() {
         // The agent uses version=0 as the "this is fallback, please refetch" signal.
         assert_eq!(AgentConfig::safe_fallback().version, 0);
+    }
+
+    #[test]
+    fn safe_fallback_uses_default_quick_action_polling() {
+        let cfg = AgentConfig::safe_fallback();
+        assert!(cfg.quick_actions.enabled);
+        assert_eq!(
+            cfg.quick_actions.poll_interval_seconds,
+            QUICK_ACTION_DEFAULT_POLL_INTERVAL_SECS
+        );
     }
 
     // ── any_metrics_enabled ─────────────────────────────────────
@@ -337,7 +409,8 @@ mod tests {
             "heartbeatIntervalSeconds": 45,
             "missedThreshold": 5,
             "metrics": {"cpu": true, "memory": false, "disk": true, "load": false},
-            "maxPayloadSizeKb": 64
+            "maxPayloadSizeKb": 64,
+            "quickActions": {"enabled": true, "pollIntervalSeconds": 7}
         }"#;
         let cfg: AgentConfig =
             serde_json::from_str(json).expect("must accept platform's camelCase");
@@ -349,6 +422,25 @@ mod tests {
         assert!(cfg.metrics.disk);
         assert!(!cfg.metrics.load);
         assert_eq!(cfg.max_payload_size_kb, 64);
+        assert!(cfg.quick_actions.enabled);
+        assert_eq!(cfg.quick_actions.poll_interval_seconds, 7);
+    }
+
+    #[test]
+    fn agent_config_deserialises_when_quick_actions_missing() {
+        let json = r#"{
+            "configVersion": 7,
+            "heartbeatIntervalSeconds": 45,
+            "missedThreshold": 5,
+            "metrics": {"cpu": true, "memory": false, "disk": true, "load": false},
+            "maxPayloadSizeKb": 64
+        }"#;
+        let cfg: AgentConfig = serde_json::from_str(json).expect("quickActions is optional");
+        assert!(cfg.quick_actions.enabled);
+        assert_eq!(
+            cfg.quick_actions.poll_interval_seconds,
+            QUICK_ACTION_DEFAULT_POLL_INTERVAL_SECS
+        );
     }
 
     #[test]
