@@ -84,29 +84,9 @@ pub struct AgentConfig {
     #[serde(rename = "maxPayloadSizeKb")]
     pub max_payload_size_kb: u64,
 
-    /// Extended Linux resource metrics (opt-in per agent)
-    #[serde(rename = "extendedMetrics", default)]
-    pub extended_metrics: ExtendedMetricsConfig,
-
     /// Local dashboard action request polling.
     #[serde(rename = "quickActions", default)]
     pub quick_actions: QuickActionsConfig,
-}
-
-#[derive(Debug, Deserialize, Clone, Default)]
-pub struct ExtendedMetricsConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(rename = "discoverResources", default)]
-    pub discover_resources: bool,
-    #[serde(rename = "collectDisks", default)]
-    pub collect_disks: bool,
-    #[serde(rename = "collectNetwork", default)]
-    pub collect_network: bool,
-    #[serde(rename = "monitoredDiskKeys", default)]
-    pub monitored_disk_keys: Vec<String>,
-    #[serde(rename = "monitoredNetworkKeys", default)]
-    pub monitored_network_keys: Vec<String>,
 }
 
 pub const QUICK_ACTION_MIN_POLL_INTERVAL_SECS: u64 = 2;
@@ -165,7 +145,6 @@ impl AgentConfig {
                 load: true,
             },
             max_payload_size_kb: 32,
-            extended_metrics: ExtendedMetricsConfig::default(),
             quick_actions: QuickActionsConfig::default(),
         }
     }
@@ -227,7 +206,6 @@ mod tests {
                 load: true,
             },
             max_payload_size_kb: payload,
-            extended_metrics: ExtendedMetricsConfig::default(),
             quick_actions: QuickActionsConfig::default(),
         }
     }

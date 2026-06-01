@@ -4,7 +4,6 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::StatusCode;
 use std::time::Duration;
 
-use crate::extended_metrics::{DiscoveryPayload, SamplesPayload};
 use crate::heartbeat::{AgentConfig, HeartbeatPayload, HeartbeatResponse};
 use crate::quick_actions::{
     QuickActionRequest, QuickActionResultPayload, QuickActionsManifestPayload,
@@ -264,56 +263,6 @@ impl ApiClient {
         envelope.data.ok_or_else(|| {
             anyhow::anyhow!("Config envelope missing `data` field: {}", response_text)
         })
-    }
-
-    pub fn send_resource_discovery(&self, payload: &DiscoveryPayload) -> Result<(), ApiError> {
-        let url = format!("{}/api/agents/resources/discovery", self.base_url);
-        let auth_value = format!("Bearer {}", self.token);
-
-        let response = self
-            .client
-            .post(&url)
-            .header(CONTENT_TYPE, "application/json")
-            .header(AUTHORIZATION, auth_value)
-            .json(payload)
-            .send()
-            .context("Failed to send resource discovery")?;
-
-        if !response.status().is_success() {
-            return Err(ApiError::HttpError {
-                status: response.status().as_u16(),
-                message: response
-                    .text()
-                    .unwrap_or_else(|_| "Unknown error".to_string()),
-            });
-        }
-
-        Ok(())
-    }
-
-    pub fn send_resource_samples(&self, payload: &SamplesPayload) -> Result<(), ApiError> {
-        let url = format!("{}/api/agents/resources/samples", self.base_url);
-        let auth_value = format!("Bearer {}", self.token);
-
-        let response = self
-            .client
-            .post(&url)
-            .header(CONTENT_TYPE, "application/json")
-            .header(AUTHORIZATION, auth_value)
-            .json(payload)
-            .send()
-            .context("Failed to send resource samples")?;
-
-        if !response.status().is_success() {
-            return Err(ApiError::HttpError {
-                status: response.status().as_u16(),
-                message: response
-                    .text()
-                    .unwrap_or_else(|_| "Unknown error".to_string()),
-            });
-        }
-
-        Ok(())
     }
 
     pub fn send_quick_actions_manifest(

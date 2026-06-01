@@ -9,7 +9,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod action_cli;
 mod config;
 mod defaults;
-mod extended_metrics;
 mod heartbeat;
 mod http;
 mod identity;
@@ -404,7 +403,6 @@ fn run_agent_with_shutdown_inner(
     let mut consecutive_unauthorized = 0u32;
     let mut consecutive_errors = 0u32;
     let mut consecutive_uninstall_commands = 0u32;
-    let mut extended_state = extended_metrics::ExtendedMetricsState::default();
 
     // ── Update strategy ──────────────────────────────────────────
     //
@@ -530,51 +528,6 @@ fn run_agent_with_shutdown_inner(
                     quick_action_polling.sync(&config.quick_actions, &quick_actions);
                 }
                 run_quick_action_requests(&client, &quick_actions, &response.quick_actions);
-
-                // Extended Linux metrics (opt-in): discovery + compact samples
-                if extended_metrics::is_linux_runtime()
-                    && extended_metrics::should_collect(
-                        config.extended_metrics.enabled,
-                        config.extended_metrics.collect_disks,
-                        config.extended_metrics.collect_network,
-                    )
-                {
-                    if config.extended_metrics.discover_resources {
-                        let discovery = extended_metrics::collect_discovery();
-                        match client.send_resource_discovery(&discovery) {
-                            Ok(_) => info!(
-                                "Extended discovery sent (disks={}, network={})",
-                                discovery.disks.len(),
-                                discovery.network.len()
-                            ),
-                            Err(e) => warn!("Extended discovery send failed: {}", e),
-                        }
-                    }
-
-                    if extended_metrics::has_monitored(
-                        &config.extended_metrics.monitored_disk_keys,
-                        &config.extended_metrics.monitored_network_keys,
-                    ) {
-                        let samples = extended_metrics::collect_samples(
-                            &mut extended_state,
-                            &config.extended_metrics.monitored_disk_keys,
-                            &config.extended_metrics.monitored_network_keys,
-                        );
-
-                        if extended_metrics::validate_payload_size(
-                            &samples,
-                            config.max_payload_size_kb,
-                        )
-                        .unwrap_or(true)
-                        {
-                            if let Err(e) = client.send_resource_samples(&samples) {
-                                warn!("Extended sample send failed: {}", e);
-                            }
-                        } else {
-                            warn!("Extended sample payload exceeds server max payload size");
-                        }
-                    }
-                }
 
                 info!(
                     "Heartbeat sent successfully, next in {}s",
