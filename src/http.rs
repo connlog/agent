@@ -134,18 +134,25 @@ impl ApiClient {
             HeaderValue::from_str(&payload.config_version.to_string())
                 .context("Failed to create config version header")?,
         );
-        headers.insert(
-            "X-Hostname",
-            HeaderValue::from_str(&payload.hostname).context("Failed to create hostname header")?,
-        );
-        headers.insert(
-            "X-OS",
-            HeaderValue::from_str(&payload.os).context("Failed to create OS header")?,
-        );
-        headers.insert(
-            "X-Arch",
-            HeaderValue::from_str(&payload.arch).context("Failed to create arch header")?,
-        );
+        // Identity headers are opt-in. Only sent when CONNLOG_EXPOSE_SYSTEM_INFO=true.
+        if let Some(hostname) = &payload.hostname {
+            headers.insert(
+                "X-Hostname",
+                HeaderValue::from_str(hostname).context("Failed to create hostname header")?,
+            );
+        }
+        if let Some(os) = &payload.os {
+            headers.insert(
+                "X-OS",
+                HeaderValue::from_str(os).context("Failed to create OS header")?,
+            );
+        }
+        if let Some(arch) = &payload.arch {
+            headers.insert(
+                "X-Arch",
+                HeaderValue::from_str(arch).context("Failed to create arch header")?,
+            );
+        }
 
         if let Some(mid) = &self.machine_id {
             headers.insert(

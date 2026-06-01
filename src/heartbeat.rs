@@ -5,9 +5,16 @@ pub struct HeartbeatPayload {
     pub agent_version: String,
     pub protocol_version: u32,
     pub config_version: u32,
-    pub hostname: String,
-    pub os: String,
-    pub arch: String,
+    /// Hostname — only present when the agent opts in via
+    /// `CONNLOG_EXPOSE_SYSTEM_INFO=true`. `None` by default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    /// OS identifier (e.g. "linux") — only present when opted in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    /// CPU architecture (e.g. "x86_64") — only present when opted in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arch: Option<String>,
     pub uptime_seconds: u64,
     pub metrics: Metrics,
     #[serde(skip_serializing_if = "Option::is_none")]

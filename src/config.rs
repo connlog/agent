@@ -63,6 +63,20 @@ pub struct Config {
         global = true
     )]
     pub endpoint: Option<String>,
+
+    /// Opt-in: share hostname, OS type, and architecture with ConnLog.
+    ///
+    /// By default these fields are NOT transmitted (privacy-preserving default).
+    /// Set CONNLOG_EXPOSE_SYSTEM_INFO=true in /etc/connlog/agent.conf to enable.
+    /// This is intentionally off by default to comply with GDPR and similar
+    /// regulations — exposing system identity is the operator's explicit choice.
+    #[arg(
+        long = "expose-system-info",
+        env = "CONNLOG_EXPOSE_SYSTEM_INFO",
+        default_value_t = false,
+        hide = true
+    )]
+    pub expose_system_info: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]

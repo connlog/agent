@@ -349,13 +349,15 @@ fn main() -> Result<()> {
     )?;
 
     let endpoint = config.resolve_endpoint(DEFAULT_ENDPOINT);
+    let expose_system_info = config.expose_system_info;
 
-    run_agent_with_shutdown_inner(token, endpoint, Arc::new(AtomicBool::new(false)))
+    run_agent_with_shutdown_inner(token, endpoint, expose_system_info, Arc::new(AtomicBool::new(false)))
 }
 
 fn run_agent_with_shutdown_inner(
     token: String,
     endpoint: String,
+    expose_system_info: bool,
     stop: Arc<AtomicBool>,
 ) -> Result<()> {
     info!("ConnLog Agent v{} starting", AGENT_VERSION);
@@ -429,6 +431,7 @@ fn run_agent_with_shutdown_inner(
             &config,
             &mut collector,
             Some(&quick_action_polling),
+            expose_system_info,
         ) {
             Ok(response) => {
                 // Reset error counters on success
@@ -824,7 +827,7 @@ fn run_test_heartbeat(token: String, endpoint: String) -> Result<()> {
 
     println!("Endpoint: {endpoint}");
     println!("Sending one heartbeat...");
-    match send_heartbeat(&client, &cfg, &mut collector, None) {
+    match send_heartbeat(&client, &cfg, &mut collector, None, false) {
         Ok(result) => {
             println!("✓ Heartbeat accepted");
             println!("  config_outdated:        {}", result.config_outdated);
@@ -926,6 +929,7 @@ fn send_heartbeat(
     config: &AgentConfig,
     collector: &mut MetricsCollector,
     quick_action_polling: Option<&QuickActionPollState>,
+    expose_system_info: bool,
 ) -> Result<HeartbeatResult, ApiError> {
     // Collect system metrics. Isolated against panics inside `sysinfo` —
     // the heartbeat MUST keep going even if a metric source briefly explodes
@@ -939,9 +943,11 @@ fn send_heartbeat(
             );
             let (hostname, os, arch) = collector.identity();
             let mut fallback = metrics::SystemMetrics::unavailable();
-            fallback.hostname = hostname.to_string();
-            fallback.os = os.to_string();
-            fallback.arch = arch.to_string();
+            if expose_system_info {
+                fallback.hostname = hostname.to_string();
+                fallback.os = os.to_string();
+                fallback.arch = arch.to_string();
+            }
             fallback
         }
     };
@@ -1002,9 +1008,12 @@ fn send_heartbeat(
         agent_version: AGENT_VERSION.to_string(),
         protocol_version: PROTOCOL_VERSION,
         config_version: config.version,
-        hostname: metrics.hostname.clone(),
-        os: metrics.os.clone(),
-        arch: metrics.arch.clone(),
+        // Identity fields are opt-in via CONNLOG_EXPOSE_SYSTEM_INFO=true.
+        // Defaults to None (not transmitted) so operators must explicitly
+        // consent before any system-identifying data leaves the machine.
+        hostname: expose_system_info.then(|| metrics.hostname.clone()),
+        os: expose_system_info.then(|| metrics.os.clone()),
+        arch: expose_system_info.then(|| metrics.arch.clone()),
         uptime_seconds: metrics.uptime_seconds,
         metrics: payload_metrics,
         dev_mode: None,
