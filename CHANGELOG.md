@@ -6,6 +6,19 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 [`VERSIONING.md`](./VERSIONING.md) for the full policy. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.9.0] — 2026-06-01
+
+### Removed
+
+- Removed the extended metrics feature (disk resource discovery, network
+  interface discovery, inode metrics, per-interface traffic sampling).
+  The agent no longer collects or transmits resource discovery payloads or
+  metric samples to `/api/agents/resources/discovery` or
+  `/api/agents/resources/samples`. Basic CPU, memory, disk usage, and load
+  metrics via the standard heartbeat are unaffected.
+- Removed `ExtendedMetricsConfig` from `AgentConfig` (was opt-in via the
+  `extendedMetrics` heartbeat response field with `#[serde(default)]`).
+
 ## [1.8.5] — 2026-05-10
 
 ### Added
