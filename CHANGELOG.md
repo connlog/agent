@@ -6,6 +6,18 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 [`VERSIONING.md`](./VERSIONING.md) for the full policy. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.10.0] — 2026-06-02
+
+### Added
+
+- Hostname, OS type, and architecture are now **opt-in only**. By default these
+  fields are not transmitted to ConnLog (privacy-preserving default, GDPR
+  alignment). To share system identity, add
+  `CONNLOG_EXPOSE_SYSTEM_INFO=true` to `/etc/connlog/agent.conf` and restart
+  the agent service. This is intentionally an explicit operator choice; the
+  platform will clear any previously stored values on the next heartbeat from
+  an agent that does not send the headers.
+
 ## [1.9.0] — 2026-06-01
 
 ### Removed
