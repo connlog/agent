@@ -351,7 +351,12 @@ fn main() -> Result<()> {
     let endpoint = config.resolve_endpoint(DEFAULT_ENDPOINT);
     let expose_system_info = config.expose_system_info;
 
-    run_agent_with_shutdown_inner(token, endpoint, expose_system_info, Arc::new(AtomicBool::new(false)))
+    run_agent_with_shutdown_inner(
+        token,
+        endpoint,
+        expose_system_info,
+        Arc::new(AtomicBool::new(false)),
+    )
 }
 
 fn run_agent_with_shutdown_inner(
