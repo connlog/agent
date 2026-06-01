@@ -608,9 +608,9 @@ mod tests {
             agent_version: "1.0.0".to_string(),
             protocol_version: 1,
             config_version: 1,
-            hostname: "h".into(),
-            os: "linux".into(),
-            arch: "x86_64".into(),
+            hostname: Some("h".to_string()),
+            os: Some("linux".to_string()),
+            arch: Some("x86_64".to_string()),
             uptime_seconds: 0,
             metrics: Metrics {
                 cpu_percent: Some(0.0),

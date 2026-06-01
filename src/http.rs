@@ -516,9 +516,9 @@ mod tests {
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
             protocol_version: 1,
             config_version: 0,
-            hostname: "test-host".to_string(),
-            os: "linux".to_string(),
-            arch: "x86_64".to_string(),
+            hostname: Some("test-host".to_string()),
+            os: Some("linux".to_string()),
+            arch: Some("x86_64".to_string()),
             uptime_seconds: uptime,
             metrics: Metrics {
                 cpu_percent: Some(cpu),

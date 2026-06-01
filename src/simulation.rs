@@ -160,9 +160,9 @@ fn make_payload() -> HeartbeatPayload {
         agent_version: "1.2.0".into(),
         protocol_version: 1,
         config_version: 0,
-        hostname: "sim-host".into(),
-        os: "linux".into(),
-        arch: "x86_64".into(),
+        hostname: Some("sim-host".to_string()),
+        os: Some("linux".to_string()),
+        arch: Some("x86_64".to_string()),
         uptime_seconds: 1234,
         metrics: Metrics {
             cpu_percent: Some(12.34),
