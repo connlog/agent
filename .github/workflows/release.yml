@@ -33,7 +33,8 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install cross-compilation tools
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        # Pinned to a specific crates.io release — avoid fetching arbitrary git HEAD.
+        run: cargo install cross@0.2.5 --locked
 
       - name: Build release binary
         env:
@@ -42,12 +43,14 @@ jobs:
         run: cross build --release --target ${{ matrix.target }}
 
       - name: Package binary
+        # VERSION/OS/ARCH/TARGET are set as env vars to prevent script injection
+        # via a crafted tag name containing shell metacharacters.
+        env:
+          VERSION: ${{ github.ref_name }}
+          OS: ${{ matrix.os }}
+          ARCH: ${{ matrix.arch }}
+          TARGET: ${{ matrix.target }}
         run: |
-          VERSION="${{ github.ref_name }}"
-          OS="${{ matrix.os }}"
-          ARCH="${{ matrix.arch }}"
-          TARGET="${{ matrix.target }}"
-
           cd target/$TARGET/release
 
           TAR="connlog-agent-${VERSION}-${OS}-${ARCH}.tar.gz"
@@ -94,9 +97,10 @@ jobs:
       - name: Sign binaries
         env:
           CONNLOG_SIGNING_PRIVATE_KEY: ${{ secrets.CONNLOG_SIGNING_PRIVATE_KEY }}
+          VERSION: ${{ github.ref_name }}
         run: |
           # Sign each raw binary (not the tarballs — the agent updates with raw binaries)
-          for bin in artifacts/*/connlog-agent-${{ github.ref_name }}-*; do
+          for bin in artifacts/*/connlog-agent-${VERSION}-*; do
             # Skip tarballs and checksums
             [[ "$bin" == *.tar.gz ]] && continue
             [[ "$bin" == *.sha256 ]] && continue
@@ -112,8 +116,8 @@ jobs:
       - name: Create or update release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ github.ref_name }}
         run: |
-          VERSION="${{ github.ref_name }}"
           NOTES="## ConnLog Agent ${VERSION}
 
           ### Installation
