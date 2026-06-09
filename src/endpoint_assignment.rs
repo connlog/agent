@@ -472,7 +472,8 @@ mod tests {
     fn refresh_due_once_interval_elapses() {
         let mut s = state();
         let now = SystemTime::now();
-        s.assigned_endpoint_last_checked_at = Some(now - s.region_check_interval - Duration::from_secs(1));
+        s.assigned_endpoint_last_checked_at =
+            Some(now - s.region_check_interval - Duration::from_secs(1));
         assert!(s.needs_refresh(now));
     }
 
@@ -538,7 +539,10 @@ mod tests {
             false,
             &c,
         );
-        assert_eq!(s.resolve_heartbeat_endpoint(), s.default_heartbeat_endpoint());
+        assert_eq!(
+            s.resolve_heartbeat_endpoint(),
+            s.default_heartbeat_endpoint()
+        );
         assert_eq!(
             s.region_code(),
             None,

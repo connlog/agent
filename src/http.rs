@@ -351,8 +351,8 @@ impl ApiClient {
 
         let envelope: Envelope<EndpointAssignmentResponse> = serde_json::from_str(&response_text)
             .with_context(|| {
-                format!("Failed to parse endpoint assignment envelope: {response_text}")
-            })?;
+            format!("Failed to parse endpoint assignment envelope: {response_text}")
+        })?;
 
         if !envelope.ok {
             anyhow::bail!(
@@ -362,9 +362,7 @@ impl ApiClient {
         }
 
         envelope.data.ok_or_else(|| {
-            anyhow::anyhow!(
-                "Endpoint assignment envelope missing `data` field: {response_text}"
-            )
+            anyhow::anyhow!("Endpoint assignment envelope missing `data` field: {response_text}")
         })
     }
 
