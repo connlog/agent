@@ -6,6 +6,25 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 [`VERSIONING.md`](./VERSIONING.md) for the full policy. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.11.0] — 2026-06-07
+
+### Added
+
+- Agents now ask the platform which heartbeat endpoint to use via
+  `GET /api/agents/endpoint-assignment` (V1 endpoint assignment). On startup,
+  every ~24h thereafter, and immediately after 3 consecutive transport-level
+  heartbeat failures, the agent fetches an assignment, validates it against a
+  trusted-domain allowlist (HTTPS, `connlog.com`/subdomains or
+  `CONNLOG_ALLOWED_ENDPOINT_DOMAINS`, no localhost/private networks outside
+  debug builds), and — only if it passes — repoints heartbeats at it.
+  Anything that fails validation is discarded and the agent falls back to its
+  default platform heartbeat URL. This lays the groundwork for migrating to
+  regional heartbeat servers (e.g. `https://eu-1.connlog.com`) with **zero**
+  further agent changes. Fully backwards compatible: with no regions
+  configured on the platform (the only state today), every agent behaves
+  exactly as before. See `docs/agent-architecture.md` → "Endpoint assignment
+  flow (V1)".
+
 ## [1.10.0] — 2026-06-02
 
 ### Added

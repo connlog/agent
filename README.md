@@ -48,6 +48,15 @@ export CONNLOG_TOKEN=agent_xxxxxxxxxxxx
 connlog-agent register
 ```
 
+### Environment variables
+
+| Variable                          | Description                                                                                                                                                                          |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `CONNLOG_TOKEN`                   | Agent auth token (`agent_...`), alternative to `--token`                                                                                                                            |
+| `CONNLOG_PLATFORM_URL`            | Override the control-plane URL (defaults to `https://connlog.com`); mainly for self-hosted deployments                                                                              |
+| `CONNLOG_EXPOSE_SYSTEM_INFO`      | Set to `true` to opt in to sending hostname/OS/arch with heartbeats (off by default)                                                                                                |
+| `CONNLOG_ALLOWED_ENDPOINT_DOMAINS`| Comma-separated extra domains the agent will trust for heartbeat **endpoint assignments** (see below), in addition to `connlog.com`; only relevant for self-hosted/regional setups |
+
 ## Management
 
 ```bash
@@ -164,8 +173,14 @@ arbitrary shell commands or command arguments.
 2. Platform responds with the latest config (metric toggles, intervals, payload limits)
 3. Agent polls Quick Action requests on its own short interval when local actions are enabled
 4. Agent applies config changes without restart
-5. Self-updates refresh the systemd unit from the new binary before the service restarts
-6. If the platform marks the agent for uninstall (HTTP 410), the agent triggers a self-cleanup via systemd `ExecStopPost`
+5. On startup, then roughly once a day (or sooner after repeated heartbeat
+   failures), the agent asks the platform which heartbeat endpoint to use and
+   switches to it if — and only if — it's a trusted, validated HTTPS URL; this
+   lets ConnLog migrate heartbeat traffic to regional servers later with no
+   agent-side changes (today there are no regions configured, so this is a
+   no-op and every agent keeps using the platform's own URL)
+6. Self-updates refresh the systemd unit from the new binary before the service restarts
+7. If the platform marks the agent for uninstall (HTTP 410), the agent triggers a self-cleanup via systemd `ExecStopPost`
 
 ### Collected metrics
 

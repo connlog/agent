@@ -25,6 +25,8 @@ src/
   main.rs         — CLI parsing, main loop, back-off/retry, heartbeat send
   config.rs       — Clap Config; reads CONNLOG_TOKEN, CONNLOG_PLATFORM_URL
   defaults.rs     — Shared constants (endpoint, backoff durations)
+  endpoint_assignment.rs — V1 heartbeat endpoint assignment: fetch, validate
+                    (trusted-domain allowlist), apply, refresh cadence
   heartbeat.rs    — Wire types: HeartbeatPayload, HeartbeatResponse, AgentConfig
   http.rs         — ApiClient (heartbeat POST, config GET); encode_heartbeat
   identity.rs     — X-Machine-Id derivation (SHA-256 of /etc/machine-id)
@@ -83,8 +85,67 @@ On error:
   ├─ 401 Unauthorized  → linear backoff; self-uninstall after 50 consecutive
   ├─ 410 Gone          → immediate self-uninstall
   ├─ 423 Locked        → 5-minute backoff; do NOT uninstall
-  └─ Other             → exponential backoff (30s → 3600s cap)
+  └─ Other             → exponential backoff (30s → 3600s cap); counts toward
+                          endpoint-reassignment (see below)
 ```
+
+---
+
+## Endpoint assignment flow (V1)
+
+The agent always talks to a single **control-plane** URL (`--endpoint` /
+`CONNLOG_PLATFORM_URL` / `DEFAULT_ENDPOINT`) for config, quick actions, and
+the assignment lookup itself. Heartbeats are the one thing that can be
+repointed at a different (regional) server — e.g. a future
+`https://eu-1.connlog.com` — without any other agent behaviour changing. This
+lets ConnLog migrate heartbeat traffic to regional infrastructure later with
+**zero agent changes**: just rows in the platform's region table.
+
+```
+src/endpoint_assignment.rs — EndpointAssignmentState, validate_assigned_endpoint
+
+run_agent_with_shutdown_inner()
+  ├─ EndpointAssignmentState::new(&endpoint) — starts on the default
+  │    {endpoint}/api/agents/heartbeat, identical to pre-V1 behaviour
+  └─ main loop, every iteration:
+       ├─ refresh_if_needed()  — cheap no-op unless a refresh is due:
+       │    • first run
+       │    • ~24h since the last check (region_check_interval,
+       │      server-controlled via refreshAfterSeconds, clamped 5min..7days)
+       │    • 3 consecutive transport-level heartbeat failures
+       │      (NOT 401/410/423 — those are account-level, reassigning
+       │      wouldn't help)
+       │    └─ on refresh: GET /api/agents/endpoint-assignment (bearer auth,
+       │       same as every other agent endpoint) → validate → apply
+       │       (validated URL is pushed into ApiClient via
+       │       set_heartbeat_endpoint, so send_heartbeat picks it up
+       │       automatically — no signature changes needed)
+       └─ note_heartbeat_outcome(success) — feeds the failure counter above
+```
+
+**Trust model** — `validate_assigned_endpoint` only accepts assignments that
+are:
+  - served over **HTTPS** (outside debug builds)
+  - on a **trusted domain**: `connlog.com` (and subdomains, e.g.
+    `eu-1.connlog.com`) by default, optionally extended via
+    `CONNLOG_ALLOWED_ENDPOINT_DOMAINS` for self-hosted deployments
+  - **not** localhost / loopback / private / link-local / unique-local
+    (outside debug builds, where `--endpoint`-style overrides are allowed —
+    same `cfg!(debug_assertions)` gate as the existing `--endpoint` flag)
+
+Anything that fails validation is logged and discarded — the agent reverts to
+(or stays on) `default_heartbeat_url` (`{control_url}/api/agents/heartbeat`).
+A compromised or buggy assignment response can therefore only ever redirect
+*heartbeat* traffic within the trusted domain set; it can never inject an
+arbitrary endpoint, change agent behaviour, or grant any new capability.
+
+Today there is no load balancer / regional infrastructure deployed — the
+platform has no `HeartbeatEndpointRegion` rows, so every agent simply gets
+`regionCode: null` back and keeps using the platform's own heartbeat URL.
+
+Logging is intentionally sparse — only on actual state changes, not every
+heartbeat: `Endpoint assignment fetched/changed/failed` and `Fallback
+endpoint in use`.
 
 ---
 
@@ -294,3 +355,10 @@ In rough priority order:
    Any change to field offsets or encoding must be coordinated with
    `../connlog-platform/src/app/api/agents/heartbeat/route.ts` in the same
    commit and must bump `PROTOCOL_VERSION`.
+6. **Endpoint assignment trust boundary** — `validate_assigned_endpoint` in
+   `endpoint_assignment.rs` is the only thing standing between "the platform
+   tells us where to heartbeat" and "an attacker tells us where to heartbeat".
+   It must keep rejecting non-HTTPS, untrusted-domain, and
+   localhost/private-network URLs outside debug builds. Loosening it (e.g.
+   widening `TRUSTED_ENDPOINT_DOMAINS`) requires the same scrutiny as a new
+   trusted root of authority.

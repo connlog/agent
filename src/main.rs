@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod action_cli;
 mod config;
 mod defaults;
+mod endpoint_assignment;
 mod heartbeat;
 mod http;
 mod identity;
@@ -24,6 +25,7 @@ mod simulation;
 use action_cli::run_action_command;
 use config::{AgentCommand, Config, DiagnosticCommand};
 use defaults::{CONFIG_FETCH_RETRY_DELAY_SECS, DEFAULT_ENDPOINT, DISABLED_BACKOFF_SECS};
+use endpoint_assignment::EndpointAssignmentState;
 use heartbeat::{AgentConfig, HeartbeatPayload, QuickActionsConfig};
 use http::{ApiClient, ApiError, QuickActionPollingReport};
 use metrics::MetricsCollector;
@@ -380,6 +382,12 @@ fn run_agent_with_shutdown_inner(
         std::process::exit(1);
     }
 
+    let mut endpoint_assignment = EndpointAssignmentState::new(&endpoint);
+    info!(
+        "Heartbeat endpoint: {} (assignment refreshed at most every {}h, or sooner on repeated failures)",
+        endpoint_assignment.resolve_heartbeat_endpoint(),
+        endpoint_assignment::DEFAULT_REGION_CHECK_INTERVAL_SECS / 3600,
+    );
     let client = ApiClient::new(endpoint, token).context("Failed to initialize HTTP client")?;
 
     // Initialize reusable metrics collector (avoids re-creating sysinfo each heartbeat)
@@ -431,6 +439,13 @@ fn run_agent_with_shutdown_inner(
             info!("Shutdown requested (service stop) — exiting agent loop");
             return Ok(());
         }
+
+        // V1 endpoint assignment: cheap no-op unless a refresh is actually
+        // due (first run, ~24h elapsed, or repeated heartbeat failures —
+        // see `EndpointAssignmentState::needs_refresh`). Repoints
+        // `client`'s heartbeat target in place via `set_heartbeat_endpoint`.
+        endpoint_assignment.refresh_if_needed(&client, cfg!(debug_assertions));
+
         match send_heartbeat(
             &client,
             &config,
@@ -442,6 +457,7 @@ fn run_agent_with_shutdown_inner(
                 // Reset error counters on success
                 consecutive_unauthorized = 0;
                 consecutive_errors = 0;
+                endpoint_assignment.note_heartbeat_outcome(true);
 
                 if first_heartbeat {
                     info!("✓ Successfully registered with ConnLog");
@@ -611,6 +627,11 @@ fn run_agent_with_shutdown_inner(
             }
             Err(e) => {
                 consecutive_errors += 1;
+                // Transport-level failure (network/HTTP) — the heartbeat
+                // *endpoint* may be unreachable, so this (unlike Unauthorized/
+                // Decommissioned/Disabled, which are account-level) counts
+                // toward forcing a fresh endpoint assignment.
+                endpoint_assignment.note_heartbeat_outcome(false);
                 // Exponential backoff: 30, 60, 120, 240, ... capped at 3600s
                 let backoff = std::cmp::min(
                     30 * 2u64.pow(consecutive_errors.saturating_sub(1).min(7)),

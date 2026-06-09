@@ -2,8 +2,10 @@ use anyhow::{Context, Result};
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::StatusCode;
+use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::endpoint_assignment::EndpointAssignmentResponse;
 use crate::heartbeat::{AgentConfig, HeartbeatPayload, HeartbeatResponse};
 use crate::quick_actions::{
     QuickActionRequest, QuickActionResultPayload, QuickActionsManifestPayload,
@@ -54,6 +56,14 @@ pub struct ApiClient {
     /// source is available (e.g. an unsupported OS); platform falls back to
     /// hostname binding in that case.
     machine_id: Option<String>,
+    /// Where `send_heartbeat` currently POSTs to. Defaults to
+    /// `{base_url}/api/agents/heartbeat` and can be repointed at a regional
+    /// endpoint via `set_heartbeat_endpoint` once the platform hands out an
+    /// assignment (see `endpoint_assignment`). Interior mutability lets the
+    /// loop hold a single shared `&ApiClient` without threading the resolved
+    /// URL through every `send_heartbeat` call site (including the test
+    /// harnesses in `simulation.rs`, whose signatures must stay stable).
+    heartbeat_url: Mutex<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -95,12 +105,33 @@ impl ApiClient {
             .build()
             .context("Failed to create HTTP client")?;
 
+        let heartbeat_url = format!("{}/api/agents/heartbeat", base_url.trim_end_matches('/'));
+
         Ok(Self {
             client,
             base_url,
             token,
             machine_id: crate::identity::machine_id(),
+            heartbeat_url: Mutex::new(heartbeat_url),
         })
+    }
+
+    /// Repoint `send_heartbeat` at a new (already-validated) URL. Called by
+    /// `EndpointAssignmentState` when it applies a trusted regional
+    /// assignment, or reverts to the default after a failed/untrusted fetch.
+    pub(crate) fn set_heartbeat_endpoint(&self, url: String) {
+        let mut guard = self
+            .heartbeat_url
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = url;
+    }
+
+    fn heartbeat_url(&self) -> String {
+        self.heartbeat_url
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Send heartbeat using the binary wire protocol (v1, 32-byte LE frame).
@@ -110,7 +141,7 @@ impl ApiClient {
         payload: &HeartbeatPayload,
         quick_action_polling: Option<&QuickActionPollingReport>,
     ) -> Result<HeartbeatResponse, ApiError> {
-        let url = format!("{}/api/agents/heartbeat", self.base_url);
+        let url = self.heartbeat_url();
 
         let binary_payload = encode_heartbeat(payload);
 
@@ -269,6 +300,71 @@ impl ApiClient {
 
         envelope.data.ok_or_else(|| {
             anyhow::anyhow!("Config envelope missing `data` field: {}", response_text)
+        })
+    }
+
+    /// `FetchEndpointAssignment` — ask the control plane which heartbeat
+    /// endpoint this agent should use. Authenticated the same way as every
+    /// other agent endpoint (bearer token); the platform decides what to
+    /// hand back, the agent decides whether to trust it
+    /// (`endpoint_assignment::validate_assigned_endpoint`).
+    pub(crate) fn fetch_endpoint_assignment(&self) -> Result<EndpointAssignmentResponse> {
+        let url = format!("{}/api/agents/endpoint-assignment", self.base_url);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let auth_value = format!("Bearer {}", self.token);
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&auth_value).context("Failed to create authorization header")?,
+        );
+
+        let response = self
+            .client
+            .get(&url)
+            .headers(headers)
+            .send()
+            .context("Failed to fetch endpoint assignment")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response
+                .text()
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            anyhow::bail!(
+                "Endpoint assignment fetch failed with status {}: {}",
+                status,
+                error_text
+            );
+        }
+
+        let response_text = response
+            .text()
+            .context("Failed to read endpoint assignment response body")?;
+
+        #[derive(serde::Deserialize)]
+        struct Envelope<T> {
+            ok: bool,
+            data: Option<T>,
+            error: Option<String>,
+        }
+
+        let envelope: Envelope<EndpointAssignmentResponse> = serde_json::from_str(&response_text)
+            .with_context(|| {
+                format!("Failed to parse endpoint assignment envelope: {response_text}")
+            })?;
+
+        if !envelope.ok {
+            anyhow::bail!(
+                "Endpoint assignment response not ok: {}",
+                envelope.error.unwrap_or_else(|| response_text.clone())
+            );
+        }
+
+        envelope.data.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Endpoint assignment envelope missing `data` field: {response_text}"
+            )
         })
     }
 
