@@ -84,14 +84,20 @@ impl fmt::Display for EndpointValidationError {
             Self::InsecureScheme => write!(f, "must use https"),
             Self::UntrustedDomain(host) => write!(f, "untrusted domain '{host}'"),
             Self::PrivateNetwork(host) => {
-                write!(f, "private/local host '{host}' not allowed outside dev mode")
+                write!(
+                    f,
+                    "private/local host '{host}' not allowed outside dev mode"
+                )
             }
         }
     }
 }
 
 fn allowed_endpoint_domains() -> Vec<String> {
-    let mut domains: Vec<String> = TRUSTED_ENDPOINT_DOMAINS.iter().map(|s| s.to_string()).collect();
+    let mut domains: Vec<String> = TRUSTED_ENDPOINT_DOMAINS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     if let Ok(extra) = std::env::var(ALLOWED_ENDPOINT_DOMAINS_ENV) {
         for raw in extra.split(',') {
             let domain = raw.trim().trim_start_matches('.').to_ascii_lowercase();
@@ -119,7 +125,8 @@ fn is_private_or_local_host(host: &str) -> bool {
             v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
         }
         Ok(IpAddr::V6(v6)) => {
-            v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
+            v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xfe00) == 0xfc00
+            // fc00::/7 unique-local
         }
         Err(_) => false,
     }
@@ -158,7 +165,10 @@ pub(crate) fn validate_assigned_endpoint(
         return Err(EndpointValidationError::PrivateNetwork(host));
     }
     let domains = allowed_endpoint_domains();
-    if !domains.iter().any(|domain| host_matches_domain(&host, domain)) {
+    if !domains
+        .iter()
+        .any(|domain| host_matches_domain(&host, domain))
+    {
         return Err(EndpointValidationError::UntrustedDomain(host));
     }
 
@@ -203,10 +213,8 @@ impl EndpointAssignmentState {
     /// assignment — exactly what a pre-V1 agent would do, so a brand new
     /// agent behaves identically until its first successful assignment fetch.
     pub fn new(control_url: &str) -> Self {
-        let default_heartbeat_url = format!(
-            "{}/api/agents/heartbeat",
-            control_url.trim_end_matches('/')
-        );
+        let default_heartbeat_url =
+            format!("{}/api/agents/heartbeat", control_url.trim_end_matches('/'));
         Self {
             heartbeat_url: default_heartbeat_url.clone(),
             default_heartbeat_url,
@@ -316,7 +324,10 @@ impl EndpointAssignmentState {
             MAX_REGION_CHECK_INTERVAL_SECS,
         ));
 
-        let (resolved, region_code) = match validate_assigned_endpoint(&response.heartbeat_url, dev_mode) {
+        let (resolved, region_code) = match validate_assigned_endpoint(
+            &response.heartbeat_url,
+            dev_mode,
+        ) {
             Ok(url) => (url.to_string(), response.region_code.clone()),
             Err(e) => {
                 warn!("Endpoint assignment failed: server returned an untrusted endpoint ({e}); ignoring it");
@@ -353,14 +364,17 @@ mod tests {
 
     #[test]
     fn accepts_trusted_https_subdomain() {
-        let url = validate_assigned_endpoint("https://eu-1.connlog.com/api/agents/heartbeat", false)
-            .expect("trusted ConnLog subdomain must be accepted");
+        let url =
+            validate_assigned_endpoint("https://eu-1.connlog.com/api/agents/heartbeat", false)
+                .expect("trusted ConnLog subdomain must be accepted");
         assert_eq!(url.host_str(), Some("eu-1.connlog.com"));
     }
 
     #[test]
     fn accepts_trusted_apex_domain() {
-        assert!(validate_assigned_endpoint("https://connlog.com/api/agents/heartbeat", false).is_ok());
+        assert!(
+            validate_assigned_endpoint("https://connlog.com/api/agents/heartbeat", false).is_ok()
+        );
     }
 
     #[test]
@@ -381,9 +395,8 @@ mod tests {
     #[test]
     fn rejects_lookalike_domain() {
         // "notconnlog.com" must NOT match via a naive `.ends_with("connlog.com")`.
-        let err =
-            validate_assigned_endpoint("https://notconnlog.com/api/agents/heartbeat", false)
-                .unwrap_err();
+        let err = validate_assigned_endpoint("https://notconnlog.com/api/agents/heartbeat", false)
+            .unwrap_err();
         assert!(matches!(err, EndpointValidationError::UntrustedDomain(_)));
     }
 
@@ -400,7 +413,8 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    EndpointValidationError::PrivateNetwork(_) | EndpointValidationError::UntrustedDomain(_)
+                    EndpointValidationError::PrivateNetwork(_)
+                        | EndpointValidationError::UntrustedDomain(_)
                 ),
                 "expected {url} to be rejected as private/untrusted, got {err:?}"
             );
