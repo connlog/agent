@@ -165,25 +165,23 @@ impl ApiClient {
             HeaderValue::from_str(&payload.config_version.to_string())
                 .context("Failed to create config version header")?,
         );
-        // Identity headers are opt-in. Only sent when CONNLOG_EXPOSE_SYSTEM_INFO=true.
+        // Hostname is opt-in. Only sent when CONNLOG_EXPOSE_SYSTEM_INFO=true.
         if let Some(hostname) = &payload.hostname {
             headers.insert(
                 "X-Hostname",
                 HeaderValue::from_str(hostname).context("Failed to create hostname header")?,
             );
         }
-        if let Some(os) = &payload.os {
-            headers.insert(
-                "X-OS",
-                HeaderValue::from_str(os).context("Failed to create OS header")?,
-            );
-        }
-        if let Some(arch) = &payload.arch {
-            headers.insert(
-                "X-Arch",
-                HeaderValue::from_str(arch).context("Failed to create arch header")?,
-            );
-        }
+        // OS/arch are always sent so the platform can select the correct
+        // self-update binary, regardless of hostname opt-in.
+        headers.insert(
+            "X-OS",
+            HeaderValue::from_str(&payload.os).context("Failed to create OS header")?,
+        );
+        headers.insert(
+            "X-Arch",
+            HeaderValue::from_str(&payload.arch).context("Failed to create arch header")?,
+        );
 
         if let Some(mid) = &self.machine_id {
             headers.insert(
@@ -611,8 +609,8 @@ mod tests {
             protocol_version: 1,
             config_version: 0,
             hostname: Some("test-host".to_string()),
-            os: Some("linux".to_string()),
-            arch: Some("x86_64".to_string()),
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
             uptime_seconds: uptime,
             metrics: Metrics {
                 cpu_percent: Some(cpu),

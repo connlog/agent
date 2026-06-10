@@ -161,8 +161,8 @@ fn make_payload() -> HeartbeatPayload {
         protocol_version: 1,
         config_version: 0,
         hostname: Some("sim-host".to_string()),
-        os: Some("linux".to_string()),
-        arch: Some("x86_64".to_string()),
+        os: "linux".to_string(),
+        arch: "x86_64".to_string(),
         uptime_seconds: 1234,
         metrics: Metrics {
             cpu_percent: Some(12.34),
@@ -232,6 +232,27 @@ fn heartbeat_200_parses_response() {
 
     // Binary frame is 32 bytes exactly (protocol v1).
     assert_eq!(req.body.len(), 32, "v2 wire frame must be exactly 32 bytes");
+}
+
+/// When the agent has not opted in to `CONNLOG_EXPOSE_SYSTEM_INFO`,
+/// `X-Hostname` must be omitted — but `X-OS`/`X-Arch` must still be sent so
+/// the platform can select the right self-update binary.
+#[test]
+fn heartbeat_omits_hostname_but_sends_os_arch_when_not_opted_in() {
+    let body =
+        br#"{"ok":true,"server_time":"2026-04-30T00:00:00Z","expected_interval_seconds":60}"#
+            .to_vec();
+    let (base, rx) = one_shot_server("200 OK", body);
+
+    let client = ApiClient::new(base, "test-token".into()).expect("ApiClient::new");
+    let mut payload = make_payload();
+    payload.hostname = None;
+    client.send_heartbeat(&payload, None).expect("heartbeat ok");
+
+    let req = recv_request(&rx);
+    assert_eq!(req.header("X-Hostname"), None);
+    assert_eq!(req.header("X-OS"), Some("linux"));
+    assert_eq!(req.header("X-Arch"), Some("x86_64"));
 }
 
 #[test]

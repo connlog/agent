@@ -969,10 +969,12 @@ fn send_heartbeat(
             );
             let (hostname, os, arch) = collector.identity();
             let mut fallback = metrics::SystemMetrics::unavailable();
+            // os/arch are always sent (needed for self-update binary
+            // selection); hostname remains opt-in.
+            fallback.os = os.to_string();
+            fallback.arch = arch.to_string();
             if expose_system_info {
                 fallback.hostname = hostname.to_string();
-                fallback.os = os.to_string();
-                fallback.arch = arch.to_string();
             }
             fallback
         }
@@ -1034,12 +1036,15 @@ fn send_heartbeat(
         agent_version: AGENT_VERSION.to_string(),
         protocol_version: PROTOCOL_VERSION,
         config_version: config.version,
-        // Identity fields are opt-in via CONNLOG_EXPOSE_SYSTEM_INFO=true.
-        // Defaults to None (not transmitted) so operators must explicitly
-        // consent before any system-identifying data leaves the machine.
+        // Hostname is opt-in via CONNLOG_EXPOSE_SYSTEM_INFO=true. Defaults to
+        // None (not transmitted) so operators must explicitly consent before
+        // the machine's hostname leaves the host.
         hostname: expose_system_info.then(|| metrics.hostname.clone()),
-        os: expose_system_info.then(|| metrics.os.clone()),
-        arch: expose_system_info.then(|| metrics.arch.clone()),
+        // OS/arch (e.g. "linux"/"x86_64") are always sent regardless of the
+        // opt-in above — the platform needs them to select the correct
+        // self-update binary, and they don't identify the machine/operator.
+        os: metrics.os.clone(),
+        arch: metrics.arch.clone(),
         uptime_seconds: metrics.uptime_seconds,
         metrics: payload_metrics,
         dev_mode: None,

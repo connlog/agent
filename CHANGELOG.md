@@ -6,6 +6,20 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 [`VERSIONING.md`](./VERSIONING.md) for the full policy. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.12.0] — 2026-06-10
+
+### Changed
+
+- The agent now always sends `X-OS`/`X-Arch` headers with every heartbeat,
+  regardless of the `CONNLOG_EXPOSE_SYSTEM_INFO` opt-in. These are generic
+  platform descriptors (e.g. "linux"/"x86_64") needed so the platform can
+  select the correct self-update binary; they are not machine-identifying.
+  `CONNLOG_EXPOSE_SYSTEM_INFO` now governs `X-Hostname` only — the platform
+  does not persist or display OS/architecture unless hostname sharing is
+  also enabled. Previously, agents that had not opted in to
+  `CONNLOG_EXPOSE_SYSTEM_INFO` could never receive auto-updates because the
+  platform had no way to pick a matching binary.
+
 ## [1.11.0] — 2026-06-07
 
 ### Added

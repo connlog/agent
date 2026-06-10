@@ -64,12 +64,20 @@ pub struct Config {
     )]
     pub endpoint: Option<String>,
 
-    /// Opt-in: share hostname, OS type, and architecture with ConnLog.
+    /// Opt-in: share this machine's hostname with ConnLog.
     ///
-    /// By default these fields are NOT transmitted (privacy-preserving default).
+    /// By default the hostname is NOT transmitted (privacy-preserving default).
     /// Set CONNLOG_EXPOSE_SYSTEM_INFO=true in /etc/connlog/agent.conf to enable.
     /// This is intentionally off by default to comply with GDPR and similar
-    /// regulations — exposing system identity is the operator's explicit choice.
+    /// regulations — exposing the machine's identity is the operator's
+    /// explicit choice.
+    ///
+    /// Note: OS and CPU architecture (e.g. "linux"/"x86_64") are always sent
+    /// with every heartbeat regardless of this setting. The platform needs
+    /// them to pick the correct self-update binary for this host. These are
+    /// generic platform descriptors, not machine-identifying, and the
+    /// platform does not store or display them unless hostname sharing is
+    /// also enabled.
     #[arg(
         long = "expose-system-info",
         env = "CONNLOG_EXPOSE_SYSTEM_INFO",

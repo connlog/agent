@@ -6,15 +6,18 @@ pub struct HeartbeatPayload {
     pub protocol_version: u32,
     pub config_version: u32,
     /// Hostname — only present when the agent opts in via
-    /// `CONNLOG_EXPOSE_SYSTEM_INFO=true`. `None` by default.
+    /// `CONNLOG_EXPOSE_SYSTEM_INFO=true`. `None` by default. This is the only
+    /// field gated by that flag: it can identify the machine/operator.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
-    /// OS identifier (e.g. "linux") — only present when opted in.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub os: Option<String>,
-    /// CPU architecture (e.g. "x86_64") — only present when opted in.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub arch: Option<String>,
+    /// OS identifier (e.g. "linux"). Always sent — the platform needs this
+    /// to pick the right self-update binary. Not gated by
+    /// `CONNLOG_EXPOSE_SYSTEM_INFO`: a generic platform descriptor, not
+    /// machine-identifying. The platform only persists/displays it when
+    /// hostname sharing is also enabled.
+    pub os: String,
+    /// CPU architecture (e.g. "x86_64"). Always sent, same rationale as `os`.
+    pub arch: String,
     pub uptime_seconds: u64,
     pub metrics: Metrics,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -609,8 +612,8 @@ mod tests {
             protocol_version: 1,
             config_version: 1,
             hostname: Some("h".to_string()),
-            os: Some("linux".to_string()),
-            arch: Some("x86_64".to_string()),
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
             uptime_seconds: 0,
             metrics: Metrics {
                 cpu_percent: Some(0.0),
