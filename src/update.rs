@@ -9,6 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
 use crate::heartbeat::UpdateInfo;
+use crate::http::{is_transient_http_status, transient_retry_delay};
 use crate::install;
 use crate::platform::{INSTALLED_BINARY, STAGED_BINARY, UPDATE_MARKER};
 
@@ -167,16 +168,56 @@ fn require_https(url: &str, what: &str) -> Result<()> {
     Ok(())
 }
 
+const TRANSIENT_DOWNLOAD_ATTEMPTS: u32 = 3;
+
+/// GET with short retries on gateway/transient failures. Used for update
+/// artifacts only — heartbeats have their own retry path in `http.rs`.
+fn get_with_transient_retries(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    what: &str,
+) -> Result<reqwest::blocking::Response> {
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 1..=TRANSIENT_DOWNLOAD_ATTEMPTS {
+        match client.get(url).send() {
+            Ok(response) => {
+                let status = response.status();
+                if status.is_success() {
+                    return Ok(response);
+                }
+                if is_transient_http_status(status.as_u16())
+                    && attempt < TRANSIENT_DOWNLOAD_ATTEMPTS
+                {
+                    warn!(
+                        "Transient HTTP {} while downloading {} (attempt {}/{})",
+                        status, what, attempt, TRANSIENT_DOWNLOAD_ATTEMPTS
+                    );
+                    std::thread::sleep(transient_retry_delay(attempt));
+                    continue;
+                }
+                return response
+                    .error_for_status()
+                    .with_context(|| format!("{} download returned HTTP error", what));
+            }
+            Err(err) if attempt < TRANSIENT_DOWNLOAD_ATTEMPTS => {
+                warn!(
+                    "Failed to download {} (attempt {}/{}): {}",
+                    what, attempt, TRANSIENT_DOWNLOAD_ATTEMPTS, err
+                );
+                std::thread::sleep(transient_retry_delay(attempt));
+                last_err = Some(err.into());
+            }
+            Err(err) => return Err(err).context(format!("Failed to download {}", what)),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Failed to download {}", what)))
+}
+
 /// Download binary bytes from a URL. Uses a long timeout for large binaries.
 fn download_binary(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<u8>> {
     require_https(url, "agent binary")?;
 
-    let mut response = client
-        .get(url)
-        .send()
-        .context("Failed to download binary")?
-        .error_for_status()
-        .context("Binary download returned HTTP error")?;
+    let mut response = get_with_transient_retries(client, url, "agent binary")?;
 
     // Reject up-front when the server tells us the body is too big. This is
     // advisory (Content-Length can be missing or lie) — the streaming read
@@ -216,12 +257,7 @@ fn download_binary(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<
 fn download_signature(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<u8>> {
     require_https(url, "update signature")?;
 
-    let sig = client
-        .get(url)
-        .send()
-        .context("Failed to download update signature")?
-        .error_for_status()
-        .context("Signature download returned HTTP error")?
+    let sig = get_with_transient_retries(client, url, "update signature")?
         .bytes()
         .context("Failed to read signature body")?
         .to_vec();
@@ -241,12 +277,7 @@ fn download_signature(client: &reqwest::blocking::Client, url: &str) -> Result<V
 fn download_sha256(client: &reqwest::blocking::Client, url: &str) -> Result<String> {
     require_https(url, "checksum file")?;
 
-    let mut response = client
-        .get(url)
-        .send()
-        .context("Failed to download checksum file")?
-        .error_for_status()
-        .context("Checksum download returned HTTP error")?;
+    let mut response = get_with_transient_retries(client, url, "checksum file")?;
 
     // Bound the read so a malformed/oversized checksum file can't blow up RAM.
     let mut buf = Vec::new();

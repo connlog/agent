@@ -48,6 +48,30 @@ impl From<anyhow::Error> for ApiError {
     }
 }
 
+impl ApiError {
+    /// Transport-level failures and gateway errors that are expected during
+    /// brief platform deploys or load-balancer blips.
+    pub(crate) fn is_transient(&self) -> bool {
+        match self {
+            ApiError::HttpError { status, .. } => is_transient_http_status(*status),
+            ApiError::Other(_) => true,
+            _ => false,
+        }
+    }
+}
+
+/// HTTP statuses that usually mean "try again in a moment" rather than a
+/// permanent rejection. Mirrors the platform dashboard client's retry policy.
+pub(crate) fn is_transient_http_status(status: u16) -> bool {
+    (502..=504).contains(&status)
+}
+
+const TRANSIENT_HTTP_ATTEMPTS: u32 = 3;
+
+pub(crate) fn transient_retry_delay(attempt: u32) -> Duration {
+    Duration::from_millis(250 * 2u64.pow(attempt.saturating_sub(1).min(2)))
+}
+
 pub struct ApiClient {
     client: Client,
     base_url: String,
@@ -137,6 +161,29 @@ impl ApiClient {
     /// Send heartbeat using the binary wire protocol (v1, 32-byte LE frame).
     /// This is the only supported transport — there is no JSON fallback.
     pub fn send_heartbeat(
+        &self,
+        payload: &HeartbeatPayload,
+        quick_action_polling: Option<&QuickActionPollingReport>,
+    ) -> Result<HeartbeatResponse, ApiError> {
+        let mut last_err = None;
+        for attempt in 1..=TRANSIENT_HTTP_ATTEMPTS {
+            match self.send_heartbeat_once(payload, quick_action_polling) {
+                Ok(response) => return Ok(response),
+                Err(err) => {
+                    let retryable = err.is_transient() && attempt < TRANSIENT_HTTP_ATTEMPTS;
+                    if retryable {
+                        std::thread::sleep(transient_retry_delay(attempt));
+                        last_err = Some(err);
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        Err(last_err.expect("TRANSIENT_HTTP_ATTEMPTS must be >= 1"))
+    }
+
+    fn send_heartbeat_once(
         &self,
         payload: &HeartbeatPayload,
         quick_action_polling: Option<&QuickActionPollingReport>,
@@ -731,6 +778,29 @@ mod tests {
         let cpu_max_x100 = u16::from_le_bytes(frame[10..12].try_into().unwrap());
         assert_eq!(cpu_x100, CPU_UNAVAILABLE_X100);
         assert_eq!(cpu_max_x100, CPU_UNAVAILABLE_X100);
+    }
+
+    #[test]
+    fn test_transient_http_status_codes() {
+        assert!(super::is_transient_http_status(502));
+        assert!(super::is_transient_http_status(503));
+        assert!(super::is_transient_http_status(504));
+        assert!(!super::is_transient_http_status(500));
+        assert!(!super::is_transient_http_status(401));
+    }
+
+    #[test]
+    fn test_api_error_transient_classification() {
+        use super::ApiError;
+
+        assert!(ApiError::HttpError {
+            status: 502,
+            message: "bad gateway".into(),
+        }
+        .is_transient());
+        assert!(ApiError::Other(anyhow::anyhow!("connection reset")).is_transient());
+        assert!(!ApiError::Unauthorized.is_transient());
+        assert!(!ApiError::Disabled.is_transient());
     }
 
     #[test]

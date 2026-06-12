@@ -6,6 +6,20 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 [`VERSIONING.md`](./VERSIONING.md) for the full policy. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.13.0] — 2026-06-12
+
+### Fixed
+
+- Heartbeats now retry transient gateway errors (HTTP 502/503/504) up to three
+  times with short backoff before surfacing a failure, so brief platform deploy
+  blips do not immediately push agents into a long retry window.
+- Transient heartbeat failures back off at the configured heartbeat interval
+  (capped at 120s) instead of jumping straight to a 30s minimum, keeping agents
+  inside the platform's missed-heartbeat threshold on fast intervals.
+- Update artifact downloads (binary, signature, checksum) use the same
+  transient retry policy. SHA-256 / Ed25519 verification and the staging /
+  `ExecStopPost` swap path are unchanged.
+
 ## [1.12.0] — 2026-06-10
 
 ### Changed
@@ -608,7 +622,12 @@ considered stable; breaking changes from this point on require a major bump.
 
 - Last pre-1.0 release. See git history for prior changes.
 
-[Unreleased]: https://github.com/connlog/agent/compare/v1.8.5...HEAD
+[Unreleased]: https://github.com/connlog/agent/compare/v1.13.0...HEAD
+[1.13.0]: https://github.com/connlog/agent/compare/v1.12.0...v1.13.0
+[1.12.0]: https://github.com/connlog/agent/compare/v1.11.0...v1.12.0
+[1.11.0]: https://github.com/connlog/agent/compare/v1.10.0...v1.11.0
+[1.10.0]: https://github.com/connlog/agent/compare/v1.9.0...v1.10.0
+[1.9.0]: https://github.com/connlog/agent/compare/v1.8.5...v1.9.0
 [1.8.5]: https://github.com/connlog/agent/compare/v1.8.4...v1.8.5
 [1.8.4]: https://github.com/connlog/agent/compare/v1.8.3...v1.8.4
 [1.8.3]: https://github.com/connlog/agent/compare/v1.8.2...v1.8.3

@@ -632,10 +632,10 @@ fn run_agent_with_shutdown_inner(
                 // Decommissioned/Disabled, which are account-level) counts
                 // toward forcing a fresh endpoint assignment.
                 endpoint_assignment.note_heartbeat_outcome(false);
-                // Exponential backoff: 30, 60, 120, 240, ... capped at 3600s
-                let backoff = std::cmp::min(
-                    30 * 2u64.pow(consecutive_errors.saturating_sub(1).min(7)),
-                    3600,
+                let backoff = heartbeat_error_backoff_secs(
+                    &e,
+                    consecutive_errors,
+                    config.heartbeat_interval_secs,
                 );
                 error!("Heartbeat failed: {} (retry in {}s)", e, backoff);
                 if interruptible_sleep(&stop, backoff).is_err() {
@@ -643,6 +643,50 @@ fn run_agent_with_shutdown_inner(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_backoff_tests {
+    use super::{heartbeat_error_backoff_secs, ApiError};
+
+    #[test]
+    fn transient_errors_stay_near_heartbeat_interval() {
+        let err = ApiError::HttpError {
+            status: 502,
+            message: "bad gateway".into(),
+        };
+        assert_eq!(heartbeat_error_backoff_secs(&err, 1, 10), 10);
+        assert_eq!(heartbeat_error_backoff_secs(&err, 2, 10), 20);
+    }
+
+    #[test]
+    fn non_transient_errors_use_exponential_backoff() {
+        let err = ApiError::HttpError {
+            status: 500,
+            message: "server error".into(),
+        };
+        assert_eq!(heartbeat_error_backoff_secs(&err, 1, 10), 30);
+        assert_eq!(heartbeat_error_backoff_secs(&err, 2, 10), 60);
+    }
+}
+
+/// Backoff after a failed heartbeat. Transient platform/gateway errors stay
+/// close to the configured interval so a brief 502 during deploy does not
+/// blow past the platform's missed-heartbeat threshold.
+fn heartbeat_error_backoff_secs(
+    error: &ApiError,
+    consecutive_errors: u32,
+    heartbeat_interval_secs: u64,
+) -> u64 {
+    if error.is_transient() {
+        let multiplier = u64::from(consecutive_errors.min(3));
+        std::cmp::min(heartbeat_interval_secs.saturating_mul(multiplier), 120)
+    } else {
+        std::cmp::min(
+            30 * 2u64.pow(consecutive_errors.saturating_sub(1).min(7)),
+            3600,
+        )
     }
 }
 
