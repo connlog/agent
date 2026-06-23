@@ -168,6 +168,33 @@ pub enum DiagnosticCommand {
         long_about = "Compare the installed systemd service with the template embedded in this binary.\n\nExamples:\n  connlog-agent diagnostics service\n  sudo connlog-agent refresh-service --restart"
     )]
     Service,
+
+    /// Inspect recent heartbeat delivery diagnostics from the agent's local store
+    #[command(
+        long_about = "Show what the agent believes happened to recent heartbeat attempts — retries, response codes, and transport failures — from a bounded, agent-owned local store.\n\nReads only local state: it requires no root, never sends a heartbeat, never contacts the platform, and never prints secrets, signatures, credentials, or raw heartbeat payloads. Safe to run through a ConnLog remote action without sudo.\n\nExamples:\n  connlog-agent diagnostics heartbeats\n  connlog-agent diagnostics heartbeats --since 72h --limit 500 --format text\n  connlog-agent diagnostics heartbeats --since 72h --limit 500 --format json"
+    )]
+    Heartbeats {
+        /// Look-back window: e.g. 24h, 72h, 30m, 90s, 7d (a bare number = seconds)
+        #[arg(long, default_value = "24h")]
+        since: String,
+
+        /// Maximum number of event records to inspect (most recent are kept)
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+
+        /// Output format
+        #[arg(long, value_enum, default_value_t = DiagnosticsFormat::Text)]
+        format: DiagnosticsFormat,
+    },
+}
+
+/// Output format for `diagnostics heartbeats`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DiagnosticsFormat {
+    /// Human-readable summary plus event list
+    Text,
+    /// Stable, machine-readable JSON document
+    Json,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
@@ -464,6 +491,60 @@ mod tests {
                 command: DiagnosticCommand::Service
             })
         );
+    }
+
+    #[test]
+    fn diagnostics_heartbeats_defaults_when_flags_omitted() {
+        let cfg = Config::parse_from(["connlog-agent", "diagnostics", "heartbeats"]);
+        assert_eq!(
+            cfg.command,
+            Some(AgentCommand::Diagnostics {
+                command: DiagnosticCommand::Heartbeats {
+                    since: "24h".to_string(),
+                    limit: 100,
+                    format: DiagnosticsFormat::Text,
+                }
+            })
+        );
+        // The command must NOT require a token (local-only diagnostics).
+        assert!(cfg.token.is_none());
+    }
+
+    #[test]
+    fn diagnostics_heartbeats_parses_all_flags() {
+        let cfg = Config::parse_from([
+            "connlog-agent",
+            "diagnostics",
+            "heartbeats",
+            "--since",
+            "72h",
+            "--limit",
+            "500",
+            "--format",
+            "json",
+        ]);
+        assert_eq!(
+            cfg.command,
+            Some(AgentCommand::Diagnostics {
+                command: DiagnosticCommand::Heartbeats {
+                    since: "72h".to_string(),
+                    limit: 500,
+                    format: DiagnosticsFormat::Json,
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn diagnostics_heartbeats_rejects_unknown_format() {
+        let result = Config::try_parse_from([
+            "connlog-agent",
+            "diagnostics",
+            "heartbeats",
+            "--format",
+            "yaml",
+        ]);
+        assert!(result.is_err(), "only text|json are valid formats");
     }
 
     #[test]

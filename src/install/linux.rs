@@ -27,6 +27,16 @@ StandardError=journal
 RuntimeDirectory=connlog
 RuntimeDirectoryMode=0700
 
+# Persistent state directory for heartbeat delivery diagnostics (/var/lib/connlog).
+# Unlike RuntimeDirectory (tmpfs, wiped on reboot), StateDirectory survives
+# reboots, service restarts, and the self-update binary swap. systemd creates it
+# owned by connlog-agent and exports the path as $STATE_DIRECTORY. 0700 keeps the
+# local heartbeat telemetry readable only by the service account (and root) —
+# the same account that runs ConnLog actions, so `diagnostics heartbeats` can
+# read it back without sudo. ProtectSystem=strict makes StateDirectory writable.
+StateDirectory=connlog
+StateDirectoryMode=0700
+
 # ── Security hardening ──────────────────────────────────
 NoNewPrivileges=yes
 ProtectSystem=strict
@@ -753,6 +763,23 @@ mod tests {
                 flag
             );
         }
+    }
+
+    /// The heartbeat diagnostics telemetry must persist across reboots and the
+    /// self-update binary swap. That requires a systemd `StateDirectory`
+    /// (`/var/lib/connlog`), NOT the tmpfs `RuntimeDirectory` (`/run/connlog`,
+    /// wiped on reboot). Pin both the directive and its restrictive mode so a
+    /// refactor can't silently drop persistence or world-expose the telemetry.
+    #[test]
+    fn systemd_unit_provisions_persistent_state_directory() {
+        assert!(
+            SYSTEMD_SERVICE.contains("StateDirectory=connlog"),
+            "StateDirectory=connlog is required so heartbeat telemetry survives reboot/update"
+        );
+        assert!(
+            SYSTEMD_SERVICE.contains("StateDirectoryMode=0700"),
+            "heartbeat telemetry directory must be 0700 (service account only)"
+        );
     }
 
     #[test]

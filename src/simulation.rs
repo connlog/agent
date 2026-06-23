@@ -22,13 +22,16 @@
 //!     (`Authorization: Bearer ...`, `X-Agent-Version`, `X-Hostname`,
 //!     `X-OS`, `X-Arch`).
 
+use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::heartbeat::{HeartbeatPayload, Metrics};
+use crate::heartbeat_telemetry::{self, HeartbeatTelemetry, TelemetryEvent};
 use crate::http::{ApiClient, ApiError, QuickActionPollingReport};
 
 /// Captured request data the test thread passes back to the assertions.
@@ -153,6 +156,55 @@ fn one_shot_redirect(target: &'static str) -> (String, mpsc::Receiver<CapturedRe
     });
 
     (format!("http://127.0.0.1:{port}"), rx)
+}
+
+/// Mock server that serves the same canned response to `count` sequential
+/// connections (each heartbeat attempt opens a fresh `Connection: close`
+/// socket). Used to drive the transient-retry path deterministically.
+fn repeating_server(
+    status_line: &'static str,
+    body: Vec<u8>,
+    count: usize,
+) -> (String, mpsc::Receiver<CapturedRequest>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        for _ in 0..count {
+            if let Ok((stream, _)) = listener.accept() {
+                let req = read_request(&stream);
+                let _ = tx.send(req);
+                write_response(&stream, status_line, &body);
+            }
+        }
+    });
+
+    (format!("http://127.0.0.1:{port}"), rx)
+}
+
+/// Return a port that has no listener (bind then drop), so a connection attempt
+/// is refused promptly — a deterministic transport failure.
+fn dead_port_base() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    format!("http://127.0.0.1:{port}")
+}
+
+fn temp_telemetry_dir(tag: &str) -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("connlog-sim-telemetry-{tag}-{unique}"));
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn read_telemetry(dir: &Path) -> Vec<TelemetryEvent> {
+    heartbeat_telemetry::load_events(dir, Duration::from_secs(86_400), 10_000, SystemTime::now())
+        .events
 }
 
 fn make_payload() -> HeartbeatPayload {
@@ -456,4 +508,222 @@ fn fetch_config_parses_and_clamp_keeps_it_sane() {
         "clamp must enforce <= 1024 KB payload (got {})",
         cfg.max_payload_size_kb
     );
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Heartbeat delivery telemetry — recorded through the REAL transport
+//
+// These drive the actual ApiClient against a mock server with a telemetry
+// store attached, then read the bounded local store back. This is the
+// end-to-end proof that lifecycle events, correlation ids, and the
+// X-ConnLog-Request-Id header are recorded for each delivery outcome.
+// ────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn telemetry_records_accepted_and_correlates_header() {
+    let body =
+        br#"{"ok":true,"server_time":"2026-04-30T00:00:00Z","expected_interval_seconds":60}"#
+            .to_vec();
+    let (base, rx) = one_shot_server("200 OK", body);
+    let dir = temp_telemetry_dir("accepted");
+
+    let mut client = ApiClient::new(base, "agent_test-token".into()).expect("ApiClient::new");
+    client.set_telemetry(HeartbeatTelemetry::with_dir(dir.clone()));
+    client
+        .send_heartbeat(&make_payload(), None)
+        .expect("heartbeat ok");
+
+    // The correlation header must be present and 32 lowercase hex chars.
+    let req = recv_request(&rx);
+    let header_id = req
+        .header("X-ConnLog-Request-Id")
+        .expect("X-ConnLog-Request-Id header must be present");
+    assert_eq!(header_id.len(), 32, "request id must be 32 hex chars");
+    assert!(header_id
+        .chars()
+        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+
+    let events = read_telemetry(&dir);
+    assert_eq!(events.len(), 1, "exactly one accepted event");
+    let ev = &events[0];
+    assert_eq!(ev.event_type, "accepted");
+    assert_eq!(ev.outcome, "accepted");
+    assert_eq!(ev.http_status, Some(200));
+    assert_eq!(ev.attempt, 1);
+    assert!(ev.duration_ms.is_some(), "duration must be recorded");
+    assert_eq!(ev.endpoint_host, "127.0.0.1");
+    // The store's request_id MUST match the header sent on the wire.
+    assert_eq!(
+        ev.request_id, header_id,
+        "store id must correlate with wire header id"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn telemetry_records_http_401_as_unauthorized() {
+    let (base, _rx) = one_shot_server("401 Unauthorized", b"nope".to_vec());
+    let dir = temp_telemetry_dir("401");
+    let mut client = ApiClient::new(base, "agent_tok".into()).unwrap();
+    client.set_telemetry(HeartbeatTelemetry::with_dir(dir.clone()));
+    let err = client.send_heartbeat(&make_payload(), None).unwrap_err();
+    assert!(matches!(err, ApiError::Unauthorized));
+
+    let events = read_telemetry(&dir);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_type, "http_rejected");
+    assert_eq!(events[0].error_category.as_deref(), Some("unauthorized"));
+    assert_eq!(events[0].http_status, Some(401));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn telemetry_records_http_403_as_forbidden() {
+    let (base, _rx) = one_shot_server("403 Forbidden", b"denied".to_vec());
+    let dir = temp_telemetry_dir("403");
+    let mut client = ApiClient::new(base, "agent_tok".into()).unwrap();
+    client.set_telemetry(HeartbeatTelemetry::with_dir(dir.clone()));
+    let _ = client.send_heartbeat(&make_payload(), None).unwrap_err();
+
+    let events = read_telemetry(&dir);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].error_category.as_deref(), Some("forbidden"));
+    assert_eq!(events[0].http_status, Some(403));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn telemetry_records_http_429_as_rate_limited() {
+    let (base, _rx) = one_shot_server("429 Too Many Requests", b"slow down".to_vec());
+    let dir = temp_telemetry_dir("429");
+    let mut client = ApiClient::new(base, "agent_tok".into()).unwrap();
+    client.set_telemetry(HeartbeatTelemetry::with_dir(dir.clone()));
+    let _ = client.send_heartbeat(&make_payload(), None).unwrap_err();
+
+    let events = read_telemetry(&dir);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_type, "rate_limited");
+    assert_eq!(events[0].error_category.as_deref(), Some("rate_limited"));
+    assert_eq!(events[0].http_status, Some(429));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn telemetry_records_http_500_as_server_error() {
+    // 500 is non-transient → exactly one attempt, no retry.
+    let (base, _rx) = one_shot_server("500 Internal Server Error", b"boom".to_vec());
+    let dir = temp_telemetry_dir("500");
+    let mut client = ApiClient::new(base, "agent_tok".into()).unwrap();
+    client.set_telemetry(HeartbeatTelemetry::with_dir(dir.clone()));
+    let _ = client.send_heartbeat(&make_payload(), None).unwrap_err();
+
+    let events = read_telemetry(&dir);
+    assert_eq!(events.len(), 1, "500 is not retried");
+    assert_eq!(events[0].event_type, "server_error");
+    assert_eq!(events[0].error_category.as_deref(), Some("server_error"));
+    assert_eq!(events[0].http_status, Some(500));
+    // The raw backend body ("boom") must NOT be persisted — only the reason.
+    let detail = events[0].detail.clone().unwrap_or_default();
+    assert!(
+        !detail.contains("boom"),
+        "raw response body leaked: {detail}"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn telemetry_records_transport_failure_for_unreachable_host() {
+    let base = dead_port_base();
+    let dir = temp_telemetry_dir("transport");
+    let mut client = ApiClient::new(base, "agent_tok".into()).unwrap();
+    client.set_telemetry(HeartbeatTelemetry::with_dir(dir.clone()));
+    let err = client.send_heartbeat(&make_payload(), None).unwrap_err();
+    assert!(matches!(err, ApiError::Other(_)));
+
+    let events = read_telemetry(&dir);
+    // A connection refusal is non-transient-classified at the HTTP layer but
+    // an `Other` error IS transient (is_transient), so it retries up to 3x.
+    assert!(!events.is_empty(), "a transport failure must be recorded");
+    // Every recorded transport attempt is a non-accepted failure with no status.
+    for ev in &events {
+        assert_ne!(ev.event_type, "accepted");
+    }
+    let categories: Vec<&str> = events
+        .iter()
+        .filter_map(|e| e.error_category.as_deref())
+        .collect();
+    assert!(
+        categories
+            .iter()
+            .any(|c| matches!(*c, "connection_error" | "dns_error" | "connect_timeout")),
+        "expected a transport category, got {categories:?}"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn telemetry_correlates_retries_under_one_request_id() {
+    // 503 is transient → the client retries up to TRANSIENT_HTTP_ATTEMPTS (3).
+    let (base, _rx) = repeating_server("503 Service Unavailable", b"unavailable".to_vec(), 3);
+    let dir = temp_telemetry_dir("retry");
+    let mut client = ApiClient::new(base, "agent_tok".into()).unwrap();
+    client.set_telemetry(HeartbeatTelemetry::with_dir(dir.clone()));
+    let _ = client.send_heartbeat(&make_payload(), None).unwrap_err();
+
+    let events = read_telemetry(&dir);
+    assert!(
+        events.len() >= 4,
+        "expected attempts + retry events, got {}",
+        events.len()
+    );
+
+    // All events for this cycle share ONE request id (retry correlation).
+    let first_id = events[0].request_id.clone();
+    assert!(
+        events.iter().all(|e| e.request_id == first_id),
+        "all retry events must share the original request id"
+    );
+
+    // Attempts increment; retry lifecycle is recorded.
+    let max_attempt = events.iter().map(|e| e.attempt).max().unwrap();
+    assert_eq!(max_attempt, 3, "should reach the 3rd attempt");
+    assert!(
+        events.iter().any(|e| e.event_type == "retry_scheduled"),
+        "retry_scheduled must be recorded"
+    );
+    assert!(
+        events.iter().any(|e| e.event_type == "retry_exhausted"),
+        "retry_exhausted must be recorded once the budget is spent"
+    );
+
+    // The summary must treat this as a single failed, retried cycle.
+    let summary = heartbeat_telemetry::summarize(&events);
+    assert_eq!(summary.cycles, 1);
+    assert_eq!(summary.accepted, 0);
+    assert_eq!(summary.failed, 1);
+    assert_eq!(summary.retried, 1);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn telemetry_write_failure_does_not_interrupt_heartbeat() {
+    // Point the telemetry store at a path that cannot hold files (a regular
+    // file where a directory is expected). The heartbeat MUST still succeed.
+    let body =
+        br#"{"ok":true,"server_time":"2026-04-30T00:00:00Z","expected_interval_seconds":60}"#
+            .to_vec();
+    let (base, _rx) = one_shot_server("200 OK", body);
+
+    let base_dir = temp_telemetry_dir("writefail");
+    let unwritable = base_dir.join("a-file-not-a-dir");
+    fs::write(&unwritable, b"x").unwrap();
+
+    let mut client = ApiClient::new(base, "agent_tok".into()).unwrap();
+    client.set_telemetry(HeartbeatTelemetry::with_dir(unwritable));
+    let result = client.send_heartbeat(&make_payload(), None);
+    assert!(
+        result.is_ok(),
+        "heartbeat must succeed even when telemetry cannot be written"
+    );
+    fs::remove_dir_all(&base_dir).ok();
 }

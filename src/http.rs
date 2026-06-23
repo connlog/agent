@@ -3,13 +3,23 @@ use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::StatusCode;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::endpoint_assignment::EndpointAssignmentResponse;
 use crate::heartbeat::{AgentConfig, HeartbeatPayload, HeartbeatResponse};
+use crate::heartbeat_telemetry::{
+    new_request_id, ErrorCategory, EventBuilder, EventType, HeartbeatTelemetry, HB_LOG_TARGET,
+};
 use crate::quick_actions::{
     QuickActionRequest, QuickActionResultPayload, QuickActionsManifestPayload,
 };
+
+/// Header carrying the agent-generated heartbeat correlation id. Authentication
+/// is bearer-token only (no HMAC over headers/body — see
+/// `connlog-platform/.../heartbeat/route.ts`), and the platform ignores unknown
+/// headers, so adding this is fully backward-compatible and never alters
+/// authentication semantics or the 32-byte binary frame.
+const REQUEST_ID_HEADER: &str = "X-ConnLog-Request-Id";
 
 const CPU_UNAVAILABLE_X100: u16 = u16::MAX;
 
@@ -88,6 +98,12 @@ pub struct ApiClient {
     /// URL through every `send_heartbeat` call site (including the test
     /// harnesses in `simulation.rs`, whose signatures must stay stable).
     heartbeat_url: Mutex<String>,
+    /// Optional heartbeat delivery telemetry sink. `None` by default (and in
+    /// every test that does not opt in) so existing constructor/method
+    /// signatures stay stable; the daemon attaches one via
+    /// [`set_telemetry`](Self::set_telemetry). Recording is best-effort and
+    /// never affects heartbeat delivery.
+    telemetry: Option<HeartbeatTelemetry>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -137,7 +153,21 @@ impl ApiClient {
             token,
             machine_id: crate::identity::machine_id(),
             heartbeat_url: Mutex::new(heartbeat_url),
+            telemetry: None,
         })
+    }
+
+    /// Attach a heartbeat delivery telemetry sink. Call once, before the client
+    /// is shared with the heartbeat loop. Tests and diagnostic CLI paths that
+    /// never call this keep behaving exactly as before (no recording).
+    pub fn set_telemetry(&mut self, telemetry: HeartbeatTelemetry) {
+        self.telemetry = Some(telemetry);
+    }
+
+    fn record(&self, builder: EventBuilder) {
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.record(builder);
+        }
     }
 
     /// Repoint `send_heartbeat` at a new (already-validated) URL. Called by
@@ -165,16 +195,52 @@ impl ApiClient {
         payload: &HeartbeatPayload,
         quick_action_polling: Option<&QuickActionPollingReport>,
     ) -> Result<HeartbeatResponse, ApiError> {
+        // One opaque correlation id per heartbeat *cycle*, shared by every
+        // attempt so the diagnostics store can stitch retries back to the
+        // original heartbeat.
+        let request_id = new_request_id();
+        let endpoint_host = host_from_url(&self.heartbeat_url());
         let mut last_err = None;
         for attempt in 1..=TRANSIENT_HTTP_ATTEMPTS {
-            match self.send_heartbeat_once(payload, quick_action_polling) {
+            match self.send_heartbeat_once(payload, quick_action_polling, &request_id, attempt) {
                 Ok(response) => return Ok(response),
                 Err(err) => {
                     let retryable = err.is_transient() && attempt < TRANSIENT_HTTP_ATTEMPTS;
                     if retryable {
-                        std::thread::sleep(transient_retry_delay(attempt));
+                        let delay = transient_retry_delay(attempt);
+                        self.record(
+                            EventBuilder::new(
+                                &request_id,
+                                attempt,
+                                EventType::RetryScheduled,
+                                &endpoint_host,
+                            )
+                            .retry_delay(delay),
+                        );
+                        log::warn!(
+                            target: HB_LOG_TARGET,
+                            "heartbeat_retry hb_id={request_id} attempt={attempt} retry_delay_ms={}",
+                            delay.as_millis()
+                        );
+                        std::thread::sleep(delay);
                         last_err = Some(err);
                         continue;
+                    }
+                    if err.is_transient() {
+                        // Ran out of retry budget on a transient failure.
+                        self.record(
+                            EventBuilder::new(
+                                &request_id,
+                                attempt,
+                                EventType::RetryExhausted,
+                                &endpoint_host,
+                            )
+                            .category(ErrorCategory::RetryExhausted),
+                        );
+                        log::warn!(
+                            target: HB_LOG_TARGET,
+                            "heartbeat_retry_exhausted hb_id={request_id} attempts={attempt}"
+                        );
                     }
                     return Err(err);
                 }
@@ -187,8 +253,11 @@ impl ApiClient {
         &self,
         payload: &HeartbeatPayload,
         quick_action_polling: Option<&QuickActionPollingReport>,
+        request_id: &str,
+        attempt: u32,
     ) -> Result<HeartbeatResponse, ApiError> {
         let url = self.heartbeat_url();
+        let endpoint_host = host_from_url(&url);
 
         let binary_payload = encode_heartbeat(payload);
 
@@ -237,6 +306,13 @@ impl ApiClient {
             );
         }
 
+        // Correlation id. Opaque, agent-generated, ignored by the platform
+        // today; lets a future server-side correlate without touching auth.
+        headers.insert(
+            REQUEST_ID_HEADER,
+            HeaderValue::from_str(request_id).context("Failed to create request-id header")?,
+        );
+
         add_quick_action_polling_headers(&mut headers, quick_action_polling)?;
 
         // SECURITY: Never log the token
@@ -246,30 +322,71 @@ impl ApiClient {
             HeaderValue::from_str(&auth_value).context("Failed to create authorization header")?,
         );
 
-        let response = self
+        let started = Instant::now();
+        let response = match self
             .client
             .post(&url)
             .headers(headers)
             .body(binary_payload.to_vec())
             .send()
-            .context("Failed to send binary heartbeat request")?;
-
+        {
+            Ok(response) => response,
+            Err(err) => {
+                // Transport-level failure: never reached an HTTP status.
+                let elapsed = started.elapsed();
+                let category = classify_reqwest_error(&err);
+                let event_type = category_event_type(category);
+                self.record(
+                    EventBuilder::new(request_id, attempt, event_type, &endpoint_host)
+                        .duration(elapsed)
+                        .category(category)
+                        .detail(&error_chain_string(&err)),
+                );
+                log::warn!(
+                    target: HB_LOG_TARGET,
+                    "heartbeat_outcome hb_id={request_id} attempt={attempt} outcome=failed error_category={} status_code=- duration_ms={}",
+                    category.as_str(),
+                    elapsed.as_millis()
+                );
+                return Err(ApiError::Other(
+                    anyhow::Error::new(err).context("Failed to send binary heartbeat request"),
+                ));
+            }
+        };
+        let elapsed = started.elapsed();
         let status = response.status();
 
-        // Check for specific error codes
-        if status == StatusCode::UNAUTHORIZED {
-            return Err(ApiError::Unauthorized);
-        }
-
-        if status == StatusCode::GONE {
-            return Err(ApiError::Decommissioned);
-        }
-
-        if status == StatusCode::LOCKED {
-            return Err(ApiError::Disabled);
-        }
-
+        // Non-success: record before consuming the body. We persist only the
+        // HTTP status reason phrase as detail, never the raw response body, so
+        // no backend payload can leak into the telemetry store.
         if !status.is_success() {
+            let category = http_status_category(status.as_u16());
+            let event_type = category_event_type(category);
+            self.record(
+                EventBuilder::new(request_id, attempt, event_type, &endpoint_host)
+                    .http_status(status.as_u16())
+                    .duration(elapsed)
+                    .category(category)
+                    .detail(status.canonical_reason().unwrap_or("HTTP error")),
+            );
+            log::warn!(
+                target: HB_LOG_TARGET,
+                "heartbeat_outcome hb_id={request_id} attempt={attempt} outcome=failed error_category={} status_code={} duration_ms={}",
+                category.as_str(),
+                status.as_u16(),
+                elapsed.as_millis()
+            );
+
+            // Map to the typed ApiError the daemon loop expects.
+            if status == StatusCode::UNAUTHORIZED {
+                return Err(ApiError::Unauthorized);
+            }
+            if status == StatusCode::GONE {
+                return Err(ApiError::Decommissioned);
+            }
+            if status == StatusCode::LOCKED {
+                return Err(ApiError::Disabled);
+            }
             let error_text = response
                 .text()
                 .unwrap_or_else(|_| "Unknown error".to_string());
@@ -279,9 +396,47 @@ impl ApiClient {
             });
         }
 
-        let heartbeat_response: HeartbeatResponse = response
-            .json()
-            .context("Failed to parse heartbeat response")?;
+        let heartbeat_response: HeartbeatResponse = match response.json() {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                // Platform accepted the heartbeat (2xx) but the body did not
+                // parse — an agent-side decode problem, recorded distinctly.
+                self.record(
+                    EventBuilder::new(
+                        request_id,
+                        attempt,
+                        EventType::SerializationError,
+                        &endpoint_host,
+                    )
+                    .http_status(status.as_u16())
+                    .duration(elapsed)
+                    .category(ErrorCategory::SerializationError)
+                    .detail(&error_chain_string(&err)),
+                );
+                log::warn!(
+                    target: HB_LOG_TARGET,
+                    "heartbeat_outcome hb_id={request_id} attempt={attempt} outcome=failed error_category=serialization_error status_code={} duration_ms={}",
+                    status.as_u16(),
+                    elapsed.as_millis()
+                );
+                return Err(ApiError::Other(
+                    anyhow::Error::new(err).context("Failed to parse heartbeat response"),
+                ));
+            }
+        };
+
+        // Fully successful round-trip.
+        self.record(
+            EventBuilder::new(request_id, attempt, EventType::Accepted, &endpoint_host)
+                .http_status(status.as_u16())
+                .duration(elapsed),
+        );
+        log::debug!(
+            target: HB_LOG_TARGET,
+            "heartbeat_outcome hb_id={request_id} attempt={attempt} outcome=accepted status_code={} duration_ms={}",
+            status.as_u16(),
+            elapsed.as_millis()
+        );
 
         Ok(heartbeat_response)
     }
@@ -553,6 +708,113 @@ fn add_quick_action_polling_headers(
     Ok(())
 }
 
+/// Extract just the host from a URL for telemetry — no scheme, port, path, or
+/// query, so a token-bearing URL can never be persisted. `http://h:80/p?x=1`
+/// becomes `h`. Falls back to the raw input only if there is no `://`.
+pub(crate) fn host_from_url(url: &str) -> String {
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    // Drop userinfo and port.
+    let host = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
+    host.split(':').next().unwrap_or(host).to_string()
+}
+
+/// Map an HTTP status to a telemetry [`ErrorCategory`].
+pub(crate) fn http_status_category(status: u16) -> ErrorCategory {
+    match status {
+        401 => ErrorCategory::Unauthorized,
+        403 => ErrorCategory::Forbidden,
+        429 => ErrorCategory::RateLimited,
+        500..=599 => ErrorCategory::ServerError,
+        _ => ErrorCategory::HttpRejected,
+    }
+}
+
+/// Map an [`ErrorCategory`] to the lifecycle [`EventType`] recorded for it.
+pub(crate) fn category_event_type(category: ErrorCategory) -> EventType {
+    match category {
+        ErrorCategory::DnsError => EventType::DnsError,
+        ErrorCategory::ConnectionError => EventType::ConnectionError,
+        ErrorCategory::ConnectTimeout => EventType::ConnectTimeout,
+        ErrorCategory::RequestTimeout => EventType::RequestTimeout,
+        ErrorCategory::TlsError => EventType::TlsError,
+        ErrorCategory::RateLimited => EventType::RateLimited,
+        ErrorCategory::ServerError => EventType::ServerError,
+        ErrorCategory::SerializationError => EventType::SerializationError,
+        ErrorCategory::SignatureError => EventType::SignatureError,
+        ErrorCategory::RetryExhausted => EventType::RetryExhausted,
+        // Unauthorized / Forbidden / generic 4xx all surface as http_rejected.
+        ErrorCategory::Unauthorized | ErrorCategory::Forbidden | ErrorCategory::HttpRejected => {
+            EventType::HttpRejected
+        }
+    }
+}
+
+/// Best-effort classification of a transport-level `reqwest` error into a
+/// telemetry category. Uses the typed predicates first, then keyword-matches
+/// the error source chain for DNS/TLS, which `reqwest` does not expose as flags.
+pub(crate) fn classify_reqwest_error(err: &reqwest::Error) -> ErrorCategory {
+    let chain = error_chain_string(err).to_ascii_lowercase();
+    classify_error_parts(err.is_timeout(), err.is_connect(), &chain)
+}
+
+/// Pure classification core, split out so every category is deterministically
+/// testable without having to synthesise a real `reqwest::Error`. `chain_lower`
+/// is the lowercased, flattened error source chain.
+pub(crate) fn classify_error_parts(
+    is_timeout: bool,
+    is_connect: bool,
+    chain_lower: &str,
+) -> ErrorCategory {
+    let looks_dns = chain_lower.contains("dns")
+        || chain_lower.contains("failed to lookup")
+        || chain_lower.contains("name or service not known")
+        || chain_lower.contains("name resolution")
+        || chain_lower.contains("nodename nor servname");
+    let looks_tls = chain_lower.contains("tls")
+        || chain_lower.contains("ssl")
+        || chain_lower.contains("certificate")
+        || chain_lower.contains("handshake");
+
+    if is_timeout {
+        return if is_connect {
+            ErrorCategory::ConnectTimeout
+        } else {
+            ErrorCategory::RequestTimeout
+        };
+    }
+    if looks_dns {
+        return ErrorCategory::DnsError;
+    }
+    if looks_tls {
+        return ErrorCategory::TlsError;
+    }
+    ErrorCategory::ConnectionError
+}
+
+/// Flatten an error and its `source()` chain into a single string for
+/// classification/detail. The caller sanitizes/caps before persistence.
+pub(crate) fn error_chain_string(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut source = err.source();
+    let mut depth = 0;
+    while let Some(inner) = source {
+        parts.push(inner.to_string());
+        source = inner.source();
+        depth += 1;
+        if depth > 8 {
+            break;
+        }
+    }
+    parts.join(": ")
+}
+
 /// Encode a heartbeat payload into the 32-byte protocol v1 binary wire frame.
 ///
 /// Frame layout (little-endian):
@@ -801,6 +1063,131 @@ mod tests {
         assert!(ApiError::Other(anyhow::anyhow!("connection reset")).is_transient());
         assert!(!ApiError::Unauthorized.is_transient());
         assert!(!ApiError::Disabled.is_transient());
+    }
+
+    // ── telemetry helpers ───────────────────────────────────────
+
+    #[test]
+    fn host_from_url_strips_scheme_port_path_and_userinfo() {
+        assert_eq!(
+            super::host_from_url("https://connlog.com/api/agents/heartbeat"),
+            "connlog.com"
+        );
+        assert_eq!(
+            super::host_from_url("http://127.0.0.1:53431/api/x?y=1"),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            super::host_from_url("https://eu-1.connlog.com:443/hb"),
+            "eu-1.connlog.com"
+        );
+        assert_eq!(
+            super::host_from_url("https://user:pass@host.example/p"),
+            "host.example"
+        );
+        // No scheme: falls back to the authority portion only (no path/query).
+        assert_eq!(super::host_from_url("connlog.com/x"), "connlog.com");
+    }
+
+    #[test]
+    fn http_status_category_mapping() {
+        use crate::heartbeat_telemetry::ErrorCategory;
+        assert_eq!(
+            super::http_status_category(401).as_str(),
+            ErrorCategory::Unauthorized.as_str()
+        );
+        assert_eq!(
+            super::http_status_category(403).as_str(),
+            ErrorCategory::Forbidden.as_str()
+        );
+        assert_eq!(
+            super::http_status_category(429).as_str(),
+            ErrorCategory::RateLimited.as_str()
+        );
+        assert_eq!(
+            super::http_status_category(500).as_str(),
+            ErrorCategory::ServerError.as_str()
+        );
+        assert_eq!(
+            super::http_status_category(503).as_str(),
+            ErrorCategory::ServerError.as_str()
+        );
+        assert_eq!(
+            super::http_status_category(418).as_str(),
+            ErrorCategory::HttpRejected.as_str()
+        );
+    }
+
+    /// Deterministic coverage of every transport category without needing to
+    /// synthesise a real `reqwest::Error`.
+    #[test]
+    fn classify_error_parts_covers_all_transport_categories() {
+        use super::classify_error_parts;
+        use crate::heartbeat_telemetry::ErrorCategory;
+
+        // connect timeout: timeout AND connect.
+        assert_eq!(
+            classify_error_parts(true, true, "operation timed out").as_str(),
+            ErrorCategory::ConnectTimeout.as_str()
+        );
+        // request/read timeout: timeout, not connect.
+        assert_eq!(
+            classify_error_parts(true, false, "operation timed out").as_str(),
+            ErrorCategory::RequestTimeout.as_str()
+        );
+        // DNS failure keyword.
+        assert_eq!(
+            classify_error_parts(
+                false,
+                true,
+                "failed to lookup address information: name or service not known"
+            )
+            .as_str(),
+            ErrorCategory::DnsError.as_str()
+        );
+        // TLS failure keyword.
+        assert_eq!(
+            classify_error_parts(
+                false,
+                true,
+                "invalid peer certificate: tls handshake failed"
+            )
+            .as_str(),
+            ErrorCategory::TlsError.as_str()
+        );
+        // Generic connection failure (e.g. connection refused).
+        assert_eq!(
+            classify_error_parts(false, true, "tcp connect error: connection refused").as_str(),
+            ErrorCategory::ConnectionError.as_str()
+        );
+    }
+
+    #[test]
+    fn error_chain_string_includes_sources() {
+        use std::fmt;
+        #[derive(Debug)]
+        struct Inner;
+        impl fmt::Display for Inner {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "inner cause")
+            }
+        }
+        impl std::error::Error for Inner {}
+        #[derive(Debug)]
+        struct Outer(Inner);
+        impl fmt::Display for Outer {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "outer")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let s = super::error_chain_string(&Outer(Inner));
+        assert!(s.contains("outer"));
+        assert!(s.contains("inner cause"));
     }
 
     #[test]

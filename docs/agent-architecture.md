@@ -28,7 +28,11 @@ src/
   endpoint_assignment.rs — V1 heartbeat endpoint assignment: fetch, validate
                     (trusted-domain allowlist), apply, refresh cadence
   heartbeat.rs    — Wire types: HeartbeatPayload, HeartbeatResponse, AgentConfig
-  http.rs         — ApiClient (heartbeat POST, config GET); encode_heartbeat
+  heartbeat_telemetry.rs — Bounded persistent heartbeat delivery diagnostics:
+                    record/load/summarize/render + correlation-id generation;
+                    backs `diagnostics heartbeats`
+  http.rs         — ApiClient (heartbeat POST, config GET); encode_heartbeat;
+                    per-attempt telemetry recording + error classification
   identity.rs     — X-Machine-Id derivation (SHA-256 of /etc/machine-id)
   metrics.rs      — MetricsCollector wrapping sysinfo; panic-isolated collect()
   update.rs       — Self-update: download → verify → atomic stage; version compare
@@ -254,11 +258,60 @@ exits cleanly (code 0). `ExecStopPost` performs the actual cleanup as root.
 
 ---
 
+## Heartbeat delivery diagnostics
+
+`heartbeat_telemetry.rs` records a bounded, persistent, agent-owned history of
+every heartbeat attempt so an operator can inspect *why* a heartbeat was
+considered missed — without root, `journalctl`, or privileged journal access.
+It is the data source behind `connlog-agent diagnostics heartbeats`.
+
+```
+send_heartbeat()  (http.rs, retry wrapper)
+  ├─ new_request_id()                     — one opaque 128-bit id per cycle
+  ├─ send_heartbeat_once(.., request_id, attempt)
+  │    ├─ adds X-ConnLog-Request-Id header (auth is bearer-only; no HMAC, so
+  │    │   this never touches authentication or the 32-byte frame)
+  │    ├─ times the request, classifies the outcome, and records ONE event:
+  │    │   accepted | http_rejected | rate_limited | server_error |
+  │    │   dns_error | connection_error | connect_timeout | request_timeout |
+  │    │   tls_error | serialization_error
+  │    └─ logs a `component=heartbeat` line (debug on success, warn on failure)
+  └─ on transient retry: records retry_scheduled; on giving up: retry_exhausted
+```
+
+Storage and bounds:
+
+| Property        | Value                                                              |
+| --------------- | ------------------------------------------------------------------ |
+| Location        | `/var/lib/connlog/heartbeat-telemetry.jsonl` (systemd `StateDirectory=connlog`, `$STATE_DIRECTORY`) |
+| Format          | newline-delimited JSON (one self-describing record per line)       |
+| Persistence     | survives process/service restart, reboot, and the self-update swap |
+| Bound           | size-based rotation, one `.1` generation kept → hard cap ≈ 2 MiB   |
+| Ownership       | `0700 connlog-agent` — readable by the service account (and root), the same account ConnLog actions run as |
+| Durability cost | one append per event, no `fsync` (a torn final line is skipped on read) |
+
+Safety invariants (pinned by tests):
+
+- **A telemetry write never affects a heartbeat.** `record()` is best-effort and
+  infallible by contract; a missing/unwritable directory degrades into no-op
+  writes. Verified by `telemetry_write_failure_does_not_interrupt_heartbeat`.
+- **No secrets are persisted.** Detail strings are token/bearer-redacted,
+  whitespace-collapsed, and length-capped; HTTP failures store only the status
+  reason phrase, never the response body. Verified by the redaction tests.
+- **Retries correlate.** Every attempt of one cycle shares the `request_id`.
+  Verified by `telemetry_correlates_retries_under_one_request_id`.
+- **Reads are crash-safe.** Corrupt/partial lines are skipped, not fatal.
+  Verified by `corrupt_lines_are_skipped`.
+
+The `diagnostics heartbeats` command is strictly read-only: no token, no
+network, no service mutation, no root.
+
 ## Config persistence
 
 There is no config file on disk for the agent config. Config comes exclusively
-from the server (`GET /api/agents/config`). The only persistent file is the
-token + platform URL in `/etc/connlog/agent.conf`.
+from the server (`GET /api/agents/config`). The only persistent files are the
+token + platform URL in `/etc/connlog/agent.conf` and the bounded heartbeat
+delivery diagnostics in `/var/lib/connlog/heartbeat-telemetry.jsonl` (above).
 
 `AgentConfig::clamp()` is called on every config response to prevent a buggy
 or malicious server from pushing values that would spin the CPU or prevent

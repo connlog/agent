@@ -19,6 +19,17 @@ pub const UNINSTALL_MARKER: &str = "/run/connlog/.uninstall_requested";
 #[allow(dead_code)]
 pub const CONFIG_DIR: &str = "/etc/connlog";
 
+/// Persistent state directory, mode 0700 connlog-agent:connlog-agent.
+///
+/// Created and owned by systemd via `StateDirectory=connlog` (see
+/// `install/linux.rs`), so it survives reboots, service restarts, and the
+/// self-update binary swap — unlike `/run/connlog` (tmpfs, wiped on reboot).
+/// Holds the bounded heartbeat delivery telemetry consumed by
+/// `connlog-agent diagnostics heartbeats`. The service account writes it; the
+/// same account runs ConnLog actions, so the diagnostics command can read it
+/// back without root. systemd exports the resolved path as `$STATE_DIRECTORY`.
+pub const STATE_DIR: &str = "/var/lib/connlog";
+
 /// Config file (env-style, sourced by systemd EnvironmentFile), mode 0600.
 #[allow(dead_code)]
 pub const CONFIG_FILE: &str = "/etc/connlog/agent.conf";
