@@ -11,6 +11,7 @@ mod config;
 mod defaults;
 mod endpoint_assignment;
 mod heartbeat;
+mod heartbeat_telemetry;
 mod http;
 mod identity;
 mod install;
@@ -27,6 +28,7 @@ use config::{AgentCommand, Config, DiagnosticCommand};
 use defaults::{CONFIG_FETCH_RETRY_DELAY_SECS, DEFAULT_ENDPOINT, DISABLED_BACKOFF_SECS};
 use endpoint_assignment::EndpointAssignmentState;
 use heartbeat::{AgentConfig, HeartbeatPayload, QuickActionsConfig};
+use heartbeat_telemetry::HeartbeatTelemetry;
 use http::{ApiClient, ApiError, QuickActionPollingReport};
 use metrics::MetricsCollector;
 use quick_actions::{QuickActionRequest, QuickActionsRegistry};
@@ -295,6 +297,16 @@ fn main() -> Result<()> {
                     return run_test_heartbeat(token, endpoint);
                 }
                 DiagnosticCommand::Service => return install::print_service_diagnostics(),
+                DiagnosticCommand::Heartbeats {
+                    since,
+                    limit,
+                    format,
+                } => {
+                    // Local-only diagnostics: no token, no network, no root, no
+                    // service mutation. Reads the bounded telemetry store the
+                    // running agent wrote.
+                    return heartbeat_telemetry::run_diagnostics_cli(&since, limit, format);
+                }
             },
         }
     }
@@ -388,7 +400,19 @@ fn run_agent_with_shutdown_inner(
         endpoint_assignment.resolve_heartbeat_endpoint(),
         endpoint_assignment::DEFAULT_REGION_CHECK_INTERVAL_SECS / 3600,
     );
-    let client = ApiClient::new(endpoint, token).context("Failed to initialize HTTP client")?;
+    let mut client = ApiClient::new(endpoint, token).context("Failed to initialize HTTP client")?;
+
+    // Attach the heartbeat delivery telemetry store. Best-effort and isolated:
+    // a missing/unwritable state directory degrades into no-op recording and
+    // never affects heartbeat delivery. The store powers
+    // `connlog-agent diagnostics heartbeats`.
+    let telemetry = HeartbeatTelemetry::open_default();
+    info!(
+        target: heartbeat_telemetry::HB_LOG_TARGET,
+        "Heartbeat diagnostics telemetry at {}",
+        telemetry.log_path().display()
+    );
+    client.set_telemetry(telemetry);
 
     // Initialize reusable metrics collector (avoids re-creating sysinfo each heartbeat)
     let mut collector =

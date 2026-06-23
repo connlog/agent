@@ -6,6 +6,74 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 [`VERSIONING.md`](./VERSIONING.md) for the full policy. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.14.0] — 2026-06-23
+
+### Added
+
+- **Heartbeat delivery diagnostics.** A new `connlog-agent diagnostics
+  heartbeats` command shows exactly what the agent believes happened to recent
+  heartbeat attempts — retries, response codes, and transport failures —
+  without root, `journalctl`, or any privileged journal access. It is safe to
+  run through a ConnLog remote action without `sudo`: it reads only local
+  state, never contacts the platform, never sends a heartbeat, never mutates
+  service state, and never prints secrets, signatures, credentials, or raw
+  heartbeat payloads.
+  - Flags: `--since <24h|72h|30m|7d|…>` (default `24h`), `--limit <N>` (default
+    `100`), `--format text|json` (default `text`). The text format opens with a
+    summary (records inspected, cycles, accepted/failed/retried, last
+    accepted/last failure, grouped failure categories) followed by a
+    chronological event list; the JSON format is a stable, schema-versioned
+    document (`schema_version`, `generated_at_utc`, period, limit, summary
+    counts, and event records). The command clearly distinguishes "no telemetry
+    available yet" from "all heartbeats succeeded".
+- **Bounded, persistent heartbeat telemetry store.** The agent now records a
+  per-attempt lifecycle history of every heartbeat to
+  `/var/lib/connlog/heartbeat-telemetry.jsonl` (newline-delimited JSON). It
+  survives process restart, service restart, reboot, and the self-update binary
+  swap, and is bounded by size-based rotation (one rotated generation; total
+  on-disk usage hard-capped at ~2 MiB). Captured per record: UTC timestamp,
+  correlation id, attempt number, lifecycle event type, outcome, HTTP status,
+  duration, retry delay, endpoint host, error category, and a sanitized detail.
+  Telemetry writes are best-effort and fully isolated — a write failure can
+  never block, delay, or fail a heartbeat, and corrupt/partial records are
+  skipped on read.
+- **Stable heartbeat correlation id.** Each heartbeat cycle is assigned an
+  opaque 128-bit id that ties all of its retries together in the local
+  diagnostics store and in structured logs, and is also sent as an
+  `X-ConnLog-Request-Id` HTTP header. Heartbeat authentication is bearer-token
+  only (there is no per-request HMAC over headers or body), and the platform
+  ignores unknown headers, so this header is fully backwards-compatible and
+  does **not** alter authentication semantics, invalidate any signature, or
+  change the 32-byte binary frame.
+- **Structured heartbeat lifecycle logs.** Each delivery outcome is logged as a
+  grep-friendly `component=heartbeat` line carrying `hb_id`, `attempt`,
+  `outcome`, `error_category`, `status_code`, `duration_ms`, and
+  `retry_delay_ms`. Successful heartbeats log at `debug` (low-noise); failures,
+  retries, and retry exhaustion log at `warn` so they are visible at the
+  default level.
+
+### Changed
+
+- The installed systemd unit now declares `StateDirectory=connlog`
+  (`StateDirectoryMode=0700`), so systemd provisions `/var/lib/connlog` owned by
+  the unprivileged `connlog-agent` service account. Existing installs pick this
+  up automatically on the next self-update (the update hook refreshes the
+  service file from the new binary before restarting). `ProtectSystem=strict`
+  and every other hardening flag are unchanged, and the directory is readable
+  only by the service account (and root) — the same account ConnLog actions run
+  as, so the diagnostics command works without `sudo`.
+
+### Security
+
+- The diagnostics command and the on-disk store never expose HMAC signatures,
+  agent secrets, authorization headers, raw request bodies, full URLs with
+  tokens/query parameters, cookies, environment secrets, or raw backend
+  response bodies. All persisted/displayed error detail is redacted (agent
+  tokens, bearer credentials, and common secret query params), whitespace-
+  collapsed, and length-capped. HTTP failures store only the status reason
+  phrase, never the response body. No new privileges, groups, or journal access
+  are required, and `no_new_privileges` in the action sandbox is unaffected.
+
 ## [1.13.0] — 2026-06-12
 
 ### Fixed
@@ -622,7 +690,8 @@ considered stable; breaking changes from this point on require a major bump.
 
 - Last pre-1.0 release. See git history for prior changes.
 
-[Unreleased]: https://github.com/connlog/agent/compare/v1.13.0...HEAD
+[Unreleased]: https://github.com/connlog/agent/compare/v1.14.0...HEAD
+[1.14.0]: https://github.com/connlog/agent/compare/v1.13.0...v1.14.0
 [1.13.0]: https://github.com/connlog/agent/compare/v1.12.0...v1.13.0
 [1.12.0]: https://github.com/connlog/agent/compare/v1.11.0...v1.12.0
 [1.11.0]: https://github.com/connlog/agent/compare/v1.10.0...v1.11.0
