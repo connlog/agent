@@ -6,6 +6,19 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 [`VERSIONING.md`](./VERSIONING.md) for the full policy. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Copyright holder corrected.** The MIT `LICENSE` and the README previously
+  named an unrelated, unverified entity ("IA Solutions B.V.") as the copyright
+  holder. There is no record establishing that entity as the owner of ConnLog or
+  this code, so it has been replaced with the project's canonical identity,
+  `ConnLog`, matching the ConnLog platform's published legal identity. The
+  registered legal entity name is still pending configuration on the platform
+  (`NEXT_PUBLIC_LEGAL_BUSINESS_NAME`); once set it should be reflected here as
+  `Copyright (c) 2026 <Legal Entity>, trading as ConnLog`.
+
 ## [1.14.0] — 2026-06-23
 
 ### Added
@@ -395,7 +408,7 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
   auditors, and security researchers. Covers startup, heartbeat, update,
   install/uninstall flows, updater safety invariants, wire protocol layout,
   versioning rules, and what must never be broken.
-- `LICENSE` — MIT license file (copyright IA Solutions B.V.)
+- `LICENSE` — MIT license file. (Copyright holder corrected under Unreleased.)
 - Tests for `require_https` in `update.rs`: verifies that HTTP, FTP, and
   empty URLs are rejected by the update download path.
 - Tests for `verify_sha256` in `update.rs`: verifies correct hash is
