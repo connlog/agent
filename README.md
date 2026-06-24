@@ -388,4 +388,23 @@ Windows support is planned after the Linux agent reaches production stability.
 
 ## License
 
-[MIT](LICENSE) — Copyright (c) 2026 IA Solutions B.V.
+[MIT](LICENSE) — Copyright (c) 2026 ConnLog.
+
+The MIT license terms in [`LICENSE`](LICENSE) are authoritative; the line above
+is a convenience reference only.
+
+## Ownership and contact
+
+To avoid confusion between the brand, the rights holder, and where to get help:
+
+| | |
+| --- | --- |
+| **Project / brand** | ConnLog — see [connlog.com](https://connlog.com) |
+| **Copyright holder** | ConnLog (the registered legal entity operating ConnLog; the legal entity name is published on the [ConnLog Legal Notice](https://connlog.com/legal-notice)) |
+| **Repository** | [github.com/connlog/agent](https://github.com/connlog/agent) |
+| **Maintainer** | The ConnLog team |
+| **Support** | [support@connlog.com](mailto:support@connlog.com) / the ConnLog dashboard |
+| **Security reports** | [security@connlog.com](mailto:security@connlog.com) |
+
+This notice does not assert ownership of any trademark, patent, or third-party
+contributor rights. Bundled third-party crates remain under their own licenses.
