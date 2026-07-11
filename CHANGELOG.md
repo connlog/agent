@@ -10,6 +10,33 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 
 ### Fixed
 
+- **False offline flaps after a single bad heartbeat cycle.** Three delivery
+  behaviors could each keep the platform's `lastHeartbeatAt` stale past the
+  offline threshold (`interval × missedThreshold`) after one hiccup, flapping
+  the agent OFFLINE→ONLINE within seconds and sending a false AGENT_DOWN
+  alert. Agents on the shortest interval (10s × 3 = a 30s budget) were hit
+  hardest. (The platform's threshold also gained one interval of slack in a
+  companion change.)
+  - **429/5xx classification.** HTTP 429 and non-gateway 5xx responses were
+    treated as non-transient and hit the 30s exponential backoff — a single
+    platform 500 blew a 10s-interval agent's entire offline budget. All 5xx
+    are now transient (backoff stays near the heartbeat interval), and 429
+    maps to a dedicated `RateLimited` error that honors `Retry-After`
+    (floored at one interval, capped at 1 hour) and is never retried
+    in-cycle.
+  - **In-cycle retry budget.** One heartbeat cycle could hold
+    `lastHeartbeatAt` stale for ~31s (three attempts × 10s request timeout
+    plus retry delays). A cycle now carries a wall-clock budget equal to the
+    heartbeat interval: retries that do not fit are skipped, and each
+    attempt's request timeout shrinks to the remaining budget.
+  - **Fixed-cadence scheduling.** The next heartbeat was slept a full
+    jittered interval after the previous cycle *completed*, so request time
+    and post-heartbeat work stretched every wire gap past the interval. The
+    next heartbeat now fires one jittered interval after the cycle *started*,
+    floored at 0.9 × interval so a slow cycle can never compress the wire gap
+    below the platform's minimum-interval grace. Heartbeat jitter is now
+    positive-only (+0..10% instead of ±10%) for the same reason.
+
 - **Copyright holder corrected.** The MIT `LICENSE` and the README previously
   named an unrelated, unverified entity ("IA Solutions B.V.") as the copyright
   holder. There is no record establishing that entity as the owner of ConnLog or

@@ -55,9 +55,12 @@ const UNINSTALL_CONFIRM_THRESHOLD: u32 = 3;
 /// Maximum config fetch failures before using fallback
 const MAX_CONFIG_FETCH_RETRIES: u32 = 3;
 
-/// Heartbeat sleep jitter, ±10%. Spreads the thundering herd when N agents
+/// Heartbeat sleep jitter, +0..10%. Spreads the thundering herd when N agents
 /// installed at the same minute would otherwise all hit the platform on the
-/// same second every interval.
+/// same second every interval. Positive-only: heartbeats are scheduled from
+/// the cycle start (see `next_heartbeat_sleep`), so a negative offset could
+/// compress the server-observed gap below the plan's minimum interval and
+/// draw a 429.
 const HEARTBEAT_JITTER_PCT: u64 = 10;
 
 /// Quick-action poll jitter, ±10%. A 5s interval becomes roughly 4.5s..5.5s,
@@ -89,9 +92,12 @@ fn init_logger() {
         .init();
 }
 
-/// Apply ±`HEARTBEAT_JITTER_PCT`% jitter to a sleep duration. Source of
-/// entropy is `SystemTime` nanos — no `rand` dependency required, no
-/// cryptographic strength needed (we only want to spread the herd).
+/// Apply +0..=`HEARTBEAT_JITTER_PCT`% jitter to the heartbeat interval.
+/// Uniform over [secs, secs + 10%] — spreading the herd does not need
+/// negative offsets, and never undershooting the interval keeps the agent
+/// clear of the platform's minimum-interval limiter. Source of entropy is
+/// `SystemTime` nanos — no `rand` dependency required, no cryptographic
+/// strength needed (we only want to spread the herd).
 fn jittered(secs: u64) -> u64 {
     if secs == 0 {
         return 0;
@@ -104,10 +110,23 @@ fn jittered(secs: u64) -> u64 {
     if span == 0 {
         return secs;
     }
-    // Map nanos into [-span, +span], applied to secs.
-    let offset = (nanos % (2 * span + 1)) as i64 - span as i64;
-    let jittered = secs as i64 + offset;
-    jittered.max(1) as u64
+    secs + (nanos % (span + 1))
+}
+
+/// Sleep needed after a completed heartbeat cycle so the *next* heartbeat
+/// fires one jittered interval after the cycle STARTED (fixed cadence).
+/// Sleeping a full interval measured from completion — the old behavior —
+/// let request time and post-heartbeat work (config fetches, quick actions)
+/// stretch every gap past the interval, eating into the platform's offline
+/// threshold on every single beat.
+///
+/// The result is floored at 90% of the interval so a slow cycle can never
+/// compress the wire gap below the platform's minimum-interval grace
+/// (heartbeats arriving faster than 0.9 × the plan minimum draw a 429).
+fn next_heartbeat_sleep(interval_secs: u64, cycle_elapsed: Duration) -> Duration {
+    let target = Duration::from_secs(jittered(interval_secs));
+    let floor = Duration::from_millis(interval_secs.saturating_mul(900));
+    target.saturating_sub(cycle_elapsed).max(floor)
 }
 
 fn jittered_duration(base: Duration, pct: u64) -> Duration {
@@ -423,6 +442,10 @@ fn run_agent_with_shutdown_inner(
     info!("Fetching runtime configuration...");
     let mut config = fetch_config_with_retry(&client);
     config.clamp();
+    // One heartbeat cycle (attempts + retry delays) must fit inside the
+    // interval, or in-cycle retries against a hung connection keep the
+    // platform's lastHeartbeatAt stale past the offline threshold.
+    client.set_heartbeat_cycle_budget(Duration::from_secs(config.heartbeat_interval_secs));
 
     info!(
         "✓ Loaded config v{} (interval={}s, missed_threshold={})",
@@ -463,6 +486,11 @@ fn run_agent_with_shutdown_inner(
             info!("Shutdown requested (service stop) — exiting agent loop");
             return Ok(());
         }
+
+        // Cadence anchor: the next heartbeat is scheduled one jittered
+        // interval from HERE, not from wherever this cycle's request and
+        // post-heartbeat work happen to finish (see `next_heartbeat_sleep`).
+        let cycle_started = Instant::now();
 
         // V1 endpoint assignment: cheap no-op unless a refresh is actually
         // due (first run, ~24h elapsed, or repeated heartbeat failures —
@@ -559,6 +587,9 @@ fn run_agent_with_shutdown_inner(
                             new_config.clamp();
                             log_config_change(&config, &new_config);
                             config = new_config;
+                            client.set_heartbeat_cycle_budget(Duration::from_secs(
+                                config.heartbeat_interval_secs,
+                            ));
                             quick_action_polling.sync(&config.quick_actions, &quick_actions);
                         }
                         Err(e) => {
@@ -583,7 +614,7 @@ fn run_agent_with_shutdown_inner(
                 );
                 if sleep_with_quick_action_polling(
                     &stop,
-                    jittered(config.heartbeat_interval_secs),
+                    next_heartbeat_sleep(config.heartbeat_interval_secs, cycle_started.elapsed()),
                     &client,
                     &mut quick_actions,
                     &mut quick_actions_fingerprint,
@@ -685,32 +716,91 @@ mod heartbeat_backoff_tests {
     }
 
     #[test]
-    fn non_transient_errors_use_exponential_backoff() {
+    fn server_errors_are_transient() {
+        // A platform 500 (e.g. transient DB error) must not trigger the 30s
+        // exponential backoff: on a 10s-interval agent that single response
+        // would exceed the offline threshold and flap the agent.
         let err = ApiError::HttpError {
             status: 500,
             message: "server error".into(),
         };
+        assert_eq!(heartbeat_error_backoff_secs(&err, 1, 10), 10);
+        assert_eq!(heartbeat_error_backoff_secs(&err, 2, 10), 20);
+    }
+
+    #[test]
+    fn non_transient_errors_use_exponential_backoff() {
+        let err = ApiError::HttpError {
+            status: 400,
+            message: "bad request".into(),
+        };
         assert_eq!(heartbeat_error_backoff_secs(&err, 1, 10), 30);
         assert_eq!(heartbeat_error_backoff_secs(&err, 2, 10), 60);
     }
+
+    #[test]
+    fn rate_limited_honors_retry_after() {
+        let err = ApiError::RateLimited {
+            retry_after_secs: Some(45),
+        };
+        assert_eq!(heartbeat_error_backoff_secs(&err, 1, 10), 45);
+
+        // Floored at one interval: retrying sooner re-trips the limiter.
+        let err = ApiError::RateLimited {
+            retry_after_secs: Some(2),
+        };
+        assert_eq!(heartbeat_error_backoff_secs(&err, 1, 10), 10);
+
+        // Capped at an hour so a bogus header can't silence the agent.
+        let err = ApiError::RateLimited {
+            retry_after_secs: Some(86_400),
+        };
+        assert_eq!(heartbeat_error_backoff_secs(&err, 1, 10), 3600);
+    }
+
+    #[test]
+    fn rate_limited_without_retry_after_stays_near_interval() {
+        let err = ApiError::RateLimited {
+            retry_after_secs: None,
+        };
+        assert_eq!(heartbeat_error_backoff_secs(&err, 1, 10), 10);
+        assert_eq!(heartbeat_error_backoff_secs(&err, 2, 10), 20);
+    }
 }
 
-/// Backoff after a failed heartbeat. Transient platform/gateway errors stay
-/// close to the configured interval so a brief 502 during deploy does not
-/// blow past the platform's missed-heartbeat threshold.
+/// Backoff after a failed heartbeat. Transient failures (5xx, network, rate
+/// limiting) stay close to the configured interval so a brief blip does not
+/// blow past the platform's missed-heartbeat threshold — a fixed 30s+ backoff
+/// on a 10s-interval agent would single-handedly flap it offline.
 fn heartbeat_error_backoff_secs(
     error: &ApiError,
     consecutive_errors: u32,
     heartbeat_interval_secs: u64,
 ) -> u64 {
-    if error.is_transient() {
+    // One skipped beat per consecutive failure, capped well under any
+    // offline threshold a longer-interval agent would have.
+    let near_interval = {
         let multiplier = u64::from(consecutive_errors.min(3));
         std::cmp::min(heartbeat_interval_secs.saturating_mul(multiplier), 120)
-    } else {
-        std::cmp::min(
+    };
+
+    match error {
+        // Honor Retry-After when the platform sent one, floored at one
+        // interval (retrying sooner would just re-trip the limiter) and
+        // capped at an hour so a bogus header can't silence the agent.
+        ApiError::RateLimited { retry_after_secs } => match retry_after_secs {
+            Some(secs) => {
+                let floor = heartbeat_interval_secs;
+                let ceiling = floor.max(3600);
+                (*secs).clamp(floor, ceiling)
+            }
+            None => near_interval,
+        },
+        _ if error.is_transient() => near_interval,
+        _ => std::cmp::min(
             30 * 2u64.pow(consecutive_errors.saturating_sub(1).min(7)),
             3600,
-        )
+        ),
     }
 }
 
@@ -729,14 +819,14 @@ fn interruptible_sleep(stop: &Arc<AtomicBool>, total_secs: u64) -> Result<(), ()
 
 fn sleep_with_quick_action_polling(
     stop: &Arc<AtomicBool>,
-    total_secs: u64,
+    total: Duration,
     client: &ApiClient,
     quick_actions: &mut QuickActionsRegistry,
     quick_actions_fingerprint: &mut String,
     quick_actions_config: &QuickActionsConfig,
     quick_action_polling: &mut QuickActionPollState,
 ) -> Result<(), ()> {
-    let deadline = Instant::now() + Duration::from_secs(total_secs);
+    let deadline = Instant::now() + total;
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -1191,8 +1281,8 @@ mod jitter_tests {
     use crate::quick_actions::QuickActionsRegistry;
 
     use super::{
-        jittered, jittered_duration, QuickActionPollState, HEARTBEAT_JITTER_PCT,
-        QUICK_ACTION_POLL_JITTER_PCT,
+        jittered, jittered_duration, next_heartbeat_sleep, QuickActionPollState,
+        HEARTBEAT_JITTER_PCT, QUICK_ACTION_POLL_JITTER_PCT,
     };
 
     #[test]
@@ -1205,13 +1295,43 @@ mod jitter_tests {
         let base = 60u64;
         let span = (base * HEARTBEAT_JITTER_PCT) / 100;
         // Run a few times — the entropy source is SystemTime nanos so values
-        // genuinely vary across calls. Every result must lie inside [base-span,
-        // base+span] and never drop below 1.
+        // genuinely vary across calls. Jitter is positive-only: every result
+        // must lie inside [base, base+span] — undershooting the interval
+        // risks the platform's minimum-interval limiter.
         for _ in 0..20 {
             let v = jittered(base);
-            assert!(v >= base - span, "{v} < {} - {span}", base);
+            assert!(v >= base, "{v} < {base}");
             assert!(v <= base + span, "{v} > {} + {span}", base);
-            assert!(v >= 1);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn next_heartbeat_sleep_compensates_cycle_overhead() {
+        // A normal cycle (sub-second work) sleeps interval + jitter − elapsed,
+        // so the beat-to-beat gap stays at one jittered interval instead of
+        // interval + work.
+        let interval = 10u64;
+        let elapsed = std::time::Duration::from_millis(300);
+        for _ in 0..20 {
+            let sleep = next_heartbeat_sleep(interval, elapsed);
+            let gap = sleep + elapsed;
+            assert!(gap >= std::time::Duration::from_secs(interval), "{gap:?}");
+            // interval + max jitter (10%)
+            assert!(gap <= std::time::Duration::from_secs(11), "{gap:?}");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn next_heartbeat_sleep_floors_at_ninety_percent() {
+        // A slow cycle must not compress the wire gap below 0.9 × interval —
+        // the platform 429s anything faster than that.
+        let interval = 10u64;
+        let elapsed = std::time::Duration::from_secs(5);
+        for _ in 0..20 {
+            let sleep = next_heartbeat_sleep(interval, elapsed);
+            assert_eq!(sleep, std::time::Duration::from_secs(9), "{sleep:?}");
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
