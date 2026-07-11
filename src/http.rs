@@ -34,6 +34,9 @@ pub enum ApiError {
     /// Reversible: the agent should back off heartbeats and keep polling
     /// `/api/agents/config` infrequently. Do NOT self-uninstall.
     Disabled,
+    /// Rate limited (429) — the platform asked us to slow down. Carries the
+    /// parsed `Retry-After` header (delay-seconds form) when present.
+    RateLimited { retry_after_secs: Option<u64> },
     /// Other HTTP error
     HttpError { status: u16, message: String },
     /// Network or other error
@@ -46,6 +49,10 @@ impl std::fmt::Display for ApiError {
             ApiError::Unauthorized => write!(f, "Unauthorized (invalid token)"),
             ApiError::Decommissioned => write!(f, "Agent has been decommissioned"),
             ApiError::Disabled => write!(f, "Agent is disabled in ConnLog"),
+            ApiError::RateLimited { retry_after_secs } => match retry_after_secs {
+                Some(secs) => write!(f, "Rate limited (429), retry after {}s", secs),
+                None => write!(f, "Rate limited (429)"),
+            },
             ApiError::HttpError { status, message } => write!(f, "HTTP {} - {}", status, message),
             ApiError::Other(e) => write!(f, "{}", e),
         }
@@ -59,21 +66,34 @@ impl From<anyhow::Error> for ApiError {
 }
 
 impl ApiError {
-    /// Transport-level failures and gateway errors that are expected during
-    /// brief platform deploys or load-balancer blips.
+    /// Failures that are expected to clear on their own: transport errors,
+    /// server errors during platform deploys or load-balancer blips, and
+    /// rate limiting. The daemon loop keeps the retry backoff for these near
+    /// the heartbeat interval — an exponential backoff on a short-interval
+    /// agent would blow past the platform's offline threshold and flap it.
     pub(crate) fn is_transient(&self) -> bool {
         match self {
             ApiError::HttpError { status, .. } => is_transient_http_status(*status),
+            ApiError::RateLimited { .. } => true,
             ApiError::Other(_) => true,
             _ => false,
         }
     }
+
+    /// Whether an immediate in-cycle retry (sub-second delay) is appropriate.
+    /// Rate limiting is transient for backoff purposes but must NOT be
+    /// retried in-cycle: the server explicitly asked us to slow down, and
+    /// hammering it again 250ms later only re-trips the limiter.
+    pub(crate) fn retryable_in_cycle(&self) -> bool {
+        !matches!(self, ApiError::RateLimited { .. }) && self.is_transient()
+    }
 }
 
 /// HTTP statuses that usually mean "try again in a moment" rather than a
-/// permanent rejection. Mirrors the platform dashboard client's retry policy.
+/// permanent rejection: any 5xx. Platform 500s (transient DB errors) are as
+/// recoverable in practice as the 502-504 a proxy emits during a deploy.
 pub(crate) fn is_transient_http_status(status: u16) -> bool {
-    (502..=504).contains(&status)
+    (500..=599).contains(&status)
 }
 
 const TRANSIENT_HTTP_ATTEMPTS: u32 = 3;
@@ -104,7 +124,20 @@ pub struct ApiClient {
     /// [`set_telemetry`](Self::set_telemetry). Recording is best-effort and
     /// never affects heartbeat delivery.
     telemetry: Option<HeartbeatTelemetry>,
+    /// Wall-clock budget for one heartbeat *cycle* (all in-cycle attempts
+    /// plus retry delays). The daemon sets this to the heartbeat interval
+    /// whenever config loads or changes: with a short interval, three
+    /// 10s-timeout attempts (~31s) would otherwise keep `lastHeartbeatAt`
+    /// stale past the platform's offline threshold and flap the agent.
+    /// `None` (tests, CLI paths) keeps the unbounded 3-attempt behavior.
+    /// Interior mutability for the same reason as `heartbeat_url` above.
+    heartbeat_cycle_budget: Mutex<Option<Duration>>,
 }
+
+/// Minimum useful time for one more in-cycle retry: the retry is skipped when
+/// less than this remains in the cycle budget after the retry delay, and a
+/// budget-capped attempt never gets a request timeout shorter than this.
+const MIN_RETRY_BUDGET: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct QuickActionPollingReport {
@@ -154,6 +187,7 @@ impl ApiClient {
             machine_id: crate::identity::machine_id(),
             heartbeat_url: Mutex::new(heartbeat_url),
             telemetry: None,
+            heartbeat_cycle_budget: Mutex::new(None),
         })
     }
 
@@ -188,6 +222,23 @@ impl ApiClient {
             .clone()
     }
 
+    /// Set the wall-clock budget for one heartbeat cycle. The daemon calls
+    /// this with the heartbeat interval whenever config loads or changes.
+    pub fn set_heartbeat_cycle_budget(&self, budget: Duration) {
+        let mut guard = self
+            .heartbeat_cycle_budget
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(budget);
+    }
+
+    fn heartbeat_cycle_budget(&self) -> Option<Duration> {
+        *self
+            .heartbeat_cycle_budget
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Send heartbeat using the binary wire protocol (v1, 32-byte LE frame).
     /// This is the only supported transport — there is no JSON fallback.
     pub fn send_heartbeat(
@@ -200,14 +251,30 @@ impl ApiClient {
         // original heartbeat.
         let request_id = new_request_id();
         let endpoint_host = host_from_url(&self.heartbeat_url());
+        let cycle_deadline = self
+            .heartbeat_cycle_budget()
+            .map(|budget| Instant::now() + budget);
         let mut last_err = None;
         for attempt in 1..=TRANSIENT_HTTP_ATTEMPTS {
-            match self.send_heartbeat_once(payload, quick_action_polling, &request_id, attempt) {
+            match self.send_heartbeat_once(
+                payload,
+                quick_action_polling,
+                &request_id,
+                attempt,
+                cycle_deadline,
+            ) {
                 Ok(response) => return Ok(response),
                 Err(err) => {
-                    let retryable = err.is_transient() && attempt < TRANSIENT_HTTP_ATTEMPTS;
+                    let delay = transient_retry_delay(attempt);
+                    // A retry must fit inside the cycle budget: skip it when
+                    // less than MIN_RETRY_BUDGET would remain after the delay.
+                    let fits_budget = cycle_deadline.is_none_or(|deadline| {
+                        Instant::now() + delay + MIN_RETRY_BUDGET <= deadline
+                    });
+                    let retryable = err.retryable_in_cycle()
+                        && attempt < TRANSIENT_HTTP_ATTEMPTS
+                        && fits_budget;
                     if retryable {
-                        let delay = transient_retry_delay(attempt);
                         self.record(
                             EventBuilder::new(
                                 &request_id,
@@ -226,8 +293,11 @@ impl ApiClient {
                         last_err = Some(err);
                         continue;
                     }
-                    if err.is_transient() {
+                    if err.retryable_in_cycle() {
                         // Ran out of retry budget on a transient failure.
+                        // (RateLimited never enters here: it is transient but
+                        // deliberately not retried in-cycle, so there is no
+                        // budget to exhaust.)
                         self.record(
                             EventBuilder::new(
                                 &request_id,
@@ -255,6 +325,7 @@ impl ApiClient {
         quick_action_polling: Option<&QuickActionPollingReport>,
         request_id: &str,
         attempt: u32,
+        cycle_deadline: Option<Instant>,
     ) -> Result<HeartbeatResponse, ApiError> {
         let url = self.heartbeat_url();
         let endpoint_host = host_from_url(&url);
@@ -323,13 +394,23 @@ impl ApiClient {
         );
 
         let started = Instant::now();
-        let response = match self
+        let mut request = self
             .client
             .post(&url)
             .headers(headers)
-            .body(binary_payload.to_vec())
-            .send()
-        {
+            .body(binary_payload.to_vec());
+        if let Some(deadline) = cycle_deadline {
+            // Shrink this attempt's timeout to whatever is left of the cycle
+            // budget (floored at MIN_RETRY_BUDGET so an attempt is never
+            // pointlessly short). Without this, a hung connection holds the
+            // whole REQUEST_TIMEOUT even when the cycle budget is smaller.
+            let remaining = deadline.saturating_duration_since(started);
+            let attempt_timeout = remaining
+                .min(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+                .max(MIN_RETRY_BUDGET);
+            request = request.timeout(attempt_timeout);
+        }
+        let response = match request.send() {
             Ok(response) => response,
             Err(err) => {
                 // Transport-level failure: never reached an HTTP status.
@@ -386,6 +467,17 @@ impl ApiClient {
             }
             if status == StatusCode::LOCKED {
                 return Err(ApiError::Disabled);
+            }
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                // Only the delay-seconds form of Retry-After is honored; the
+                // HTTP-date form fails the parse and falls back to None
+                // (interval-based backoff in the daemon loop).
+                let retry_after_secs = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.trim().parse::<u64>().ok());
+                return Err(ApiError::RateLimited { retry_after_secs });
             }
             let error_text = response
                 .text()
@@ -1047,8 +1139,11 @@ mod tests {
         assert!(super::is_transient_http_status(502));
         assert!(super::is_transient_http_status(503));
         assert!(super::is_transient_http_status(504));
-        assert!(!super::is_transient_http_status(500));
+        assert!(super::is_transient_http_status(500));
         assert!(!super::is_transient_http_status(401));
+        // 429 is handled by the dedicated RateLimited variant, never HttpError.
+        assert!(!super::is_transient_http_status(429));
+        assert!(!super::is_transient_http_status(400));
     }
 
     #[test]
@@ -1061,8 +1156,31 @@ mod tests {
         }
         .is_transient());
         assert!(ApiError::Other(anyhow::anyhow!("connection reset")).is_transient());
+        assert!(ApiError::RateLimited {
+            retry_after_secs: None
+        }
+        .is_transient());
         assert!(!ApiError::Unauthorized.is_transient());
         assert!(!ApiError::Disabled.is_transient());
+    }
+
+    #[test]
+    fn rate_limited_is_never_retried_in_cycle() {
+        use super::ApiError;
+
+        // Transient for backoff purposes, but an immediate retry would just
+        // re-trip the server's limiter.
+        assert!(!ApiError::RateLimited {
+            retry_after_secs: Some(30)
+        }
+        .retryable_in_cycle());
+        assert!(ApiError::HttpError {
+            status: 503,
+            message: "unavailable".into(),
+        }
+        .retryable_in_cycle());
+        assert!(ApiError::Other(anyhow::anyhow!("connection reset")).retryable_in_cycle());
+        assert!(!ApiError::Unauthorized.retryable_in_cycle());
     }
 
     // ── telemetry helpers ───────────────────────────────────────

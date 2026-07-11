@@ -14,7 +14,10 @@
 //!   * 401 Unauthorized → `ApiError::Unauthorized`.
 //!   * 410 Gone        → `ApiError::Decommissioned`.
 //!   * 423 Locked      → `ApiError::Disabled`.
-//!   * 500 Server Err  → `ApiError::HttpError { status: 500, .. }`.
+//!   * 429 Too Many    → `ApiError::RateLimited` (Retry-After parsed, no
+//!     in-cycle retry).
+//!   * 500 Server Err  → transient: retried in-cycle, then
+//!     `ApiError::HttpError { status: 500, .. }`.
 //!   * 302 redirect to a *different* host is not followed (token must not
 //!     leak — `redirect::Policy::none()` is regression-tested here).
 //!   * `fetch_config` parses an `AgentConfig` and `clamp()` keeps it sane.
@@ -129,6 +132,36 @@ fn one_shot_server(
             let req = read_request(&stream);
             let _ = tx.send(req);
             write_response(&stream, status_line, &body);
+        }
+    });
+
+    (format!("http://127.0.0.1:{port}"), rx)
+}
+
+/// Same as `one_shot_server` but injects one extra response header line
+/// (e.g. `Retry-After: 45`).
+fn one_shot_server_with_header(
+    status_line: &'static str,
+    extra_header: &'static str,
+    body: Vec<u8>,
+) -> (String, mpsc::Receiver<CapturedRequest>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let req = read_request(&stream);
+            let _ = tx.send(req);
+            let header = format!(
+                "HTTP/1.1 {}\r\n{}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+                status_line,
+                extra_header,
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(&body);
+            let _ = stream.flush();
         }
     });
 
@@ -414,7 +447,8 @@ fn heartbeat_423_disabled() {
 
 #[test]
 fn heartbeat_500_surfaces_status_and_body() {
-    let (base, _rx) = one_shot_server("500 Internal Server Error", b"boom".to_vec());
+    // 500 is transient → retried in-cycle up to 3 attempts before surfacing.
+    let (base, _rx) = repeating_server("500 Internal Server Error", b"boom".to_vec(), 3);
     let client = ApiClient::new(base, "tok".into()).unwrap();
     let err = client.send_heartbeat(&make_payload(), None).unwrap_err();
     match err {
@@ -427,6 +461,80 @@ fn heartbeat_500_surfaces_status_and_body() {
         }
         other => panic!("expected HttpError, got {other:?}"),
     }
+}
+
+#[test]
+fn cycle_budget_skips_retries_that_do_not_fit() {
+    // 503 is transient and would normally be retried up to 3 attempts, but a
+    // budget too small for delay (250ms) + MIN_RETRY_BUDGET (1s) must stop
+    // the cycle after the first attempt.
+    let (base, rx) = repeating_server("503 Service Unavailable", b"unavailable".to_vec(), 3);
+    let client = ApiClient::new(base, "tok".into()).unwrap();
+    client.set_heartbeat_cycle_budget(Duration::from_millis(500));
+    let err = client.send_heartbeat(&make_payload(), None).unwrap_err();
+    assert!(
+        matches!(err, ApiError::HttpError { status: 503, .. }),
+        "got {err:?}"
+    );
+
+    // Give any (erroneous) retry a moment to arrive, then count requests.
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        rx.try_iter().count(),
+        1,
+        "no retry fits a 500ms cycle budget"
+    );
+}
+
+#[test]
+fn cycle_budget_allows_retries_that_fit() {
+    let (base, rx) = repeating_server("503 Service Unavailable", b"unavailable".to_vec(), 3);
+    let client = ApiClient::new(base, "tok".into()).unwrap();
+    client.set_heartbeat_cycle_budget(Duration::from_secs(10));
+    let _ = client.send_heartbeat(&make_payload(), None).unwrap_err();
+    assert_eq!(
+        rx.try_iter().count(),
+        3,
+        "all 3 attempts fit a 10s cycle budget"
+    );
+}
+
+#[test]
+fn heartbeat_429_maps_to_rate_limited_without_in_cycle_retry() {
+    // One-shot on purpose: if the client retried in-cycle, the second attempt
+    // would hit a closed listener and surface `ApiError::Other` instead.
+    let (base, _rx) = one_shot_server("429 Too Many Requests", b"slow down".to_vec());
+    let client = ApiClient::new(base, "tok".into()).unwrap();
+    let err = client.send_heartbeat(&make_payload(), None).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ApiError::RateLimited {
+                retry_after_secs: None
+            }
+        ),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn heartbeat_429_parses_retry_after_seconds() {
+    let (base, _rx) = one_shot_server_with_header(
+        "429 Too Many Requests",
+        "Retry-After: 45",
+        b"slow down".to_vec(),
+    );
+    let client = ApiClient::new(base, "tok".into()).unwrap();
+    let err = client.send_heartbeat(&make_payload(), None).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ApiError::RateLimited {
+                retry_after_secs: Some(45)
+            }
+        ),
+        "got {err:?}"
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -601,6 +709,7 @@ fn telemetry_records_http_429_as_rate_limited() {
     let _ = client.send_heartbeat(&make_payload(), None).unwrap_err();
 
     let events = read_telemetry(&dir);
+    // Rate limiting is deliberately never retried in-cycle → exactly one event.
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].event_type, "rate_limited");
     assert_eq!(events[0].error_category.as_deref(), Some("rate_limited"));
@@ -610,24 +719,29 @@ fn telemetry_records_http_429_as_rate_limited() {
 
 #[test]
 fn telemetry_records_http_500_as_server_error() {
-    // 500 is non-transient → exactly one attempt, no retry.
-    let (base, _rx) = one_shot_server("500 Internal Server Error", b"boom".to_vec());
+    // 500 is transient → retried in-cycle up to 3 attempts.
+    let (base, _rx) = repeating_server("500 Internal Server Error", b"boom".to_vec(), 3);
     let dir = temp_telemetry_dir("500");
     let mut client = ApiClient::new(base, "agent_tok".into()).unwrap();
     client.set_telemetry(HeartbeatTelemetry::with_dir(dir.clone()));
     let _ = client.send_heartbeat(&make_payload(), None).unwrap_err();
 
     let events = read_telemetry(&dir);
-    assert_eq!(events.len(), 1, "500 is not retried");
-    assert_eq!(events[0].event_type, "server_error");
-    assert_eq!(events[0].error_category.as_deref(), Some("server_error"));
-    assert_eq!(events[0].http_status, Some(500));
-    // The raw backend body ("boom") must NOT be persisted — only the reason.
-    let detail = events[0].detail.clone().unwrap_or_default();
-    assert!(
-        !detail.contains("boom"),
-        "raw response body leaked: {detail}"
-    );
+    let server_errors: Vec<_> = events
+        .iter()
+        .filter(|e| e.event_type == "server_error")
+        .collect();
+    assert_eq!(server_errors.len(), 3, "each in-cycle attempt is recorded");
+    for ev in &server_errors {
+        assert_eq!(ev.error_category.as_deref(), Some("server_error"));
+        assert_eq!(ev.http_status, Some(500));
+        // The raw backend body ("boom") must NOT be persisted — only the reason.
+        let detail = ev.detail.clone().unwrap_or_default();
+        assert!(
+            !detail.contains("boom"),
+            "raw response body leaked: {detail}"
+        );
+    }
     fs::remove_dir_all(&dir).ok();
 }
 
