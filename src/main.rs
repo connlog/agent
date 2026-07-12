@@ -7,6 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod action_cli;
+mod bmc;
 mod config;
 mod defaults;
 mod endpoint_assignment;
@@ -419,6 +420,13 @@ fn run_agent_with_shutdown_inner(
         endpoint_assignment.resolve_heartbeat_endpoint(),
         endpoint_assignment::DEFAULT_REGION_CHECK_INTERVAL_SECS / 3600,
     );
+
+    // Optional BMC hardware-health poller (iDRAC/iLO via Redfish). Inert
+    // unless CONNLOG_BMC_* is configured; runs on its own thread with its own
+    // HTTP clients so it can never delay a heartbeat. Reports go to the base
+    // platform endpoint (not the regional heartbeat endpoint).
+    let _bmc_poller = bmc::spawn_if_configured(Arc::clone(&stop), endpoint.clone(), token.clone());
+
     let mut client = ApiClient::new(endpoint, token).context("Failed to initialize HTTP client")?;
 
     // Attach the heartbeat delivery telemetry store. Best-effort and isolated:

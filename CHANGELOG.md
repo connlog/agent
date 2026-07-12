@@ -6,6 +6,23 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 [`VERSIONING.md`](./VERSIONING.md) for the full policy. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **BMC hardware health monitoring (iDRAC / iLO via Redfish).** The agent can
+  now poll the machine's out-of-band management controller and report storage
+  hardware health — physical drives (including SMART failure prediction and
+  media life), RAID volumes, and storage controllers — to the platform, which
+  alerts on transitions such as a drive going CRITICAL or predicting failure.
+  Opt-in and fully isolated from the heartbeat loop: enable it by setting
+  `CONNLOG_BMC_ENDPOINT`, `CONNLOG_BMC_USERNAME`, and `CONNLOG_BMC_PASSWORD`
+  in `/etc/connlog/agent.conf`. Optional: `CONNLOG_BMC_POLL_INTERVAL_SECS`
+  (default 300, clamped 60–3600) and `CONNLOG_BMC_INSECURE_TLS=true` to accept
+  the BMC's self-signed certificate. BMC credentials are sent only to the BMC
+  itself, never logged, and never forwarded to the platform. Requires a
+  platform running the `/api/agents/hardware-health` endpoint.
+
 ## [1.14.1] — 2026-07-11
 
 ### Fixed

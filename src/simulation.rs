@@ -464,6 +464,44 @@ fn heartbeat_500_surfaces_status_and_body() {
 }
 
 #[test]
+fn hardware_report_posts_snake_case_json_with_bearer_token() {
+    let (base, rx) = one_shot_server("200 OK", br#"{"ok":true}"#.to_vec());
+    let reporter = crate::bmc::PlatformReporter::new(&base, "agent_tok".into()).unwrap();
+
+    let mut attributes = serde_json::Map::new();
+    attributes.insert("model".into(), serde_json::Value::from("ST4000NM0023"));
+    reporter
+        .send(&crate::bmc::HardwareHealthReport {
+            source: "redfish",
+            collected_at_unix_ms: 1234,
+            components: vec![crate::bmc::HardwareComponent {
+                component_type: "drive",
+                component_key: "Disk.Bay.0".into(),
+                name: "Physical Disk 0:1:0".into(),
+                health: crate::bmc::Health::Critical,
+                state: Some("Enabled".into()),
+                failure_predicted: true,
+                attributes,
+            }],
+        })
+        .expect("2xx response must be accepted");
+
+    let req = recv_request(&rx);
+    assert_eq!(req.method, "POST");
+    assert_eq!(req.path, "/api/agents/hardware-health");
+    assert_eq!(req.header("Authorization"), Some("Bearer agent_tok"));
+
+    let body: serde_json::Value = serde_json::from_slice(&req.body).expect("body must be JSON");
+    assert_eq!(body["source"], "redfish");
+    let component = &body["components"][0];
+    assert_eq!(component["component_type"], "drive");
+    assert_eq!(component["component_key"], "Disk.Bay.0");
+    assert_eq!(component["health"], "CRITICAL");
+    assert_eq!(component["failure_predicted"], true);
+    assert_eq!(component["attributes"]["model"], "ST4000NM0023");
+}
+
+#[test]
 fn cycle_budget_skips_retries_that_do_not_fit() {
     // 503 is transient and would normally be retried up to 3 attempts, but a
     // budget too small for delay (250ms) + MIN_RETRY_BUDGET (1s) must stop
