@@ -6,6 +6,21 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 [`VERSIONING.md`](./VERSIONING.md) for the full policy. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.15.1] — 2026-07-12
+
+### Changed
+
+- **Module reorganization — no behavior change.** The crate root previously
+  mixed the essential daemon loop (config, identity, transport, wire
+  protocol, endpoint assignment) with bolt-on capabilities and the
+  self-update subsystem as flat files. `metrics.rs`, `quick_actions.rs`,
+  `action_cli.rs`, `heartbeat_telemetry.rs`, and `bmc.rs` now live under
+  `src/features/` (each degrades independently without affecting heartbeat
+  delivery); `update.rs` becomes `src/update/mod.rs`, isolated on its own
+  since it is the single highest-blast-radius code path in the agent. Pure
+  file moves and import-path updates — no logic changed in any file. See
+  `docs/agent-architecture.md` for the updated source map.
+
 ## [1.15.0] — 2026-07-11
 
 ### Added
@@ -747,6 +762,7 @@ considered stable; breaking changes from this point on require a major bump.
 
 - Last pre-1.0 release. See git history for prior changes.
 
+[1.15.1]: https://github.com/connlog/agent/compare/v1.15.0...v1.15.1
 [1.15.0]: https://github.com/connlog/agent/compare/v1.14.1...v1.15.0
 [1.14.1]: https://github.com/connlog/agent/compare/v1.14.0...v1.14.1
 [1.14.0]: https://github.com/connlog/agent/compare/v1.13.0...v1.14.0
