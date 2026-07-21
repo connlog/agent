@@ -37,13 +37,18 @@ platform action is needed.
 
 ## Architecture
 
+Core plumbing lives at the crate root; optional capabilities live under
+`src/features/`; self-update is isolated under `src/update/`. Full source map
+in `docs/agent-architecture.md`.
+
 - `src/main.rs` — entry point, main agent loop (heartbeat, quick actions, updates)
 - `src/heartbeat.rs` — `HeartbeatPayload`, `HeartbeatResponse`, `AgentConfig` structs
 - `src/http.rs` — `AgentApiClient` (all outbound HTTP calls)
-- `src/metrics.rs` — CPU, memory, disk, load metric collection
 - `src/config.rs` — CLI arg parsing (clap), config file loading
-- `src/update.rs` — self-update logic (Ed25519 signature verification)
-- `src/quick_actions.rs` — quick action polling and execution
+- `src/features/metrics.rs` — CPU, memory, disk, load metric collection
+- `src/features/quick_actions.rs` — quick action polling and execution
+- `src/features/bmc.rs` — optional BMC (iDRAC/iLO) hardware health poller
+- `src/update/mod.rs` — self-update logic (Ed25519 signature verification)
 - `src/install/` — installation logic (systemd, binary placement)
 - `src/platform/` — platform-specific abstractions
 

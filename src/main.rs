@@ -6,33 +6,38 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-mod action_cli;
-mod bmc;
+// ── Core plumbing (crate root) ──────────────────────────────────
+// The minimum an agent needs to authenticate, resolve where to send
+// heartbeats, speak the wire protocol, and transport them.
 mod config;
 mod defaults;
 mod endpoint_assignment;
 mod heartbeat;
-mod heartbeat_telemetry;
 mod http;
 mod identity;
+
+// ── OS integration (already grouped by directory) ───────────────
 mod install;
-mod metrics;
 mod platform;
-mod quick_actions;
+
+// ── Optional bolt-on capabilities ────────────────────────────────
+mod features;
+
+// ── Self-update subsystem (isolated on purpose — see src/update/mod.rs) ──
 mod update;
 
 #[cfg(test)]
 mod simulation;
 
-use action_cli::run_action_command;
 use config::{AgentCommand, Config, DiagnosticCommand};
 use defaults::{CONFIG_FETCH_RETRY_DELAY_SECS, DEFAULT_ENDPOINT, DISABLED_BACKOFF_SECS};
 use endpoint_assignment::EndpointAssignmentState;
+use features::action_cli::run_action_command;
+use features::heartbeat_telemetry::HeartbeatTelemetry;
+use features::metrics::MetricsCollector;
+use features::quick_actions::{QuickActionRequest, QuickActionsRegistry};
 use heartbeat::{AgentConfig, HeartbeatPayload, QuickActionsConfig};
-use heartbeat_telemetry::HeartbeatTelemetry;
 use http::{ApiClient, ApiError, QuickActionPollingReport};
-use metrics::MetricsCollector;
-use quick_actions::{QuickActionRequest, QuickActionsRegistry};
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Wire protocol version. v1 = 32-byte little-endian binary frame over
@@ -325,7 +330,9 @@ fn main() -> Result<()> {
                     // Local-only diagnostics: no token, no network, no root, no
                     // service mutation. Reads the bounded telemetry store the
                     // running agent wrote.
-                    return heartbeat_telemetry::run_diagnostics_cli(&since, limit, format);
+                    return features::heartbeat_telemetry::run_diagnostics_cli(
+                        &since, limit, format,
+                    );
                 }
             },
         }
@@ -425,7 +432,8 @@ fn run_agent_with_shutdown_inner(
     // unless CONNLOG_BMC_* is configured; runs on its own thread with its own
     // HTTP clients so it can never delay a heartbeat. Reports go to the base
     // platform endpoint (not the regional heartbeat endpoint).
-    let _bmc_poller = bmc::spawn_if_configured(Arc::clone(&stop), endpoint.clone(), token.clone());
+    let _bmc_poller =
+        features::bmc::spawn_if_configured(Arc::clone(&stop), endpoint.clone(), token.clone());
 
     let mut client = ApiClient::new(endpoint, token).context("Failed to initialize HTTP client")?;
 
@@ -435,7 +443,7 @@ fn run_agent_with_shutdown_inner(
     // `connlog-agent diagnostics heartbeats`.
     let telemetry = HeartbeatTelemetry::open_default();
     info!(
-        target: heartbeat_telemetry::HB_LOG_TARGET,
+        target: features::heartbeat_telemetry::HB_LOG_TARGET,
         "Heartbeat diagnostics telemetry at {}",
         telemetry.log_path().display()
     );
@@ -1113,7 +1121,7 @@ struct HeartbeatResult {
     latest_config_version: Option<u32>,
     uninstall: bool,
     update: Option<heartbeat::UpdateInfo>,
-    quick_actions: Vec<quick_actions::QuickActionRequest>,
+    quick_actions: Vec<features::quick_actions::QuickActionRequest>,
 }
 
 fn send_heartbeat(
@@ -1134,7 +1142,7 @@ fn send_heartbeat(
                 "Metrics collection failed ({e}); sending heartbeat with zero metrics so liveness still reaches the platform"
             );
             let (hostname, os, arch) = collector.identity();
-            let mut fallback = metrics::SystemMetrics::unavailable();
+            let mut fallback = features::metrics::SystemMetrics::unavailable();
             // os/arch are always sent (needed for self-update binary
             // selection); hostname remains opt-in.
             fallback.os = os.to_string();
@@ -1282,11 +1290,11 @@ fn send_heartbeat(
 
 #[cfg(test)]
 mod jitter_tests {
+    use crate::features::quick_actions::QuickActionsRegistry;
     use crate::heartbeat::{
         QuickActionsConfig, QUICK_ACTION_DEFAULT_POLL_INTERVAL_SECS,
         QUICK_ACTION_MIN_POLL_INTERVAL_SECS,
     };
-    use crate::quick_actions::QuickActionsRegistry;
 
     use super::{
         jittered, jittered_duration, next_heartbeat_sleep, QuickActionPollState,

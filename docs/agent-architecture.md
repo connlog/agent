@@ -20,28 +20,57 @@ service discovery, no network probing.
 
 ## Source map
 
+The crate root holds only what every agent process needs regardless of which
+optional capabilities are in use: identity, config, the wire protocol, and
+transport. Everything bolt-on lives under `features/`; the self-update
+subsystem gets its own `update/` directory because it is the single
+highest-blast-radius code path in the agent (see "What must never be broken"
+below) and is easiest to review in isolation.
+
 ```
 src/
   main.rs         — CLI parsing, main loop, back-off/retry, heartbeat send
+
+  # Core plumbing — the minimum an agent needs to authenticate, resolve
+  # where to send heartbeats, speak the wire protocol, and transport them.
   config.rs       — Clap Config; reads CONNLOG_TOKEN, CONNLOG_PLATFORM_URL
   defaults.rs     — Shared constants (endpoint, backoff durations)
   endpoint_assignment.rs — V1 heartbeat endpoint assignment: fetch, validate
                     (trusted-domain allowlist), apply, refresh cadence
   heartbeat.rs    — Wire types: HeartbeatPayload, HeartbeatResponse, AgentConfig
-  heartbeat_telemetry.rs — Bounded persistent heartbeat delivery diagnostics:
-                    record/load/summarize/render + correlation-id generation;
-                    backs `diagnostics heartbeats`
   http.rs         — ApiClient (heartbeat POST, config GET); encode_heartbeat;
                     per-attempt telemetry recording + error classification
   identity.rs     — X-Machine-Id derivation (SHA-256 of /etc/machine-id)
-  metrics.rs      — MetricsCollector wrapping sysinfo; panic-isolated collect()
-  update.rs       — Self-update: download → verify → atomic stage; version compare
-  simulation.rs   — In-process HTTP mock used by tests (no network required)
+
+  simulation.rs   — In-process HTTP mock used by tests (no network required);
+                    spans core, features, and update, so it stays at the root
+
+  features/       — Optional, bolt-on capabilities. None of these are
+                    required for the agent to heartbeat, and each degrades
+                    independently without affecting delivery.
+    metrics.rs             — MetricsCollector wrapping sysinfo; panic-isolated collect()
+    quick_actions.rs       — Remote dashboard action registry, execution, polling
+    action_cli.rs          — `connlog-agent action ...` CLI surface for quick actions
+    heartbeat_telemetry.rs — Bounded persistent heartbeat delivery diagnostics:
+                              record/load/summarize/render + correlation-id
+                              generation; backs `diagnostics heartbeats`
+    bmc.rs                 — Optional BMC hardware health poller (Dell iDRAC /
+                              HPE iLO via Redfish); own thread, own HTTP clients
+
+  update/         — Self-update subsystem, isolated on purpose.
+    mod.rs        — download → verify (SHA-256 + Ed25519) → atomic stage;
+                    version compare (anti-rollback); manual `--update` path
+
   install/
     linux.rs      — systemd unit (embedded string), install/uninstall helpers
   platform/
     unix.rs       — Filesystem paths for Linux (installed binary, staging, markers)
 ```
+
+> `src/service/mod.rs` exists but is **not** part of the module tree (no `mod
+> service;` anywhere) — it is dead code left over from an earlier pass, not a
+> real supervision layer. Service supervision is handled by `install/` (which
+> owns the systemd unit) and systemd itself. Slated for removal.
 
 ---
 
@@ -202,7 +231,7 @@ ExecStopPost (runs as root, +/bin/bash)
 ### Updater safety invariants
 
 These invariants must never be broken. They are pinned by tests in
-`src/install/linux.rs` and `src/update.rs`.
+`src/install/linux.rs` and `src/update/mod.rs`.
 
 | Invariant                                              | How it is enforced                                                                                                                            |
 | ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -361,7 +390,7 @@ Version string lives only in `Cargo.toml`. All other references use
 `env!("CARGO_PKG_VERSION")` so there is a single source of truth.
 
 The agent refuses updates to a version ≤ its current version
-(`is_version_upgrade()` in `src/update.rs`).
+(`is_version_upgrade()` in `src/update/mod.rs`).
 
 ---
 
@@ -392,7 +421,7 @@ redirect rejection, and update-info parsing — all without touching the network
 In rough priority order:
 
 1. **Auto-update chain** — an agent that cannot update is frozen forever at
-   its current version. Every change that touches `update.rs` or the
+   its current version. Every change that touches `src/update/` or the
    `ExecStopPost` script must preserve all updater safety invariants above.
 2. **Heartbeat reliability** — the agent must keep beating even when metric
    collection panics, config fetches fail, or the platform returns transient

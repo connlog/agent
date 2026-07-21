@@ -4,7 +4,7 @@ use std::io::{self, IsTerminal, Write};
 use crate::config::{
     ActionCommand, AddActionArgs, CliActionOutputMode, CliActionRisk, RegisterActionArgs,
 };
-use crate::quick_actions::{
+use crate::features::quick_actions::{
     command_looks_risky, is_valid_action_id, label_to_action_id, parse_command_line,
     register_local_action, remove_local_action, set_local_action_enabled, OutputMode,
     QuickActionRegistration, QuickActionRequest, QuickActionsRegistry, Risk,
@@ -414,11 +414,11 @@ fn validate_registration(registration: &QuickActionRegistration) -> Result<()> {
         anyhow::bail!("timeout must be between 1 and {MAX_TIMEOUT_SECONDS} seconds");
     }
     if registration.max_output_bytes == 0
-        || registration.max_output_bytes > crate::quick_actions::HARD_MAX_OUTPUT_BYTES
+        || registration.max_output_bytes > crate::features::quick_actions::HARD_MAX_OUTPUT_BYTES
     {
         anyhow::bail!(
             "max output bytes must be between 1 and {}",
-            crate::quick_actions::HARD_MAX_OUTPUT_BYTES
+            crate::features::quick_actions::HARD_MAX_OUTPUT_BYTES
         );
     }
     Ok(())
