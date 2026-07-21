@@ -35,7 +35,7 @@ Per [`VERSIONING.md`](../VERSIONING.md):
 | PATCH | Backwards-compatible bug/security fix                    |
 
 Never use a pre-release suffix (`-rc1`, `-beta`) for anything agents should
-auto-install — `is_version_upgrade()` in `src/update.rs` deliberately rejects
+auto-install — `is_version_upgrade()` in `src/update/mod.rs` deliberately rejects
 pre-release versions as update targets.
 
 ### 2. Branch from the canary tip

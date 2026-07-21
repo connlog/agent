@@ -50,7 +50,7 @@ pub struct HeartbeatResponse {
     #[serde(default)]
     pub uninstall: bool,
     #[serde(default)]
-    pub quick_actions: Vec<crate::quick_actions::QuickActionRequest>,
+    pub quick_actions: Vec<crate::features::quick_actions::QuickActionRequest>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

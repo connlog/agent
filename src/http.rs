@@ -6,13 +6,13 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::endpoint_assignment::EndpointAssignmentResponse;
-use crate::heartbeat::{AgentConfig, HeartbeatPayload, HeartbeatResponse};
-use crate::heartbeat_telemetry::{
+use crate::features::heartbeat_telemetry::{
     new_request_id, ErrorCategory, EventBuilder, EventType, HeartbeatTelemetry, HB_LOG_TARGET,
 };
-use crate::quick_actions::{
+use crate::features::quick_actions::{
     QuickActionRequest, QuickActionResultPayload, QuickActionsManifestPayload,
 };
+use crate::heartbeat::{AgentConfig, HeartbeatPayload, HeartbeatResponse};
 
 /// Header carrying the agent-generated heartbeat correlation id. Authentication
 /// is bearer-token only (no HMAC over headers/body — see
@@ -1209,7 +1209,7 @@ mod tests {
 
     #[test]
     fn http_status_category_mapping() {
-        use crate::heartbeat_telemetry::ErrorCategory;
+        use crate::features::heartbeat_telemetry::ErrorCategory;
         assert_eq!(
             super::http_status_category(401).as_str(),
             ErrorCategory::Unauthorized.as_str()
@@ -1241,7 +1241,7 @@ mod tests {
     #[test]
     fn classify_error_parts_covers_all_transport_categories() {
         use super::classify_error_parts;
-        use crate::heartbeat_telemetry::ErrorCategory;
+        use crate::features::heartbeat_telemetry::ErrorCategory;
 
         // connect timeout: timeout AND connect.
         assert_eq!(

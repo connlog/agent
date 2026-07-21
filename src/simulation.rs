@@ -33,8 +33,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::features::heartbeat_telemetry::{self, HeartbeatTelemetry, TelemetryEvent};
 use crate::heartbeat::{HeartbeatPayload, Metrics};
-use crate::heartbeat_telemetry::{self, HeartbeatTelemetry, TelemetryEvent};
 use crate::http::{ApiClient, ApiError, QuickActionPollingReport};
 
 /// Captured request data the test thread passes back to the assertions.
@@ -466,19 +466,19 @@ fn heartbeat_500_surfaces_status_and_body() {
 #[test]
 fn hardware_report_posts_snake_case_json_with_bearer_token() {
     let (base, rx) = one_shot_server("200 OK", br#"{"ok":true}"#.to_vec());
-    let reporter = crate::bmc::PlatformReporter::new(&base, "agent_tok".into()).unwrap();
+    let reporter = crate::features::bmc::PlatformReporter::new(&base, "agent_tok".into()).unwrap();
 
     let mut attributes = serde_json::Map::new();
     attributes.insert("model".into(), serde_json::Value::from("ST4000NM0023"));
     reporter
-        .send(&crate::bmc::HardwareHealthReport {
+        .send(&crate::features::bmc::HardwareHealthReport {
             source: "redfish",
             collected_at_unix_ms: 1234,
-            components: vec![crate::bmc::HardwareComponent {
+            components: vec![crate::features::bmc::HardwareComponent {
                 component_type: "drive",
                 component_key: "Disk.Bay.0".into(),
                 name: "Physical Disk 0:1:0".into(),
-                health: crate::bmc::Health::Critical,
+                health: crate::features::bmc::Health::Critical,
                 state: Some("Enabled".into()),
                 failure_predicted: true,
                 attributes,
