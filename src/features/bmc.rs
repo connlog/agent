@@ -21,13 +21,15 @@
 //!   - BMC credentials are sent only to the BMC itself (HTTP basic auth) and
 //!     are never logged and never forwarded to the platform.
 //!
-//! Supported env vars:
-//!   CONNLOG_BMC_ENDPOINT            e.g. https://10.0.0.120 (the BMC, not the OS)
-//!   CONNLOG_BMC_USERNAME            read-only BMC account recommended
-//!   CONNLOG_BMC_PASSWORD
-//!   CONNLOG_BMC_POLL_INTERVAL_SECS  default 300, clamped to 60..=3600
-//!   CONNLOG_BMC_INSECURE_TLS        "true" to accept the BMC's self-signed
-//!                                   certificate (common on iDRAC/iLO).
+//! Configuration (CLI flag > env var / agent.conf > default). The installer
+//! (`connlog-agent install --bmc-endpoint … --bmc-username … --bmc-password …`)
+//! persists these into `/etc/connlog/agent.conf` for the systemd service:
+//!   --bmc-endpoint       CONNLOG_BMC_ENDPOINT            https://10.0.0.120 (the BMC IP, not the OS)
+//!   --bmc-username       CONNLOG_BMC_USERNAME            read-only BMC account recommended
+//!   --bmc-password       CONNLOG_BMC_PASSWORD            prefer env/agent.conf over the CLI flag
+//!   --bmc-poll-interval  CONNLOG_BMC_POLL_INTERVAL_SECS  default 300, clamped to 60..=3600
+//!   --bmc-insecure-tls   CONNLOG_BMC_INSECURE_TLS        accept the BMC's self-signed cert
+//!                                                        (common on iDRAC/iLO)
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -72,12 +74,25 @@ pub struct BmcConfig {
 }
 
 impl BmcConfig {
-    pub fn from_env() -> Option<Self> {
-        Self::from_lookup(|key| std::env::var(key).ok())
+    /// Build from the resolved CLI/env `Config`. clap has already folded the
+    /// `--bmc-*` flags over the `CONNLOG_BMC_*` env vars (which arrive from the
+    /// systemd EnvironmentFile `/etc/connlog/agent.conf`), so reading the
+    /// config fields here composes CLI > env > agent.conf with no extra merge
+    /// logic. Delegates to `from_lookup` so the non-empty/clamp/trim rules
+    /// stay in one tested place.
+    pub fn from_config(cfg: &crate::config::Config) -> Option<Self> {
+        Self::from_lookup(|key| match key {
+            "CONNLOG_BMC_ENDPOINT" => cfg.bmc_endpoint.clone(),
+            "CONNLOG_BMC_USERNAME" => cfg.bmc_username.clone(),
+            "CONNLOG_BMC_PASSWORD" => cfg.bmc_password.clone(),
+            "CONNLOG_BMC_POLL_INTERVAL_SECS" => cfg.bmc_poll_interval_secs.map(|v| v.to_string()),
+            "CONNLOG_BMC_INSECURE_TLS" => Some(cfg.bmc_insecure_tls.to_string()),
+            _ => None,
+        })
     }
 
-    /// Testable core of `from_env`: all three of endpoint/username/password
-    /// must be present and non-empty, everything else has defaults.
+    /// Testable core: all three of endpoint/username/password must be present
+    /// and non-empty, everything else has defaults.
     fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Option<Self> {
         let non_empty = |key: &str| {
             get(key)
@@ -694,14 +709,16 @@ fn interruptible_sleep(stop: &AtomicBool, total: Duration) -> Result<(), ()> {
     Ok(())
 }
 
-/// Spawn the BMC poller thread when `CONNLOG_BMC_*` is configured.
-/// Returns `None` (and stays completely inert) otherwise.
+/// Spawn the BMC poller thread when BMC is configured (endpoint + username +
+/// password via `--bmc-*` flags or `CONNLOG_BMC_*` / agent.conf). Returns
+/// `None` (and stays completely inert) otherwise.
 pub fn spawn_if_configured(
     stop: Arc<AtomicBool>,
+    bmc_config: Option<BmcConfig>,
     platform_endpoint: String,
     token: String,
 ) -> Option<thread::JoinHandle<()>> {
-    let config = BmcConfig::from_env()?;
+    let config = bmc_config?;
     info!(
         "✓ BMC hardware health poller enabled (endpoint={}, interval={}s)",
         config.endpoint, config.poll_interval_secs

@@ -18,6 +18,14 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 
 ### Added
 
+- **First-class BMC configuration.** `--bmc-endpoint`, `--bmc-username`,
+  `--bmc-password`, `--bmc-poll-interval` and `--bmc-insecure-tls` are now real
+  CLI flags (shown in `--help`), each backed by its `CONNLOG_BMC_*` env var, so
+  BMC settings compose CLI > env / `agent.conf` > default just like the token.
+  `connlog-agent install --bmc-endpoint … --bmc-username … --bmc-password …`
+  now persists them into `/etc/connlog/agent.conf` (0600, shell-escaped) so the
+  installed systemd service polls the BMC. The password is redacted in any
+  rendered `Config` (new security test) and never logged or forwarded.
 - **Broader Redfish coverage (Dell iDRAC / HPE iLO / OpenBMC).** In addition to
   drives, RAID volumes and storage controllers, the poller now reports overall
   `ComputerSystem` health (with CPU/RAM summary roll-ups), chassis **fans**,

@@ -116,7 +116,7 @@ fi'
 WantedBy=multi-user.target
 "#;
 
-pub fn install(token: &str) -> Result<()> {
+pub fn install(token: &str, bmc: Option<&crate::features::bmc::BmcConfig>) -> Result<()> {
     // Check if running as root
     if !is_root() {
         anyhow::bail!("Installation requires root privileges. Please run with sudo.");
@@ -134,8 +134,11 @@ pub fn install(token: &str) -> Result<()> {
     // Create config directory
     create_config_dir()?;
 
-    // Write config file with token
-    write_config(token, &platform_url)?;
+    // Write config file with token (+ BMC settings if provided)
+    write_config(token, &platform_url, bmc)?;
+    if bmc.is_some() {
+        println!("  BMC hardware-health polling configured (iDRAC / iLO / OpenBMC)");
+    }
 
     // Copy binary to /usr/local/bin
     install_binary()?;
@@ -436,12 +439,32 @@ fn escape_env_value(s: &str) -> String {
         .replace('`', "\\`")
 }
 
-fn write_config(token: &str, platform_url: &str) -> Result<()> {
-    let config = format!(
+fn write_config(
+    token: &str,
+    platform_url: &str,
+    bmc: Option<&crate::features::bmc::BmcConfig>,
+) -> Result<()> {
+    let mut config = format!(
         "CONNLOG_TOKEN=\"{}\"\nCONNLOG_PLATFORM_URL=\"{}\"\n",
         escape_env_value(token),
         escape_env_value(platform_url),
     );
+
+    // Persist BMC hardware-health settings so the installed systemd service
+    // (which sources this EnvironmentFile) polls the BMC. Only written when all
+    // of endpoint/username/password were provided. The password is shell-escaped
+    // like the token; the file is 0600 root-only (set below), the correct
+    // resting place for the credential.
+    if let Some(b) = bmc {
+        config.push_str(&format!(
+            "CONNLOG_BMC_ENDPOINT=\"{}\"\nCONNLOG_BMC_USERNAME=\"{}\"\nCONNLOG_BMC_PASSWORD=\"{}\"\nCONNLOG_BMC_POLL_INTERVAL_SECS=\"{}\"\nCONNLOG_BMC_INSECURE_TLS=\"{}\"\n",
+            escape_env_value(&b.endpoint),
+            escape_env_value(&b.username),
+            escape_env_value(&b.password),
+            b.poll_interval_secs,
+            b.insecure_tls,
+        ));
+    }
 
     fs::write("/etc/connlog/agent.conf", config).context("Failed to write config file")?;
 
