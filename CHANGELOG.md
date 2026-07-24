@@ -6,6 +6,27 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 [`VERSIONING.md`](./VERSIONING.md) for the full policy. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **BMC hardware health now works beyond Dell/HPE RAID.** The Redfish poller
+  skipped an entire system when it exposed no `Storage` subsystem, so OpenBMC,
+  no-RAID hosts, and older HPE iLO4 reported nothing. Storage is now optional:
+  the poller always captures overall system health and continues to the rest of
+  the tree.
+
+### Added
+
+- **Broader Redfish coverage (Dell iDRAC / HPE iLO / OpenBMC).** In addition to
+  drives, RAID volumes and storage controllers, the poller now reports overall
+  `ComputerSystem` health (with CPU/RAM summary roll-ups), chassis **fans**,
+  health-tracked **temperature** sensors, and **power supplies** — the signals
+  operators actually alert on. New `component_type`s (`system`, `fan`,
+  `temperature`, `psu`) flow through the existing platform ingest unchanged
+  (the platform's `component_type` is free-form). Temperature sensors without a
+  BMC-reported health status are skipped so the report stays signal, not noise.
+
 ## [1.15.1] — 2026-07-12
 
 ### Changed

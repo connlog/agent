@@ -1,9 +1,16 @@
-//! BMC hardware-health poller (Dell iDRAC, HPE iLO — anything Redfish).
+//! BMC hardware-health poller (Dell iDRAC, HPE iLO, OpenBMC — anything Redfish).
 //!
 //! Polls the machine's out-of-band management controller over its Redfish
-//! REST API and reports storage hardware health (physical drives, RAID
-//! volumes, storage controllers) to the platform, which alerts on
-//! transitions (e.g. a drive going CRITICAL or predicting failure).
+//! REST API and reports hardware health to the platform, which alerts on
+//! transitions (e.g. a drive going CRITICAL or predicting failure):
+//!   - Overall system health (rolls up CPU + RAM summaries)
+//!   - Storage: physical drives, RAID volumes, storage controllers
+//!   - Chassis Thermal: fans and health-tracked temperature sensors
+//!   - Chassis Power: power supplies
+//!
+//! Storage is optional in Redfish: OpenBMC and no-RAID hosts expose little or
+//! no storage but still report system health, fans and PSUs, so those are what
+//! make the poller useful across every vendor rather than Dell/HPE RAID only.
 //!
 //! Opt-in and fully isolated from the heartbeat loop:
 //!   - Enabled only when `CONNLOG_BMC_ENDPOINT`, `CONNLOG_BMC_USERNAME`, and
@@ -307,6 +314,157 @@ pub(crate) fn controller_components(storage_doc: &Value) -> Vec<HardwareComponen
         .collect()
 }
 
+/// Stable id for an embedded array member (Thermal `Fans`/`Temperatures`,
+/// Power `PowerSupplies`). Prefers `MemberId`, then `Name`, then the raw
+/// `@odata.id` fragment.
+fn embedded_key(doc: &Value) -> String {
+    str_field(doc, "MemberId")
+        .or_else(|| str_field(doc, "Name"))
+        .or_else(|| str_field(doc, "@odata.id"))
+        .unwrap_or_else(|| "0".to_string())
+}
+
+/// Overall `ComputerSystem` health (CPU + RAM summaries roll up here).
+///
+/// This is what makes OpenBMC and no-RAID hosts report something useful: they
+/// often expose no Redfish `Storage`, but every Redfish system exposes an
+/// overall `Status/Health`.
+pub(crate) fn system_component(doc: &Value) -> Option<HardwareComponent> {
+    let key = component_key(doc)?;
+    let name = str_field(doc, "Name").unwrap_or_else(|| format!("System {key}"));
+
+    let mut attributes = serde_json::Map::new();
+    insert_attr(&mut attributes, "manufacturer", doc.get("Manufacturer").cloned());
+    insert_attr(&mut attributes, "model", doc.get("Model").cloned());
+    insert_attr(&mut attributes, "power_state", doc.get("PowerState").cloned());
+    insert_attr(
+        &mut attributes,
+        "processor_summary_health",
+        doc.pointer("/ProcessorSummary/Status/Health").cloned(),
+    );
+    insert_attr(
+        &mut attributes,
+        "memory_summary_health",
+        doc.pointer("/MemorySummary/Status/Health").cloned(),
+    );
+
+    Some(HardwareComponent {
+        component_type: "system",
+        component_key: format!("system/{key}"),
+        name,
+        health: status_health(doc),
+        state: status_state(doc),
+        failure_predicted: false,
+        attributes,
+    })
+}
+
+/// Fans + Temperatures embedded in a Chassis `Thermal` document (arrays, like
+/// storage controllers). `chassis_key` namespaces the component keys.
+pub(crate) fn thermal_components(thermal_doc: &Value, chassis_key: &str) -> Vec<HardwareComponent> {
+    let mut out = Vec::new();
+
+    if let Some(fans) = thermal_doc.get("Fans").and_then(|v| v.as_array()) {
+        for fan in fans.iter().filter(|d| !is_absent(d)) {
+            let member = embedded_key(fan);
+            let name = str_field(fan, "Name")
+                .or_else(|| str_field(fan, "FanName"))
+                .unwrap_or_else(|| format!("Fan {member}"));
+
+            let mut attributes = serde_json::Map::new();
+            insert_attr(
+                &mut attributes,
+                "reading",
+                fan.get("Reading").or_else(|| fan.get("ReadingRPM")).cloned(),
+            );
+            insert_attr(&mut attributes, "reading_units", fan.get("ReadingUnits").cloned());
+
+            out.push(HardwareComponent {
+                component_type: "fan",
+                component_key: format!("{chassis_key}/fan/{member}"),
+                name,
+                health: status_health(fan),
+                state: status_state(fan),
+                failure_predicted: false,
+                attributes,
+            });
+        }
+    }
+
+    if let Some(temps) = thermal_doc.get("Temperatures").and_then(|v| v.as_array()) {
+        for temp in temps.iter().filter(|d| !is_absent(d)) {
+            // Only sensors the BMC actually health-tracks — skip bare readings
+            // so we don't flood the report with dozens of Unknown temp sensors.
+            if temp.pointer("/Status/Health").and_then(|v| v.as_str()).is_none() {
+                continue;
+            }
+            let member = embedded_key(temp);
+            let name = str_field(temp, "Name").unwrap_or_else(|| format!("Temperature {member}"));
+
+            let mut attributes = serde_json::Map::new();
+            insert_attr(&mut attributes, "reading_celsius", temp.get("ReadingCelsius").cloned());
+            insert_attr(
+                &mut attributes,
+                "upper_threshold_critical",
+                temp.get("UpperThresholdCritical").cloned(),
+            );
+
+            out.push(HardwareComponent {
+                component_type: "temperature",
+                component_key: format!("{chassis_key}/temp/{member}"),
+                name,
+                health: status_health(temp),
+                state: status_state(temp),
+                failure_predicted: false,
+                attributes,
+            });
+        }
+    }
+
+    out
+}
+
+/// Power supplies embedded in a Chassis `Power` document.
+pub(crate) fn power_components(power_doc: &Value, chassis_key: &str) -> Vec<HardwareComponent> {
+    let Some(supplies) = power_doc.get("PowerSupplies").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    supplies
+        .iter()
+        .filter(|d| !is_absent(d))
+        .map(|psu| {
+            let member = embedded_key(psu);
+            let name = str_field(psu, "Name").unwrap_or_else(|| format!("PSU {member}"));
+
+            let mut attributes = serde_json::Map::new();
+            insert_attr(&mut attributes, "model", psu.get("Model").cloned());
+            insert_attr(
+                &mut attributes,
+                "line_input_voltage",
+                psu.get("LineInputVoltage").cloned(),
+            );
+            insert_attr(
+                &mut attributes,
+                "power_output_watts",
+                psu.get("LastPowerOutputWatts")
+                    .or_else(|| psu.get("PowerOutputWatts"))
+                    .cloned(),
+            );
+
+            HardwareComponent {
+                component_type: "psu",
+                component_key: format!("{chassis_key}/psu/{member}"),
+                name,
+                health: status_health(psu),
+                state: status_state(psu),
+                failure_predicted: false,
+                attributes,
+            }
+        })
+        .collect()
+}
+
 // ── Redfish HTTP client + tree walk ─────────────────────────────
 
 struct RedfishClient {
@@ -368,49 +526,43 @@ impl RedfishClient {
         let mut budget = RequestBudget(MAX_BMC_REQUESTS);
         let mut components: Vec<HardwareComponent> = Vec::new();
 
-        let systems = self.get_json("/redfish/v1/Systems", &mut budget)?;
-        for system_ref in member_refs(&systems) {
-            let Ok(system) = self.get_json(&system_ref, &mut budget) else {
-                continue;
-            };
-            let Some(storage_col_ref) = odata_ref(system.get("Storage")) else {
-                continue;
-            };
-            let Ok(storage_col) = self.get_json(&storage_col_ref, &mut budget) else {
-                continue;
-            };
-
-            for storage_ref in member_refs(&storage_col) {
-                let Ok(storage) = self.get_json(&storage_ref, &mut budget) else {
+        // Systems → overall health (+ optional Storage). Capturing the system
+        // health first means OpenBMC / no-RAID / iLO4 hosts (which expose no
+        // Redfish Storage) still report a meaningful signal instead of nothing.
+        if let Ok(systems) = self.get_json("/redfish/v1/Systems", &mut budget) {
+            for system_ref in member_refs(&systems) {
+                if components.len() >= MAX_COMPONENTS {
+                    break;
+                }
+                let Ok(system) = self.get_json(&system_ref, &mut budget) else {
                     continue;
                 };
+                components.extend(system_component(&system));
+                self.collect_storage(&system, &mut components, &mut budget);
+            }
+        }
 
-                components.extend(controller_components(&storage));
+        // Chassis → Thermal (fans + temperatures) and Power (PSUs). Present on
+        // iDRAC, iLO and OpenBMC even when there is no Redfish Storage, and the
+        // signals operators actually alert on (a dead fan, a failed PSU).
+        if let Ok(chassis_col) = self.get_json("/redfish/v1/Chassis", &mut budget) {
+            for chassis_ref in member_refs(&chassis_col) {
+                if components.len() >= MAX_COMPONENTS {
+                    break;
+                }
+                let Ok(chassis) = self.get_json(&chassis_ref, &mut budget) else {
+                    continue;
+                };
+                let chassis_key = component_key(&chassis).unwrap_or_else(|| "chassis".to_string());
 
-                let drive_refs: Vec<String> = storage
-                    .get("Drives")
-                    .and_then(|v| v.as_array())
-                    .map(|drives| drives.iter().filter_map(|d| odata_ref(Some(d))).collect())
-                    .unwrap_or_default();
-                for drive_ref in drive_refs {
-                    if components.len() >= MAX_COMPONENTS {
-                        break;
-                    }
-                    if let Ok(doc) = self.get_json(&drive_ref, &mut budget) {
-                        components.extend(drive_component(&doc));
+                if let Some(thermal_ref) = odata_ref(chassis.get("Thermal")) {
+                    if let Ok(thermal) = self.get_json(&thermal_ref, &mut budget) {
+                        components.extend(thermal_components(&thermal, &chassis_key));
                     }
                 }
-
-                if let Some(volumes_ref) = odata_ref(storage.get("Volumes")) {
-                    if let Ok(volumes) = self.get_json(&volumes_ref, &mut budget) {
-                        for volume_ref in member_refs(&volumes) {
-                            if components.len() >= MAX_COMPONENTS {
-                                break;
-                            }
-                            if let Ok(doc) = self.get_json(&volume_ref, &mut budget) {
-                                components.extend(volume_component(&doc));
-                            }
-                        }
+                if let Some(power_ref) = odata_ref(chassis.get("Power")) {
+                    if let Ok(power) = self.get_json(&power_ref, &mut budget) {
+                        components.extend(power_components(&power, &chassis_key));
                     }
                 }
             }
@@ -418,6 +570,62 @@ impl RedfishClient {
 
         components.truncate(MAX_COMPONENTS);
         Ok(components)
+    }
+
+    /// Walk a `ComputerSystem`'s Storage subsystem into drive/volume/controller
+    /// components. Storage is optional in Redfish, so a missing or unreadable
+    /// subsystem is not an error — the caller keeps the system health it already
+    /// captured.
+    fn collect_storage(
+        &self,
+        system: &Value,
+        components: &mut Vec<HardwareComponent>,
+        budget: &mut RequestBudget,
+    ) {
+        let Some(storage_col_ref) = odata_ref(system.get("Storage")) else {
+            return;
+        };
+        let Ok(storage_col) = self.get_json(&storage_col_ref, budget) else {
+            return;
+        };
+
+        for storage_ref in member_refs(&storage_col) {
+            if components.len() >= MAX_COMPONENTS {
+                break;
+            }
+            let Ok(storage) = self.get_json(&storage_ref, budget) else {
+                continue;
+            };
+
+            components.extend(controller_components(&storage));
+
+            let drive_refs: Vec<String> = storage
+                .get("Drives")
+                .and_then(|v| v.as_array())
+                .map(|drives| drives.iter().filter_map(|d| odata_ref(Some(d))).collect())
+                .unwrap_or_default();
+            for drive_ref in drive_refs {
+                if components.len() >= MAX_COMPONENTS {
+                    break;
+                }
+                if let Ok(doc) = self.get_json(&drive_ref, budget) {
+                    components.extend(drive_component(&doc));
+                }
+            }
+
+            if let Some(volumes_ref) = odata_ref(storage.get("Volumes")) {
+                if let Ok(volumes) = self.get_json(&volumes_ref, budget) {
+                    for volume_ref in member_refs(&volumes) {
+                        if components.len() >= MAX_COMPONENTS {
+                            break;
+                        }
+                        if let Ok(doc) = self.get_json(&volume_ref, budget) {
+                            components.extend(volume_component(&doc));
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -787,6 +995,114 @@ mod tests {
             vec!["/redfish/v1/Systems/1", "/redfish/v1/Systems/2"]
         );
         assert!(member_refs(&json!({})).is_empty());
+    }
+
+    // ── system / thermal / power extraction ─────────────────────
+
+    #[test]
+    fn system_component_rolls_up_health() {
+        // OpenBMC-style system: no Storage subsystem, but an overall health
+        // plus CPU/RAM summaries — the signal that makes OpenBMC report at all.
+        let doc = json!({
+            "@odata.id": "/redfish/v1/Systems/system",
+            "Id": "system",
+            "Name": "OpenBMC System",
+            "Manufacturer": "OpenBMC",
+            "PowerState": "On",
+            "ProcessorSummary": { "Status": { "Health": "OK" } },
+            "MemorySummary": { "Status": { "Health": "Warning" } },
+            "Status": { "Health": "Warning", "State": "Enabled" }
+        });
+        let c = system_component(&doc).expect("system must map");
+        assert_eq!(c.component_type, "system");
+        assert_eq!(c.component_key, "system/system");
+        assert_eq!(c.health, Health::Warning);
+        assert_eq!(c.state.as_deref(), Some("Enabled"));
+        assert!(!c.failure_predicted);
+        assert_eq!(
+            c.attributes
+                .get("memory_summary_health")
+                .and_then(|v| v.as_str()),
+            Some("Warning")
+        );
+        assert_eq!(
+            c.attributes
+                .get("processor_summary_health")
+                .and_then(|v| v.as_str()),
+            Some("OK")
+        );
+    }
+
+    #[test]
+    fn thermal_components_map_fans_and_health_tracked_temps() {
+        let thermal = json!({
+            "Fans": [
+                { "MemberId": "0", "Name": "Fan 1A", "Reading": 4680, "ReadingUnits": "RPM",
+                  "Status": { "Health": "OK", "State": "Enabled" } },
+                { "MemberId": "1", "Name": "Fan 2A",
+                  "Status": { "Health": "Critical", "State": "Enabled" } },
+                { "MemberId": "9", "Name": "Fan Empty", "Status": { "State": "Absent" } }
+            ],
+            "Temperatures": [
+                { "MemberId": "0", "Name": "Inlet Temp", "ReadingCelsius": 22,
+                  "UpperThresholdCritical": 47, "Status": { "Health": "OK", "State": "Enabled" } },
+                // Bare reading with no Status/Health — must be skipped as noise.
+                { "MemberId": "5", "Name": "DIMM Zone", "ReadingCelsius": 30 }
+            ]
+        });
+        let components = thermal_components(&thermal, "System.Chassis.1");
+        // 2 fans (absent skipped) + 1 temperature (bare reading skipped).
+        assert_eq!(components.len(), 3);
+
+        let fan = components.iter().find(|c| c.name == "Fan 1A").unwrap();
+        assert_eq!(fan.component_type, "fan");
+        assert_eq!(fan.component_key, "System.Chassis.1/fan/0");
+        assert_eq!(fan.health, Health::Ok);
+        assert_eq!(fan.attributes.get("reading").and_then(|v| v.as_u64()), Some(4680));
+
+        assert_eq!(
+            components.iter().find(|c| c.name == "Fan 2A").unwrap().health,
+            Health::Critical
+        );
+
+        let temp = components
+            .iter()
+            .find(|c| c.component_type == "temperature")
+            .unwrap();
+        assert_eq!(temp.name, "Inlet Temp");
+        assert_eq!(temp.component_key, "System.Chassis.1/temp/0");
+        assert_eq!(
+            temp.attributes.get("reading_celsius").and_then(|v| v.as_i64()),
+            Some(22)
+        );
+        assert!(
+            !components.iter().any(|c| c.name == "DIMM Zone"),
+            "temperature sensors without a health status are skipped"
+        );
+    }
+
+    #[test]
+    fn power_components_map_supplies_and_skip_absent() {
+        let power = json!({
+            "PowerSupplies": [
+                { "MemberId": "0", "Name": "PSU 1", "Model": "PWR-1200W", "LineInputVoltage": 230,
+                  "LastPowerOutputWatts": 210, "Status": { "Health": "OK", "State": "Enabled" } },
+                { "MemberId": "1", "Name": "PSU 2",
+                  "Status": { "Health": "Critical", "State": "Enabled" } },
+                { "MemberId": "2", "Name": "PSU 3", "Status": { "State": "Absent" } }
+            ]
+        });
+        let components = power_components(&power, "System.Chassis.1");
+        assert_eq!(components.len(), 2, "absent PSU bay skipped");
+        let psu = &components[0];
+        assert_eq!(psu.component_type, "psu");
+        assert_eq!(psu.component_key, "System.Chassis.1/psu/0");
+        assert_eq!(psu.health, Health::Ok);
+        assert_eq!(
+            psu.attributes.get("model").and_then(|v| v.as_str()),
+            Some("PWR-1200W")
+        );
+        assert_eq!(components[1].health, Health::Critical);
     }
 
     // ── wire format contract ────────────────────────────────────
