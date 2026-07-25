@@ -94,7 +94,12 @@ pub struct Config {
     // arrive as env vars that clap reads here). Prefer the env/agent.conf
     // path for the password so it never lands in `ps`/shell history.
     /// BMC Redfish endpoint, e.g. https://10.0.0.120 (the BMC IP, not the OS).
-    #[arg(long = "bmc-endpoint", env = "CONNLOG_BMC_ENDPOINT", global = true, value_name = "URL")]
+    #[arg(
+        long = "bmc-endpoint",
+        env = "CONNLOG_BMC_ENDPOINT",
+        global = true,
+        value_name = "URL"
+    )]
     pub bmc_endpoint: Option<String>,
 
     /// BMC account username (a read-only monitoring account is recommended).
@@ -421,7 +426,10 @@ impl fmt::Debug for Config {
             .field("emit_service", &self.emit_service)
             .field("bmc_endpoint", &self.bmc_endpoint)
             .field("bmc_username", &self.bmc_username)
-            .field("bmc_password", &self.bmc_password.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "bmc_password",
+                &self.bmc_password.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("bmc_poll_interval_secs", &self.bmc_poll_interval_secs)
             .field("bmc_insecure_tls", &self.bmc_insecure_tls)
             .finish()

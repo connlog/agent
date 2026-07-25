@@ -349,9 +349,17 @@ pub(crate) fn system_component(doc: &Value) -> Option<HardwareComponent> {
     let name = str_field(doc, "Name").unwrap_or_else(|| format!("System {key}"));
 
     let mut attributes = serde_json::Map::new();
-    insert_attr(&mut attributes, "manufacturer", doc.get("Manufacturer").cloned());
+    insert_attr(
+        &mut attributes,
+        "manufacturer",
+        doc.get("Manufacturer").cloned(),
+    );
     insert_attr(&mut attributes, "model", doc.get("Model").cloned());
-    insert_attr(&mut attributes, "power_state", doc.get("PowerState").cloned());
+    insert_attr(
+        &mut attributes,
+        "power_state",
+        doc.get("PowerState").cloned(),
+    );
     insert_attr(
         &mut attributes,
         "processor_summary_health",
@@ -390,9 +398,15 @@ pub(crate) fn thermal_components(thermal_doc: &Value, chassis_key: &str) -> Vec<
             insert_attr(
                 &mut attributes,
                 "reading",
-                fan.get("Reading").or_else(|| fan.get("ReadingRPM")).cloned(),
+                fan.get("Reading")
+                    .or_else(|| fan.get("ReadingRPM"))
+                    .cloned(),
             );
-            insert_attr(&mut attributes, "reading_units", fan.get("ReadingUnits").cloned());
+            insert_attr(
+                &mut attributes,
+                "reading_units",
+                fan.get("ReadingUnits").cloned(),
+            );
 
             out.push(HardwareComponent {
                 component_type: "fan",
@@ -410,14 +424,22 @@ pub(crate) fn thermal_components(thermal_doc: &Value, chassis_key: &str) -> Vec<
         for temp in temps.iter().filter(|d| !is_absent(d)) {
             // Only sensors the BMC actually health-tracks — skip bare readings
             // so we don't flood the report with dozens of Unknown temp sensors.
-            if temp.pointer("/Status/Health").and_then(|v| v.as_str()).is_none() {
+            if temp
+                .pointer("/Status/Health")
+                .and_then(|v| v.as_str())
+                .is_none()
+            {
                 continue;
             }
             let member = embedded_key(temp);
             let name = str_field(temp, "Name").unwrap_or_else(|| format!("Temperature {member}"));
 
             let mut attributes = serde_json::Map::new();
-            insert_attr(&mut attributes, "reading_celsius", temp.get("ReadingCelsius").cloned());
+            insert_attr(
+                &mut attributes,
+                "reading_celsius",
+                temp.get("ReadingCelsius").cloned(),
+            );
             insert_attr(
                 &mut attributes,
                 "upper_threshold_critical",
@@ -1075,10 +1097,17 @@ mod tests {
         assert_eq!(fan.component_type, "fan");
         assert_eq!(fan.component_key, "System.Chassis.1/fan/0");
         assert_eq!(fan.health, Health::Ok);
-        assert_eq!(fan.attributes.get("reading").and_then(|v| v.as_u64()), Some(4680));
+        assert_eq!(
+            fan.attributes.get("reading").and_then(|v| v.as_u64()),
+            Some(4680)
+        );
 
         assert_eq!(
-            components.iter().find(|c| c.name == "Fan 2A").unwrap().health,
+            components
+                .iter()
+                .find(|c| c.name == "Fan 2A")
+                .unwrap()
+                .health,
             Health::Critical
         );
 
@@ -1089,7 +1118,9 @@ mod tests {
         assert_eq!(temp.name, "Inlet Temp");
         assert_eq!(temp.component_key, "System.Chassis.1/temp/0");
         assert_eq!(
-            temp.attributes.get("reading_celsius").and_then(|v| v.as_i64()),
+            temp.attributes
+                .get("reading_celsius")
+                .and_then(|v| v.as_i64()),
             Some(22)
         );
         assert!(
