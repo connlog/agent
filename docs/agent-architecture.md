@@ -55,7 +55,8 @@ src/
                               record/load/summarize/render + correlation-id
                               generation; backs `diagnostics heartbeats`
     bmc.rs                 — Optional BMC hardware health poller (Dell iDRAC /
-                              HPE iLO via Redfish); own thread, own HTTP clients
+                              HPE iLO / OpenBMC via Redfish): system health,
+                              storage, fans, temps, PSUs; own thread + clients
 
   update/         — Self-update subsystem, isolated on purpose.
     mod.rs        — download → verify (SHA-256 + Ed25519) → atomic stage;

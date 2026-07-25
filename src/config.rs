@@ -85,6 +85,53 @@ pub struct Config {
         hide = true
     )]
     pub expose_system_info: bool,
+
+    // ── BMC hardware-health (Dell iDRAC / HPE iLO / OpenBMC via Redfish) ──
+    //
+    // All three of endpoint/username/password must be set to enable the
+    // poller; everything else has a default. These fold CLI > env >
+    // agent.conf (agent.conf is the systemd EnvironmentFile, so its lines
+    // arrive as env vars that clap reads here). Prefer the env/agent.conf
+    // path for the password so it never lands in `ps`/shell history.
+    /// BMC Redfish endpoint, e.g. https://10.0.0.120 (the BMC IP, not the OS).
+    #[arg(long = "bmc-endpoint", env = "CONNLOG_BMC_ENDPOINT", global = true, value_name = "URL")]
+    pub bmc_endpoint: Option<String>,
+
+    /// BMC account username (a read-only monitoring account is recommended).
+    #[arg(
+        long = "bmc-username",
+        env = "CONNLOG_BMC_USERNAME",
+        global = true,
+        value_name = "USER"
+    )]
+    pub bmc_username: Option<String>,
+
+    /// BMC account password. Prefer CONNLOG_BMC_PASSWORD / agent.conf over the flag.
+    #[arg(
+        long = "bmc-password",
+        env = "CONNLOG_BMC_PASSWORD",
+        global = true,
+        value_name = "PASS"
+    )]
+    pub bmc_password: Option<String>,
+
+    /// BMC poll interval in seconds (default 300, clamped to 60..=3600).
+    #[arg(
+        long = "bmc-poll-interval",
+        env = "CONNLOG_BMC_POLL_INTERVAL_SECS",
+        global = true,
+        value_name = "SECS"
+    )]
+    pub bmc_poll_interval_secs: Option<u64>,
+
+    /// Accept the BMC's self-signed TLS certificate (common on iDRAC / iLO).
+    #[arg(
+        long = "bmc-insecure-tls",
+        env = "CONNLOG_BMC_INSECURE_TLS",
+        global = true,
+        default_value_t = false
+    )]
+    pub bmc_insecure_tls: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
@@ -372,6 +419,11 @@ impl fmt::Debug for Config {
             .field("check_config", &self.check_config)
             .field("test_heartbeat", &self.test_heartbeat)
             .field("emit_service", &self.emit_service)
+            .field("bmc_endpoint", &self.bmc_endpoint)
+            .field("bmc_username", &self.bmc_username)
+            .field("bmc_password", &self.bmc_password.as_ref().map(|_| "[REDACTED]"))
+            .field("bmc_poll_interval_secs", &self.bmc_poll_interval_secs)
+            .field("bmc_insecure_tls", &self.bmc_insecure_tls)
             .finish()
     }
 }
@@ -424,6 +476,28 @@ mod tests {
             "Expected [REDACTED] marker, got: {}",
             rendered
         );
+    }
+
+    /// SECURITY-CRITICAL: the BMC password must NEVER appear in a rendered
+    /// `Config` either (the codebase never forwards or logs BMC creds).
+    #[test]
+    fn debug_redacts_bmc_password() {
+        let cfg = Config::parse_from([
+            "connlog-agent",
+            "--bmc-endpoint",
+            "https://10.0.0.120",
+            "--bmc-username",
+            "monitor",
+            "--bmc-password",
+            "bmc_super_secret_pw",
+        ]);
+        let rendered = format!("{:?}", cfg);
+        assert!(
+            !rendered.contains("bmc_super_secret_pw"),
+            "Debug must NEVER include the raw BMC password, got: {}",
+            rendered
+        );
+        assert!(rendered.contains("REDACTED"));
     }
 
     #[test]

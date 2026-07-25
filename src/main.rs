@@ -281,7 +281,8 @@ fn main() -> Result<()> {
             AgentCommand::Register => {}
             AgentCommand::Install => {
                 let token = config.token.clone().context("Token required for install")?;
-                return install::install(&token);
+                let bmc = features::bmc::BmcConfig::from_config(&config);
+                return install::install(&token, bmc.as_ref());
             }
             AgentCommand::Uninstall => return install::uninstall(),
             AgentCommand::Status => return install::status(),
@@ -381,7 +382,8 @@ fn main() -> Result<()> {
             .token
             .clone()
             .context("Token required for installation")?;
-        return install::install(&token);
+        let bmc = features::bmc::BmcConfig::from_config(&config);
+        return install::install(&token, bmc.as_ref());
     }
 
     // Run mode - require token
@@ -391,11 +393,15 @@ fn main() -> Result<()> {
 
     let endpoint = config.resolve_endpoint(DEFAULT_ENDPOINT);
     let expose_system_info = config.expose_system_info;
+    // Resolve BMC config here (where the parsed Config is in scope). None ->
+    // the poller stays inert.
+    let bmc_config = features::bmc::BmcConfig::from_config(&config);
 
     run_agent_with_shutdown_inner(
         token,
         endpoint,
         expose_system_info,
+        bmc_config,
         Arc::new(AtomicBool::new(false)),
     )
 }
@@ -404,6 +410,7 @@ fn run_agent_with_shutdown_inner(
     token: String,
     endpoint: String,
     expose_system_info: bool,
+    bmc_config: Option<features::bmc::BmcConfig>,
     stop: Arc<AtomicBool>,
 ) -> Result<()> {
     info!("ConnLog Agent v{} starting", AGENT_VERSION);
@@ -432,8 +439,12 @@ fn run_agent_with_shutdown_inner(
     // unless CONNLOG_BMC_* is configured; runs on its own thread with its own
     // HTTP clients so it can never delay a heartbeat. Reports go to the base
     // platform endpoint (not the regional heartbeat endpoint).
-    let _bmc_poller =
-        features::bmc::spawn_if_configured(Arc::clone(&stop), endpoint.clone(), token.clone());
+    let _bmc_poller = features::bmc::spawn_if_configured(
+        Arc::clone(&stop),
+        bmc_config,
+        endpoint.clone(),
+        token.clone(),
+    );
 
     let mut client = ApiClient::new(endpoint, token).context("Failed to initialize HTTP client")?;
 
