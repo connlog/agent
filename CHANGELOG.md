@@ -6,6 +6,25 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 [`VERSIONING.md`](./VERSIONING.md) for the full policy. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.17.0] — 2026-08-12
+
+### Added
+
+- **Remote host reboot from the ConnLog dashboard.** When the platform sets
+  `reboot: true` on three consecutive heartbeat responses, the agent writes
+  `/run/connlog/.reboot_requested` and exits cleanly so the systemd
+  `ExecStopPost` hook (root via `+`) runs `systemctl reboot`. The agent
+  refuses to exit if the installed unit file does not yet include the reboot
+  branch (avoids leaving the service permanently stopped under
+  `Restart=on-failure`). Updating to this release refreshes the unit via the
+  existing self-update `refresh-service` path.
+
+### Fixed
+
+- **Heartbeat load encoding no longer wraps extreme values.** Load averages
+  above 655.34 are clamped to 65534 in the 32-byte frame so they cannot wrap
+  to a small plausible-looking u16 (e.g. load 700 previously became ~44.64).
+
 ## [1.16.0] — 2026-07-25
 
 ### Fixed
@@ -791,6 +810,7 @@ considered stable; breaking changes from this point on require a major bump.
 
 - Last pre-1.0 release. See git history for prior changes.
 
+[1.17.0]: https://github.com/connlog/agent/compare/v1.16.0...v1.17.0
 [1.16.0]: https://github.com/connlog/agent/compare/v1.15.1...v1.16.0
 [1.15.1]: https://github.com/connlog/agent/compare/v1.15.0...v1.15.1
 [1.15.0]: https://github.com/connlog/agent/compare/v1.14.1...v1.15.0

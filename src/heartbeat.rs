@@ -49,6 +49,9 @@ pub struct HeartbeatResponse {
     /// If true, the agent should uninstall itself
     #[serde(default)]
     pub uninstall: bool,
+    /// If true, the agent should reboot the host (after consecutive confirmations)
+    #[serde(default)]
+    pub reboot: bool,
     #[serde(default)]
     pub quick_actions: Vec<crate::features::quick_actions::QuickActionRequest>,
 }
@@ -469,6 +472,23 @@ mod tests {
             !resp.uninstall,
             "missing `uninstall` must default to false (#[serde(default)])"
         );
+        assert!(
+            !resp.reboot,
+            "missing `reboot` must default to false (#[serde(default)])"
+        );
+    }
+
+    #[test]
+    fn heartbeat_response_reboot_flag() {
+        let json = r#"{
+            "ok": true,
+            "server_time": "2026-04-28T12:00:00Z",
+            "expected_interval_seconds": 30,
+            "reboot": true
+        }"#;
+        let resp: HeartbeatResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.reboot);
+        assert!(!resp.uninstall);
     }
 
     #[test]

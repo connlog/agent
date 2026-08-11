@@ -111,6 +111,9 @@ send_heartbeat()
 On OK response:
   ├─ Reset consecutive error counters
   ├─ Check response.uninstall       — accumulate, act after 3 consecutive
+  ├─ Check response.reboot          — accumulate, act after 3 consecutive
+  │                                    (writes `.reboot_requested`, exits;
+  │                                    skipped if unit lacks the reboot hook)
   ├─ Check response.update          — try_apply_update() (see Update flow)
   ├─ Check response.config_outdated — fetch new config if true
   └─ Sleep jittered(interval_secs)  — ±10% to spread fleet load

@@ -13,6 +13,9 @@ pub const UPDATE_MARKER: &str = "/run/connlog/.update_requested";
 /// Marker file. When present, ExecStopPost performs full self-uninstall.
 pub const UNINSTALL_MARKER: &str = "/run/connlog/.uninstall_requested";
 
+/// Marker file. When present, ExecStopPost runs `systemctl reboot` as root.
+pub const REBOOT_MARKER: &str = "/run/connlog/.reboot_requested";
+
 /// Config directory, mode 0750 root:connlog-agent.
 /// The token file stays 0600 root-only; actions.toml is group-readable so the
 /// unprivileged service can publish local action metadata.
