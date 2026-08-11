@@ -581,9 +581,7 @@ fn run_agent_with_shutdown_inner(
                             "Reboot confirmed after {} consecutive commands",
                             REBOOT_CONFIRM_THRESHOLD
                         );
-                        if trigger_host_reboot(
-                            "Remote reboot confirmed by workspace owner",
-                        ) {
+                        if trigger_host_reboot("Remote reboot confirmed by workspace owner") {
                             return Ok(());
                         }
                         // Stale unit / marker write failed — keep running and
