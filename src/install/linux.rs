@@ -84,7 +84,8 @@ AmbientCapabilities=
 RemoveIPC=yes
 UMask=0077
 
-# Post-stop hook: handles self-update and self-uninstall (runs as root via + prefix)
+# Post-stop hook: handles self-update, self-uninstall, and host reboot
+# (runs as root via + prefix). The agent process itself is unprivileged.
 ExecStopPost=+/bin/bash -c '\
 if [ -f /run/connlog/.update_requested ]; then \
     echo "ConnLog: Update marker detected, applying update..."; \
@@ -110,6 +111,10 @@ elif [ -f /run/connlog/.uninstall_requested ]; then \
     rm -rf /etc/connlog; \
     rm -f /usr/local/bin/connlog-agent; \
     echo "ConnLog: Agent fully uninstalled."; \
+elif [ -f /run/connlog/.reboot_requested ]; then \
+    echo "ConnLog: Reboot marker detected, rebooting host..."; \
+    rm -f /run/connlog/.reboot_requested; \
+    systemctl reboot; \
 fi'
 
 [Install]
@@ -676,6 +681,8 @@ mod tests {
         );
         assert!(SYSTEMD_SERVICE.contains("/run/connlog/.update_requested"));
         assert!(SYSTEMD_SERVICE.contains("/run/connlog/.uninstall_requested"));
+        assert!(SYSTEMD_SERVICE.contains("/run/connlog/.reboot_requested"));
+        assert!(SYSTEMD_SERVICE.contains("systemctl reboot"));
         assert!(SYSTEMD_SERVICE.contains("refresh-service"));
         assert!(SYSTEMD_SERVICE.contains("ConnLog: ERROR - service refresh failed"));
     }

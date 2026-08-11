@@ -58,6 +58,9 @@ const MAX_UNAUTHORIZED_ATTEMPTS: u32 = 50;
 /// Consecutive uninstall commands required from server before acting
 const UNINSTALL_CONFIRM_THRESHOLD: u32 = 3;
 
+/// Consecutive reboot commands required from server before acting
+const REBOOT_CONFIRM_THRESHOLD: u32 = 3;
+
 /// Maximum config fetch failures before using fallback
 const MAX_CONFIG_FETCH_RETRIES: u32 = 3;
 
@@ -492,6 +495,7 @@ fn run_agent_with_shutdown_inner(
     let mut consecutive_unauthorized = 0u32;
     let mut consecutive_errors = 0u32;
     let mut consecutive_uninstall_commands = 0u32;
+    let mut consecutive_reboot_commands = 0u32;
 
     // ── Update strategy ──────────────────────────────────────────
     //
@@ -546,6 +550,7 @@ fn run_agent_with_shutdown_inner(
                 // Check for remote uninstall command (require consecutive confirmations)
                 if response.uninstall {
                     consecutive_uninstall_commands += 1;
+                    consecutive_reboot_commands = 0;
                     warn!(
                         "Received remote uninstall command ({}/{})",
                         consecutive_uninstall_commands, UNINSTALL_CONFIRM_THRESHOLD
@@ -561,6 +566,30 @@ fn run_agent_with_shutdown_inner(
                 } else {
                     // Reset if server stops requesting uninstall
                     consecutive_uninstall_commands = 0;
+                }
+
+                // Remote host reboot (require consecutive confirmations). Uninstall
+                // takes precedence when both flags are present.
+                if !response.uninstall && response.reboot {
+                    consecutive_reboot_commands += 1;
+                    warn!(
+                        "Received remote reboot command ({}/{})",
+                        consecutive_reboot_commands, REBOOT_CONFIRM_THRESHOLD
+                    );
+                    if consecutive_reboot_commands >= REBOOT_CONFIRM_THRESHOLD {
+                        warn!(
+                            "Reboot confirmed after {} consecutive commands",
+                            REBOOT_CONFIRM_THRESHOLD
+                        );
+                        if trigger_host_reboot("Remote reboot confirmed by workspace owner") {
+                            return Ok(());
+                        }
+                        // Stale unit / marker write failed — keep running and
+                        // retry on later confirmed deliveries.
+                        consecutive_reboot_commands = 0;
+                    }
+                } else if !response.reboot {
+                    consecutive_reboot_commands = 0;
                 }
 
                 // Check for available update
@@ -1046,6 +1075,7 @@ fn run_test_heartbeat(token: String, endpoint: String) -> Result<()> {
                 println!("  latest_config_version:  {v}");
             }
             println!("  uninstall:              {}", result.uninstall);
+            println!("  reboot:                 {}", result.reboot);
             println!("  quick_actions:          {}", result.quick_actions.len());
             match result.update {
                 Some(u) if u.available => {
@@ -1126,11 +1156,67 @@ fn trigger_self_uninstall(reason: &str) {
     std::process::exit(0);
 }
 
+/// Returns true when the installed systemd unit includes the reboot ExecStopPost
+/// branch. Without that branch, exiting after writing the reboot marker would
+/// leave the agent permanently stopped (`Restart=on-failure` ignores exit 0).
+fn installed_unit_supports_reboot() -> bool {
+    match std::fs::read_to_string(install::SYSTEMD_SERVICE_PATH) {
+        Ok(unit) => unit.contains("/run/connlog/.reboot_requested"),
+        Err(e) => {
+            warn!(
+                "REBOOT: Could not read {}: {} — treating unit as not reboot-capable",
+                install::SYSTEMD_SERVICE_PATH,
+                e
+            );
+            false
+        }
+    }
+}
+
+/// Trigger a host reboot via the systemd ExecStopPost root hook.
+///
+/// Returns `true` when the marker was written and the process is about to exit.
+/// Returns `false` when the installed unit is stale or the marker could not be
+/// written — the caller must keep the agent running.
+fn trigger_host_reboot(reason: &str) -> bool {
+    error!("REBOOT: {}", reason);
+
+    if !installed_unit_supports_reboot() {
+        error!(
+            "REBOOT: Installed systemd unit does not include the reboot hook. \
+             Refusing to exit (would leave the agent stopped without rebooting). \
+             Run: sudo connlog-agent refresh-service --restart \
+             (or update the agent so ExecStopPost refreshes the unit)."
+        );
+        return false;
+    }
+
+    match std::fs::write(platform::REBOOT_MARKER, reason) {
+        Ok(_) => {
+            info!(
+                "REBOOT: Marker written to {}. Exiting — ExecStopPost will reboot the host.",
+                platform::REBOOT_MARKER
+            );
+            // Exit with 0 so systemd Restart=on-failure does not restart us
+            // before ExecStopPost runs `systemctl reboot`.
+            std::process::exit(0);
+        }
+        Err(e) => {
+            error!(
+                "REBOOT: Could not write reboot marker: {}. Continuing without reboot.",
+                e
+            );
+            false
+        }
+    }
+}
+
 /// Response from a successful heartbeat
 struct HeartbeatResult {
     config_outdated: bool,
     latest_config_version: Option<u32>,
     uninstall: bool,
+    reboot: bool,
     update: Option<heartbeat::UpdateInfo>,
     quick_actions: Vec<features::quick_actions::QuickActionRequest>,
 }
@@ -1294,6 +1380,7 @@ fn send_heartbeat(
         config_outdated: response.config_outdated.unwrap_or(false),
         latest_config_version: response.latest_config_version,
         uninstall: response.uninstall,
+        reboot: response.reboot,
         update: response.update,
         quick_actions: response.quick_actions,
     })

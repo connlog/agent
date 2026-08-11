@@ -959,8 +959,11 @@ pub(crate) fn encode_heartbeat(payload: &HeartbeatPayload) -> [u8; 32] {
     // [24..28] disk_total_mb as u32 LE
     frame[24..28].copy_from_slice(&(payload.metrics.disk_total_mb as u32).to_le_bytes());
 
-    // [28..30] load_1m × 100 as u16 LE
-    let load_x100 = (payload.metrics.load_1m * 100.0) as u16;
+    // [28..30] load_1m × 100 as u16 LE.
+    // Clamped to 65534 (u16::MAX - 1) so 0xffff remains unambiguously
+    // "unavailable" (the CPU sentinel) and extreme loads never silently
+    // wrap around to a small value (e.g. load 700 → 1.35 without the cap).
+    let load_x100 = ((payload.metrics.load_1m * 100.0).round() as u32).min(65534) as u16;
     frame[28..30].copy_from_slice(&load_x100.to_le_bytes());
     // [30..32] load_max mirrors load_avg (no multi-sample aggregation yet)
     frame[30..32].copy_from_slice(&load_x100.to_le_bytes());
@@ -1119,7 +1122,19 @@ mod tests {
         let cpu_x100 = u16::from_le_bytes(frame[8..10].try_into().unwrap());
         assert_eq!(cpu_x100, 10000, "100% × 100 = 10000");
         let load_x100 = u16::from_le_bytes(frame[28..30].try_into().unwrap());
-        assert_eq!(load_x100, 9999, "99.99 × 100 = 9999");
+        // 99.99 × 100 = 9999.000...002 in f64, rounds to 9999
+        assert_eq!(load_x100, 9999, "99.99 × 100 = 9999 (f64 rounding)");
+    }
+
+    /// Load values above 655.35 must be clamped to 65534, not wrap around.
+    /// Without the clamp, load=700.0 → (700*100) as u16 = 4464, which the
+    /// platform decodes as 44.64 — a silent wrap to a plausible-looking value.
+    #[test]
+    fn test_frame_extreme_load_clamped() {
+        let payload = make_payload(0, 0.0, 0, 0, 0, 0, 700.0);
+        let frame = encode_heartbeat(&payload);
+        let load_x100 = u16::from_le_bytes(frame[28..30].try_into().unwrap());
+        assert_eq!(load_x100, 65534, "load 700 must clamp to 65534, not wrap");
     }
 
     #[test]
