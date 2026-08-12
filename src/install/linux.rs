@@ -112,9 +112,15 @@ elif [ -f /run/connlog/.uninstall_requested ]; then \
     rm -f /usr/local/bin/connlog-agent; \
     echo "ConnLog: Agent fully uninstalled."; \
 elif [ -f /run/connlog/.reboot_requested ]; then \
-    echo "ConnLog: Reboot marker detected, rebooting host..."; \
+    echo "ConnLog: Reboot marker detected, scheduling host reboot..."; \
     rm -f /run/connlog/.reboot_requested; \
-    systemctl reboot; \
+    # MUST use --no-block: a synchronous `systemctl reboot` waits for every
+    # unit (including this one) to finish deactivating, but we are still
+    # inside ExecStopPost — that deadlocks and the host never reboots.
+    if ! systemctl reboot --no-block; then \
+        echo "ConnLog: systemctl reboot --no-block failed; falling back to systemd-run"; \
+        systemd-run --collect --on-active=2s /bin/systemctl reboot --no-block; \
+    fi; \
 fi'
 
 [Install]
@@ -682,7 +688,14 @@ mod tests {
         assert!(SYSTEMD_SERVICE.contains("/run/connlog/.update_requested"));
         assert!(SYSTEMD_SERVICE.contains("/run/connlog/.uninstall_requested"));
         assert!(SYSTEMD_SERVICE.contains("/run/connlog/.reboot_requested"));
-        assert!(SYSTEMD_SERVICE.contains("systemctl reboot"));
+        assert!(
+            SYSTEMD_SERVICE.contains("systemctl reboot --no-block"),
+            "reboot must be non-blocking or ExecStopPost deadlocks"
+        );
+        assert!(
+            !SYSTEMD_SERVICE.contains("systemctl reboot;"),
+            "synchronous systemctl reboot inside ExecStopPost deadlocks"
+        );
         assert!(SYSTEMD_SERVICE.contains("refresh-service"));
         assert!(SYSTEMD_SERVICE.contains("ConnLog: ERROR - service refresh failed"));
     }

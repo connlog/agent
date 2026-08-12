@@ -6,6 +6,17 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 [`VERSIONING.md`](./VERSIONING.md) for the full policy. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.17.1] — 2026-08-12
+
+### Fixed
+
+- **Remote reboot no longer deadlocks in ExecStopPost.** `systemctl reboot`
+  without `--no-block` waits for every unit (including `connlog-agent`) to
+  finish deactivating, but the reboot command itself was still inside
+  `ExecStopPost` — so the host never rebooted after the three heartbeat
+  confirmations. Reboot is now `systemctl reboot --no-block`, with a
+  `systemd-run` fallback.
+
 ## [1.17.0] — 2026-08-12
 
 ### Added
@@ -810,6 +821,7 @@ considered stable; breaking changes from this point on require a major bump.
 
 - Last pre-1.0 release. See git history for prior changes.
 
+[1.17.1]: https://github.com/connlog/agent/compare/v1.17.0...v1.17.1
 [1.17.0]: https://github.com/connlog/agent/compare/v1.16.0...v1.17.0
 [1.16.0]: https://github.com/connlog/agent/compare/v1.15.1...v1.16.0
 [1.15.1]: https://github.com/connlog/agent/compare/v1.15.0...v1.15.1

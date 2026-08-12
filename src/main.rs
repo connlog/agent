@@ -1156,12 +1156,17 @@ fn trigger_self_uninstall(reason: &str) {
     std::process::exit(0);
 }
 
-/// Returns true when the installed systemd unit includes the reboot ExecStopPost
-/// branch. Without that branch, exiting after writing the reboot marker would
-/// leave the agent permanently stopped (`Restart=on-failure` ignores exit 0).
+/// Returns true when the installed systemd unit includes a *non-blocking*
+/// reboot ExecStopPost branch. Without `--no-block`, `systemctl reboot` from
+/// ExecStopPost deadlocks (waits for this unit to finish deactivating).
+/// Without any reboot branch, exiting after writing the marker would leave the
+/// agent permanently stopped (`Restart=on-failure` ignores exit 0).
 fn installed_unit_supports_reboot() -> bool {
     match std::fs::read_to_string(install::SYSTEMD_SERVICE_PATH) {
-        Ok(unit) => unit.contains("/run/connlog/.reboot_requested"),
+        Ok(unit) => {
+            unit.contains("/run/connlog/.reboot_requested")
+                && unit.contains("systemctl reboot --no-block")
+        }
         Err(e) => {
             warn!(
                 "REBOOT: Could not read {}: {} — treating unit as not reboot-capable",
