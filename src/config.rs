@@ -6,7 +6,7 @@ use std::fmt;
 #[command(about = "ConnLog monitoring agent")]
 #[command(long_about = "ConnLog monitoring agent")]
 #[command(
-    after_help = "Common usage:\n  sudo connlog-agent install --token agent_xxxxxxxxxxxx\n  sudo connlog-agent action add\n  sudo connlog-agent status\n\nTip:\n  Use `connlog-agent action --help` to manage dashboard buttons.\n  Use `connlog-agent diagnostics --help` for heartbeat/config checks.\n\nLegacy flags still work for existing scripts: --install, --uninstall, --status, --update, --check-config, --test-heartbeat."
+    after_help = "Common usage:\n  sudo connlog-agent install --token agent_xxxxxxxxxxxx\n  sudo connlog-agent action add\n  sudo connlog-agent config enable-hostname\n  sudo connlog-agent status\n\nTip:\n  Use `connlog-agent action --help` to manage dashboard buttons.\n  Use `connlog-agent diagnostics --help` for heartbeat/config checks.\n\nLegacy flags still work for existing scripts: --install, --uninstall, --status, --update, --check-config, --test-heartbeat."
 )]
 #[command(version)]
 pub struct Config {
@@ -183,6 +183,15 @@ pub enum AgentCommand {
         command: DiagnosticCommand,
     },
 
+    /// Local `/etc/connlog/agent.conf` settings
+    #[command(
+        long_about = "Create or update /etc/connlog/agent.conf on this machine.\n\nThe running service cannot write that file (it is 0600 root-only and the process is sandboxed). These commands run as root and then restart the service so the new values take effect.\n\nExamples:\n  sudo connlog-agent config enable-hostname"
+    )]
+    Config {
+        #[command(subcommand)]
+        command: LocalConfigCommand,
+    },
+
     /// Uninstall the agent
     Uninstall,
 
@@ -199,6 +208,15 @@ pub enum AgentCommand {
         long_about = "Send exactly one heartbeat to the platform, print the response, then exit without starting the normal retry loop.\n\nUse this as a smoke test after registration or service changes.\n\nExamples:\n  sudo CONNLOG_TOKEN=agent_xxxxxxxxxxxx connlog-agent test-heartbeat\n  connlog-agent test-heartbeat --token agent_xxxxxxxxxxxx"
     )]
     TestHeartbeat,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum LocalConfigCommand {
+    /// Share this machine's hostname with ConnLog
+    #[command(
+        long_about = "Create /etc/connlog/agent.conf if it is missing, set CONNLOG_EXPOSE_SYSTEM_INFO=true, and restart the agent service.\n\nHostname sharing is off by default. Run this on the server when you want ConnLog to display the hostname.\n\nExample:\n  sudo connlog-agent config enable-hostname"
+    )]
+    EnableHostname,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
@@ -635,6 +653,17 @@ mod tests {
         assert_eq!(
             cfg.command,
             Some(AgentCommand::RefreshService { restart: true })
+        );
+    }
+
+    #[test]
+    fn config_enable_hostname_subcommand_parses() {
+        let cfg = Config::parse_from(["connlog-agent", "config", "enable-hostname"]);
+        assert_eq!(
+            cfg.command,
+            Some(AgentCommand::Config {
+                command: LocalConfigCommand::EnableHostname
+            })
         );
     }
 

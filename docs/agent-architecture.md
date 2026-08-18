@@ -13,8 +13,9 @@ Its only job is to send authenticated heartbeats to the ConnLog platform every
 ~60 seconds, carrying a small set of system metrics (CPU, memory, disk, load
 average, uptime).
 
-It does nothing else. There is no log shipping, no script execution, no
-service discovery, no network probing.
+It does nothing else. There is no log shipping, no remote command execution,
+no service discovery, no network probing. Host reboot can be requested from
+the dashboard and is confirmed on three consecutive heartbeats.
 
 ---
 
@@ -112,9 +113,7 @@ On OK response:
   ├─ Reset consecutive error counters
   ├─ Check response.uninstall       — accumulate, act after 3 consecutive
   ├─ Check response.reboot          — accumulate, act after 3 consecutive
-  │                                    (writes `.reboot_requested`, exits;
-  │                                    ExecStopPost runs `systemctl reboot
-  │                                    --no-block`; skipped if unit lacks hook)
+  ├─ Ignore response.quick_actions  — never execute remote commands
   ├─ Check response.update          — try_apply_update() (see Update flow)
   ├─ Check response.config_outdated — fetch new config if true
   └─ Sleep jittered(interval_secs)  — ±10% to spread fleet load
@@ -266,6 +265,13 @@ These invariants must never be broken. They are pinned by tests in
 5. Copy the current binary to `/usr/local/bin/connlog-agent`
 6. Write the embedded systemd unit to `/etc/systemd/system/connlog-agent.service`
 7. `systemctl daemon-reload && systemctl enable && systemctl start`
+
+Hostname sharing is off by default. `install --expose-system-info` writes
+`CONNLOG_EXPOSE_SYSTEM_INFO=true` into the same file. After install, root can
+run `connlog-agent config enable-hostname`: create `/etc/connlog` and
+`agent.conf` if missing, upsert that flag without touching token/URL/BMC keys,
+then `systemctl restart connlog-agent`. The running service cannot write the
+file (`ProtectSystem=strict`, 0600 root-only).
 
 ### Uninstall (`uninstall`)
 

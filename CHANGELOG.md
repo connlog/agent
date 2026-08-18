@@ -6,6 +6,18 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 [`VERSIONING.md`](./VERSIONING.md) for the full policy. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+## [1.18.0] — 2026-08-18
+
+### Added
+
+- **`connlog-agent config enable-hostname`.** Creates `/etc/connlog/agent.conf`
+  if it is missing, sets `CONNLOG_EXPOSE_SYSTEM_INFO=true` without touching the
+  token or other keys, and restarts the systemd service so hostname sharing
+  takes effect. `install --expose-system-info` now persists the same flag into
+  the file.
+
 ## [1.17.1] — 2026-08-12
 
 ### Fixed
@@ -821,6 +833,7 @@ considered stable; breaking changes from this point on require a major bump.
 
 - Last pre-1.0 release. See git history for prior changes.
 
+[1.18.0]: https://github.com/connlog/agent/compare/v1.17.1...v1.18.0
 [1.17.1]: https://github.com/connlog/agent/compare/v1.17.0...v1.17.1
 [1.17.0]: https://github.com/connlog/agent/compare/v1.16.0...v1.17.0
 [1.16.0]: https://github.com/connlog/agent/compare/v1.15.1...v1.16.0

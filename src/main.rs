@@ -29,7 +29,7 @@ mod update;
 #[cfg(test)]
 mod simulation;
 
-use config::{AgentCommand, Config, DiagnosticCommand};
+use config::{AgentCommand, Config, DiagnosticCommand, LocalConfigCommand};
 use defaults::{CONFIG_FETCH_RETRY_DELAY_SECS, DEFAULT_ENDPOINT, DISABLED_BACKOFF_SECS};
 use endpoint_assignment::EndpointAssignmentState;
 use features::action_cli::run_action_command;
@@ -60,6 +60,9 @@ const UNINSTALL_CONFIRM_THRESHOLD: u32 = 3;
 
 /// Consecutive reboot commands required from server before acting
 const REBOOT_CONFIRM_THRESHOLD: u32 = 3;
+
+/// Remote command execution is not a product capability.
+const REMOTE_CONTROL_ENABLED: bool = false;
 
 /// Maximum config fetch failures before using fallback
 const MAX_CONFIG_FETCH_RETRIES: u32 = 3;
@@ -285,11 +288,16 @@ fn main() -> Result<()> {
             AgentCommand::Install => {
                 let token = config.token.clone().context("Token required for install")?;
                 let bmc = features::bmc::BmcConfig::from_config(&config);
-                return install::install(&token, bmc.as_ref());
+                return install::install(&token, bmc.as_ref(), config.expose_system_info);
             }
             AgentCommand::Uninstall => return install::uninstall(),
             AgentCommand::Status => return install::status(),
             AgentCommand::RefreshService { restart } => return install::refresh_service(restart),
+            AgentCommand::Config { command } => match command {
+                LocalConfigCommand::EnableHostname => {
+                    return install::enable_hostname_sharing();
+                }
+            },
             AgentCommand::Update => return update::run_manual_update(),
             AgentCommand::CheckConfig => {
                 let token = config
@@ -386,7 +394,7 @@ fn main() -> Result<()> {
             .clone()
             .context("Token required for installation")?;
         let bmc = features::bmc::BmcConfig::from_config(&config);
-        return install::install(&token, bmc.as_ref());
+        return install::install(&token, bmc.as_ref(), config.expose_system_info);
     }
 
     // Run mode - require token
@@ -655,14 +663,13 @@ fn run_agent_with_shutdown_inner(
                     }
                 }
 
-                if reload_quick_actions_if_changed(
-                    &client,
-                    &mut quick_actions,
-                    &mut quick_actions_fingerprint,
-                ) {
-                    quick_action_polling.sync(&config.quick_actions, &quick_actions);
+                // Monitoring-only: do not execute dashboard-triggered commands.
+                if !response.quick_actions.is_empty() {
+                    warn!(
+                        "Ignoring {} remote action request(s) — ConnLog does not execute remote commands",
+                        response.quick_actions.len()
+                    );
                 }
-                run_quick_action_requests(&client, &quick_actions, &response.quick_actions);
 
                 info!(
                     "Heartbeat sent successfully, next in {}s",
@@ -894,7 +901,7 @@ fn sleep_with_quick_action_polling(
             return Ok(());
         }
 
-        if quick_action_polling.due(now) {
+        if REMOTE_CONTROL_ENABLED && quick_action_polling.due(now) {
             poll_quick_actions_once(
                 client,
                 quick_actions,
@@ -905,10 +912,14 @@ fn sleep_with_quick_action_polling(
             continue;
         }
 
-        let next_wake = quick_action_polling
-            .next_due()
-            .map(|next_due| std::cmp::min(deadline, next_due))
-            .unwrap_or(deadline);
+        let next_wake = if REMOTE_CONTROL_ENABLED {
+            quick_action_polling
+                .next_due()
+                .map(|next_due| std::cmp::min(deadline, next_due))
+                .unwrap_or(deadline)
+        } else {
+            deadline
+        };
         let sleep_for = std::cmp::min(
             Duration::from_millis(500),
             next_wake.saturating_duration_since(now),

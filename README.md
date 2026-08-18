@@ -16,7 +16,7 @@ curl -fsSL https://connlog.com/install.sh | sudo sh -s -- --install --token <TOK
 
 This detects your architecture, downloads the latest release, verifies its SHA-256 checksum, installs the binary to `/usr/local/bin/connlog-agent`, stores your token in `/etc/connlog/agent.conf`, and starts a systemd service. The agent begins reporting immediately.
 
-Get your token from the [ConnLog dashboard](https://connlog.com) under **Agents → Add Agent**.
+Get your token from the [ConnLog dashboard](https://connlog.com) under **Servers → Add server**.
 
 ### Supported platforms
 
@@ -54,7 +54,7 @@ connlog-agent register
 | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `CONNLOG_TOKEN`                   | Agent auth token (`agent_...`), alternative to `--token`                                                                                                                            |
 | `CONNLOG_PLATFORM_URL`            | Override the control-plane URL (defaults to `https://connlog.com`); mainly for self-hosted deployments                                                                              |
-| `CONNLOG_EXPOSE_SYSTEM_INFO`      | Set to `true` to opt in to sending hostname/OS/arch with heartbeats (off by default)                                                                                                |
+| `CONNLOG_EXPOSE_SYSTEM_INFO`      | Set to `true` to opt in to sending hostname with heartbeats (off by default). Prefer `sudo connlog-agent config enable-hostname`, which creates `/etc/connlog/agent.conf` if needed and restarts the service. |
 | `CONNLOG_ALLOWED_ENDPOINT_DOMAINS`| Comma-separated extra domains the agent will trust for heartbeat **endpoint assignments** (see below), in addition to `connlog.com`; only relevant for self-hosted/regional setups |
 
 ## Management
@@ -70,6 +70,9 @@ journalctl -u connlog-agent -f
 
 # Refresh the installed systemd unit from the current binary
 sudo connlog-agent refresh-service --restart
+
+# Share this machine's hostname with ConnLog (creates /etc/connlog/agent.conf if needed)
+sudo connlog-agent config enable-hostname
 
 # Uninstall (stops service, removes all files)
 sudo connlog-agent uninstall
@@ -306,17 +309,18 @@ arbitrary shell commands or command arguments.
 ## How it works
 
 1. Agent sends a heartbeat to the platform every 60 seconds (configurable server-side)
-2. Platform responds with the latest config (metric toggles, intervals, payload limits)
-3. Agent polls Quick Action requests on its own short interval when local actions are enabled
-4. Agent applies config changes without restart
-5. On startup, then roughly once a day (or sooner after repeated heartbeat
+2. Platform responds with the latest config (metric toggles, intervals)
+3. Agent applies config changes without restart
+4. On startup, then roughly once a day (or sooner after repeated heartbeat
    failures), the agent asks the platform which heartbeat endpoint to use and
-   switches to it if — and only if — it's a trusted, validated HTTPS URL; this
-   lets ConnLog migrate heartbeat traffic to regional servers later with no
-   agent-side changes (today there are no regions configured, so this is a
-   no-op and every agent keeps using the platform's own URL)
-6. Self-updates refresh the systemd unit from the new binary before the service restarts
-7. If the platform marks the agent for uninstall (HTTP 410), the agent triggers a self-cleanup via systemd `ExecStopPost`
+   switches to it if — and only if — it's a trusted, validated HTTPS URL
+5. Self-updates refresh the systemd unit from the new binary before the service restarts
+6. If the platform marks the agent for uninstall (HTTP 410), the agent triggers a self-cleanup via systemd `ExecStopPost`
+
+ConnLog does **not** remotely execute arbitrary commands. Host reboot can be
+requested from the dashboard and is confirmed on three consecutive heartbeats
+before systemd reboots the machine. Local `connlog-agent action` tooling may
+still exist on disk; the platform will not trigger it.
 
 ### Collected metrics
 

@@ -127,7 +127,11 @@ fi'
 WantedBy=multi-user.target
 "#;
 
-pub fn install(token: &str, bmc: Option<&crate::features::bmc::BmcConfig>) -> Result<()> {
+pub fn install(
+    token: &str,
+    bmc: Option<&crate::features::bmc::BmcConfig>,
+    expose_system_info: bool,
+) -> Result<()> {
     // Check if running as root
     if !is_root() {
         anyhow::bail!("Installation requires root privileges. Please run with sudo.");
@@ -146,9 +150,13 @@ pub fn install(token: &str, bmc: Option<&crate::features::bmc::BmcConfig>) -> Re
     create_config_dir()?;
 
     // Write config file with token (+ BMC settings if provided)
-    write_config(token, &platform_url, bmc)?;
+    write_config(token, &platform_url, bmc, expose_system_info)?;
     if bmc.is_some() {
         println!("  BMC hardware-health polling configured (iDRAC / iLO / OpenBMC)");
+    }
+
+    if expose_system_info {
+        println!("  Hostname sharing enabled (CONNLOG_EXPOSE_SYSTEM_INFO=true)");
     }
 
     // Copy binary to /usr/local/bin
@@ -454,12 +462,17 @@ fn write_config(
     token: &str,
     platform_url: &str,
     bmc: Option<&crate::features::bmc::BmcConfig>,
+    expose_system_info: bool,
 ) -> Result<()> {
     let mut config = format!(
         "CONNLOG_TOKEN=\"{}\"\nCONNLOG_PLATFORM_URL=\"{}\"\n",
         escape_env_value(token),
         escape_env_value(platform_url),
     );
+
+    if expose_system_info {
+        config.push_str("CONNLOG_EXPOSE_SYSTEM_INFO=\"true\"\n");
+    }
 
     // Persist BMC hardware-health settings so the installed systemd service
     // (which sources this EnvironmentFile) polls the BMC. Only written when all
@@ -477,18 +490,93 @@ fn write_config(
         ));
     }
 
-    fs::write("/etc/connlog/agent.conf", config).context("Failed to write config file")?;
+    write_agent_conf(&config)?;
+    println!("  Wrote config to /etc/connlog/agent.conf (600 root:root)");
+    Ok(())
+}
 
-    // Set permissions to 600 (root-only)
+/// Create `/etc/connlog/agent.conf` if missing, set hostname sharing on, and
+/// restart the service so systemd reloads the EnvironmentFile.
+pub fn enable_hostname_sharing() -> Result<()> {
+    if !is_root() {
+        anyhow::bail!("This command requires root. Please run with sudo.");
+    }
+
+    if !Path::new("/etc/connlog").exists() {
+        create_config_dir()?;
+    }
+
     let path = Path::new("/etc/connlog/agent.conf");
+    let created = !path.exists();
+    let existing = if created {
+        String::new()
+    } else {
+        fs::read_to_string(path).context("Failed to read /etc/connlog/agent.conf")?
+    };
+    let next = upsert_env_line(&existing, "CONNLOG_EXPOSE_SYSTEM_INFO", "true");
+    write_agent_conf(&next)?;
+
+    if created {
+        println!("  Created /etc/connlog/agent.conf (600 root:root)");
+    }
+    println!("  Set CONNLOG_EXPOSE_SYSTEM_INFO=true");
+
+    restart_agent_service()
+}
+
+fn write_agent_conf(contents: &str) -> Result<()> {
+    let path = Path::new("/etc/connlog/agent.conf");
+    fs::write(path, contents).context("Failed to write /etc/connlog/agent.conf")?;
+
     let mut perms = fs::metadata(path)
         .context("Failed to read /etc/connlog/agent.conf metadata")?
         .permissions();
     perms.set_mode(0o600);
     fs::set_permissions(path, perms)
         .context("Failed to set /etc/connlog/agent.conf permissions")?;
+    Ok(())
+}
 
-    println!("  Wrote config to /etc/connlog/agent.conf (600 root:root)");
+/// Replace or append `KEY="value"` in a systemd EnvironmentFile body.
+/// Duplicate keys are collapsed to a single assignment.
+fn upsert_env_line(existing: &str, key: &str, value: &str) -> String {
+    let assignment = format!("{}=\"{}\"\n", key, escape_env_value(value));
+    let prefix = format!("{key}=");
+    let mut found = false;
+    let mut out = String::new();
+    for line in existing.lines() {
+        if line.trim_start().starts_with(&prefix) {
+            if !found {
+                out.push_str(&assignment);
+                found = true;
+            }
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !found {
+        out.push_str(&assignment);
+    }
+    out
+}
+
+fn restart_agent_service() -> Result<()> {
+    if !Path::new(SYSTEMD_SERVICE_PATH).exists() {
+        println!(
+            "  Agent service is not installed. The setting is saved; start the agent to apply it."
+        );
+        return Ok(());
+    }
+
+    let status = Command::new("systemctl")
+        .args(["restart", "connlog-agent"])
+        .status()
+        .context("Failed to restart connlog-agent")?;
+    if !status.success() {
+        anyhow::bail!("Failed to restart connlog-agent. Try: sudo systemctl restart connlog-agent");
+    }
+    println!("  Restarted connlog-agent");
     Ok(())
 }
 
@@ -662,6 +750,46 @@ mod tests {
             "no unescaped quote may survive, got: {}",
             twice
         );
+    }
+
+    #[test]
+    fn upsert_creates_file_body_when_empty() {
+        assert_eq!(
+            upsert_env_line("", "CONNLOG_EXPOSE_SYSTEM_INFO", "true"),
+            "CONNLOG_EXPOSE_SYSTEM_INFO=\"true\"\n"
+        );
+    }
+
+    #[test]
+    fn upsert_appends_without_touching_token() {
+        let existing =
+            "CONNLOG_TOKEN=\"agent_abc\"\nCONNLOG_PLATFORM_URL=\"https://connlog.com\"\n";
+        let next = upsert_env_line(existing, "CONNLOG_EXPOSE_SYSTEM_INFO", "true");
+        assert!(next.contains("CONNLOG_TOKEN=\"agent_abc\""));
+        assert!(next.contains("CONNLOG_PLATFORM_URL=\"https://connlog.com\""));
+        assert!(next.contains("CONNLOG_EXPOSE_SYSTEM_INFO=\"true\""));
+        assert_eq!(
+            next.matches("CONNLOG_EXPOSE_SYSTEM_INFO=").count(),
+            1,
+            "must not duplicate the key"
+        );
+    }
+
+    #[test]
+    fn upsert_replaces_existing_false_value() {
+        let existing = "CONNLOG_TOKEN=\"agent_abc\"\nCONNLOG_EXPOSE_SYSTEM_INFO=\"false\"\n";
+        let next = upsert_env_line(existing, "CONNLOG_EXPOSE_SYSTEM_INFO", "true");
+        assert!(next.contains("CONNLOG_EXPOSE_SYSTEM_INFO=\"true\""));
+        assert!(!next.contains("false"));
+        assert!(next.contains("CONNLOG_TOKEN=\"agent_abc\""));
+    }
+
+    #[test]
+    fn upsert_collapses_duplicate_keys() {
+        let existing = "CONNLOG_EXPOSE_SYSTEM_INFO=false\nCONNLOG_TOKEN=\"t\"\nCONNLOG_EXPOSE_SYSTEM_INFO=true\n";
+        let next = upsert_env_line(existing, "CONNLOG_EXPOSE_SYSTEM_INFO", "true");
+        assert_eq!(next.matches("CONNLOG_EXPOSE_SYSTEM_INFO=").count(), 1);
+        assert!(next.contains("CONNLOG_TOKEN=\"t\""));
     }
 
     // ── SYSTEMD_SERVICE invariants ──────────────────────────────
