@@ -1,5 +1,7 @@
 # ConnLog Agent — Copilot Instructions
 
+If anything about the request is ambiguous — protocol, flags, systemd, or which repo to change — **stop and ask** before implementing. Do not guess.
+
 ## Stack
 
 - **Language**: Rust (stable), cross-compiled via `cross` for `x86_64` and `aarch64` musl
