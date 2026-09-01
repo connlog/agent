@@ -252,6 +252,7 @@ fn make_payload() -> HeartbeatPayload {
         metrics: Metrics {
             cpu_percent: Some(12.34),
             cpu_peak_percent: Some(12.34),
+            cpu_core_count: None,
             memory_used_mb: 100,
             memory_total_mb: 1024,
             disk_used_mb: 5_000,

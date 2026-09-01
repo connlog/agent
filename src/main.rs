@@ -1280,6 +1280,9 @@ fn send_heartbeat(
             } else {
                 None
             },
+            // Identity, not a reading: sent whenever it is known so the
+            // dashboard can scale the load average to the machine.
+            cpu_core_count: metrics.cpu_core_count,
             memory_used_mb: if config.metrics.memory {
                 metrics.memory_used_mb
             } else {
@@ -1310,6 +1313,7 @@ fn send_heartbeat(
         heartbeat::Metrics {
             cpu_percent: None,
             cpu_peak_percent: None,
+            cpu_core_count: metrics.cpu_core_count,
             memory_used_mb: 0,
             memory_total_mb: 0,
             disk_used_mb: 0,

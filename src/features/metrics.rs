@@ -9,6 +9,9 @@ pub struct SystemMetrics {
     pub uptime_seconds: u64,
     pub cpu_percent: Option<f64>,
     pub cpu_peak_percent: Option<f64>,
+    /// Logical CPU count. Hardware identity rather than a reading, so it is
+    /// not subject to the CPU metric toggle; `None` when it cannot be read.
+    pub cpu_core_count: Option<u32>,
     pub memory_used_mb: u64,
     pub memory_total_mb: u64,
     pub disk_used_mb: u64,
@@ -32,6 +35,7 @@ impl SystemMetrics {
             uptime_seconds: 0,
             cpu_percent: None,
             cpu_peak_percent: None,
+            cpu_core_count: None,
             memory_used_mb: 0,
             memory_total_mb: 0,
             disk_used_mb: 0,
@@ -258,7 +262,7 @@ impl MetricsCollector {
         //
         // Non-Linux: fall back to sysinfo's two-refresh-with-sleep recipe.
         #[cfg(target_os = "linux")]
-        let cpu_percent = {
+        let (cpu_percent, cpu_core_count) = {
             let curr = read_proc_stat_cpu();
             let (avg, peak) = match (&self.prev_cpu, &curr) {
                 (Some(prev), Some(c)) => {
@@ -267,17 +271,24 @@ impl MetricsCollector {
                 }
                 _ => (None, None),
             };
+            // `/proc/stat` lists one `cpuN` line per online logical CPU, which
+            // is the count the load average should be read against.
+            let cores = curr
+                .as_ref()
+                .map(|c| c.cores.len() as u32)
+                .filter(|n| *n > 0);
             self.prev_cpu = curr;
-            (avg, peak)
+            ((avg, peak), cores)
         };
 
         #[cfg(not(target_os = "linux"))]
-        let cpu_percent = {
+        let (cpu_percent, cpu_core_count) = {
             self.sys.refresh_cpu_usage();
             std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
             self.sys.refresh_cpu_usage();
             let avg = Some(self.sys.global_cpu_usage() as f64);
-            (avg, avg)
+            let cores = u32::try_from(self.sys.cpus().len()).ok().filter(|n| *n > 0);
+            ((avg, avg), cores)
         };
 
         // Memory + disks don't need the two-step dance.
@@ -389,6 +400,7 @@ impl MetricsCollector {
             uptime_seconds,
             cpu_percent: cpu_percent.0,
             cpu_peak_percent: cpu_percent.1,
+            cpu_core_count,
             memory_used_mb,
             memory_total_mb,
             disk_used_mb,
@@ -464,6 +476,20 @@ mod tests {
         assert!(
             m.cpu_percent.is_none(),
             "first CPU sample should be unavailable, not a fake zero"
+        );
+    }
+
+    /// The logical CPU count is hardware identity: available from the very
+    /// first sample, and never zero on a running host.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn first_linux_collect_reports_core_count() {
+        let mut c = MetricsCollector::new().expect("collector init must work in tests");
+        let m = c.collect().expect("first collect");
+        assert!(
+            m.cpu_core_count.is_some_and(|n| n > 0),
+            "core count should be known from /proc/stat, got {:?}",
+            m.cpu_core_count
         );
     }
 
