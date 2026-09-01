@@ -165,6 +165,40 @@ pub(crate) const REQUEST_TIMEOUT_SECS: u64 = 10;
 /// fast on a black-holed route and reach the retry/back-off path quickly.
 pub(crate) const CONNECT_TIMEOUT_SECS: u64 = 5;
 
+/// How much of a non-success response body is read before it is logged. The
+/// platform's error bodies are a few hundred bytes; anything the agent talks to
+/// that answers with more is not a platform we want buffering in memory or
+/// writing into the journal.
+const MAX_ERROR_BODY_BYTES: u64 = 8 * 1024;
+
+/// Upper bound on a config response. The real payload is well under a
+/// kilobyte; the cap only exists so a wrong server cannot make the agent
+/// allocate without limit.
+const MAX_CONFIG_BODY_BYTES: u64 = 1024 * 1024;
+
+/// A bounded, sanitized excerpt of an error body: whitespace collapsed, secrets
+/// redacted, length capped, so it is safe to log and cannot inject lines into
+/// the journal. Reads at most `MAX_ERROR_BODY_BYTES` from the wire.
+fn error_body_excerpt(response: reqwest::blocking::Response) -> String {
+    let mut buf = Vec::new();
+    let mut limited = std::io::Read::take(response, MAX_ERROR_BODY_BYTES);
+    if std::io::Read::read_to_end(&mut limited, &mut buf).is_err() || buf.is_empty() {
+        return "Unknown error".to_string();
+    }
+    crate::features::heartbeat_telemetry::sanitize_detail(&String::from_utf8_lossy(&buf))
+}
+
+/// Read a success body up to `max` bytes as text.
+fn read_body_bounded(response: reqwest::blocking::Response, max: u64) -> anyhow::Result<String> {
+    let mut buf = Vec::new();
+    let mut limited = std::io::Read::take(response, max + 1);
+    std::io::Read::read_to_end(&mut limited, &mut buf).context("Failed to read response body")?;
+    if buf.len() as u64 > max {
+        anyhow::bail!("Response body exceeded the {} byte cap", max);
+    }
+    String::from_utf8(buf).context("Response body is not valid UTF-8")
+}
+
 impl ApiClient {
     pub fn new(base_url: String, token: String) -> Result<Self> {
         let client = Client::builder()
@@ -492,12 +526,9 @@ impl ApiClient {
                     .and_then(|value| value.trim().parse::<u64>().ok());
                 return Err(ApiError::RateLimited { retry_after_secs });
             }
-            let error_text = response
-                .text()
-                .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(ApiError::HttpError {
                 status: status.as_u16(),
-                message: error_text,
+                message: error_body_excerpt(response),
             });
         }
 
@@ -567,15 +598,12 @@ impl ApiClient {
 
         let status = response.status();
         if !status.is_success() {
-            let error_text = response
-                .text()
-                .unwrap_or_else(|_| "Unknown error".to_string());
+            let error_text = error_body_excerpt(response);
             anyhow::bail!("Config fetch failed with status {}: {}", status, error_text);
         }
 
         // Get the response text first for better error reporting
-        let response_text = response
-            .text()
+        let response_text = read_body_bounded(response, MAX_CONFIG_BODY_BYTES)
             .context("Failed to read config response body")?;
 
         // The platform wraps successful responses in an `apiResponse.ok`
@@ -690,9 +718,7 @@ impl ApiClient {
         if !response.status().is_success() {
             return Err(ApiError::HttpError {
                 status: response.status().as_u16(),
-                message: response
-                    .text()
-                    .unwrap_or_else(|_| "Unknown error".to_string()),
+                message: error_body_excerpt(response),
             });
         }
 

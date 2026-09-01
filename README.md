@@ -2,7 +2,7 @@
 
 Lightweight Linux monitoring agent for [ConnLog](https://connlog.com). Collects CPU, memory, disk, and load metrics and sends them to the ConnLog platform via authenticated heartbeats.
 
-Single static binary. One-command install. Zero dependencies.
+Single static binary. One-command install. No runtime dependencies.
 
 > **Source:** [github.com/connlog/agent](https://github.com/connlog/agent)  
 > **Binary/service name:** `connlog-agent`  
@@ -11,42 +11,43 @@ Single static binary. One-command install. Zero dependencies.
 ## Install
 
 ```bash
-curl -fsSL https://connlog.com/install.sh | sudo sh -s -- --install --token <TOKEN>
+curl -fsSL https://connlog.com/install.sh | sudo CONNLOG_TOKEN=<TOKEN> sh -s -- --install
 ```
 
-This detects your architecture, downloads the latest release, verifies its SHA-256 checksum, installs the binary to `/usr/local/bin/connlog-agent`, stores your token in `/etc/connlog/agent.conf`, and starts a systemd service. The agent begins reporting immediately.
+This detects your architecture, downloads the latest release from GitHub, checks its SHA-256 and verifies its Ed25519 signature against the ConnLog release key pinned in the script, installs the binary root-owned to `/usr/local/bin/connlog-agent`, stores your token in `/etc/connlog/agent.conf`, and starts a systemd service. The agent begins reporting immediately. Every check fails closed: nothing is installed if a download, checksum or signature does not verify.
+
+The token goes in the environment rather than on the command line, so it never shows up in `ps` or `/proc/<pid>/cmdline` for other users on the host. `--token <TOKEN>` still works for older scripts. To review the script first, download it and run it with `sh install.sh`; `--version vX.Y.Z` installs a specific release.
+
+The installer itself lives in the platform repository (`connlog-platform/public/install.sh`) and is served at `https://connlog.com/install.sh`.
 
 Get your token from the [ConnLog dashboard](https://connlog.com) under **Servers → Add server**.
 
 ### Supported platforms
 
-| OS    | Architecture | Binary                                 |
-| ----- | ------------ | -------------------------------------- |
-| Linux | x86_64       | `connlog-agent-*-linux-x86_64.tar.gz`  |
-| Linux | aarch64      | `connlog-agent-*-linux-aarch64.tar.gz` |
+| OS    | Architecture | Release asset                       |
+| ----- | ------------ | ----------------------------------- |
+| Linux | x86_64       | `connlog-agent-vX.Y.Z-linux-x86_64`  |
+| Linux | aarch64      | `connlog-agent-vX.Y.Z-linux-aarch64` |
+
+Each raw binary ships with a `.sha256` checksum and a `.sig` (Ed25519 over the SHA-256 digest). Tarballs of the same binaries are published with a `.sha256` for convenience.
 
 ### Two-step install
 
 ```bash
-# 1. Download binary only
-curl -fsSL https://connlog.com/install.sh | sh
+# 1. Download and verify the binary only
+curl -fsSL https://connlog.com/install.sh | sudo sh
 
 # 2. Install as systemd service
-sudo connlog-agent install --token <TOKEN>
+sudo CONNLOG_TOKEN=<TOKEN> connlog-agent install
 ```
 
 ### Run without systemd
 
 ```bash
-connlog-agent register --token <TOKEN>
+CONNLOG_TOKEN=<TOKEN> connlog-agent register
 ```
 
-You can also pass the token via the `CONNLOG_TOKEN` environment variable:
-
-```bash
-export CONNLOG_TOKEN=agent_xxxxxxxxxxxx
-connlog-agent register
-```
+`--token <TOKEN>` is accepted too, but a command-line argument is readable by every user on the host; prefer the environment variable.
 
 ### Environment variables
 
@@ -56,6 +57,10 @@ connlog-agent register
 | `CONNLOG_PLATFORM_URL`            | Override the control-plane URL (defaults to `https://connlog.com`); mainly for self-hosted deployments                                                                              |
 | `CONNLOG_EXPOSE_SYSTEM_INFO`      | Set to `true` to opt in to sending hostname with heartbeats (off by default). Prefer `sudo connlog-agent config enable-hostname`, which creates `/etc/connlog/agent.conf` if needed and restarts the service. |
 | `CONNLOG_ALLOWED_ENDPOINT_DOMAINS`| Comma-separated extra domains the agent will trust for heartbeat **endpoint assignments** (see below), in addition to `connlog.com`; only relevant for self-hosted/regional setups |
+| `CONNLOG_BMC_ENDPOINT`            | Optional. The Redfish endpoint of this machine's BMC (iDRAC, iLO, OpenBMC), e.g. `https://10.0.0.120`. With the username and password below, the agent polls it for hardware health (drives, volumes, controllers, fans, PSUs, temperatures) and reports it to ConnLog. Also set by `install --bmc-endpoint ...`. |
+| `CONNLOG_BMC_USERNAME`, `CONNLOG_BMC_PASSWORD` | BMC credentials. Stored in `/etc/connlog/agent.conf` (0600 root), sent only to the configured BMC origin, never to ConnLog. |
+| `CONNLOG_BMC_POLL_INTERVAL_SECS`  | How often the BMC is polled (clamped to a sane range).                                                                                                                             |
+| `CONNLOG_BMC_INSECURE_TLS`        | `true` to accept the BMC's self-signed certificate. Applies to the BMC connection only, never to ConnLog traffic.                                                                  |
 
 ## Management
 
@@ -74,13 +79,13 @@ sudo connlog-agent refresh-service --restart
 # Share this machine's hostname with ConnLog (creates /etc/connlog/agent.conf if needed)
 sudo connlog-agent config enable-hostname
 
-# Uninstall (stops service, removes all files)
+# Uninstall (stops the service; removes the config, local diagnostics and the binary)
 sudo connlog-agent uninstall
 ```
 
 Note: uninstall preserves the `connlog-agent` system user. Remove it manually if needed: `sudo userdel connlog-agent`.
 
-You can also trigger a remote uninstall from the ConnLog dashboard.
+You can also request removal from the ConnLog dashboard. The agent acts after three consecutive heartbeats confirm the request, or immediately when the platform answers 410 for an agent that has been deleted. A rejected token (401) never removes anything: the agent keeps its files and keeps retrying.
 
 ### Diagnostics
 
@@ -314,8 +319,8 @@ arbitrary shell commands or command arguments.
 4. On startup, then roughly once a day (or sooner after repeated heartbeat
    failures), the agent asks the platform which heartbeat endpoint to use and
    switches to it if — and only if — it's a trusted, validated HTTPS URL
-5. Self-updates refresh the systemd unit from the new binary before the service restarts
-6. If the platform marks the agent for uninstall (HTTP 410), the agent triggers a self-cleanup via systemd `ExecStopPost`
+5. When the platform offers a newer release, the agent downloads it, checks the SHA-256 and verifies the Ed25519 signature with the key compiled into the binary, stages it, and exits. The systemd `ExecStopPost` hook then runs `connlog-agent apply-staged-update` as root, which verifies the signature again, runs the staged binary to confirm it reports a strictly higher version, swaps it in with an atomic rename, refreshes the unit from the new binary, and rolls back if that fails. The service is started again either way.
+6. If the platform requests removal (three consecutive confirmations, or HTTP 410 for a deleted agent), the agent triggers a self-cleanup via systemd `ExecStopPost`
 
 ConnLog does **not** remotely execute arbitrary commands. Host reboot can be
 requested from the dashboard and is confirmed on three consecutive heartbeats
@@ -327,26 +332,35 @@ still exist on disk; the platform will not trigger it.
 | Metric            | Description                         |
 | ----------------- | ----------------------------------- |
 | `cpu_percent`     | CPU usage across all cores          |
+| `cpu_max`         | Busiest single core                 |
+| `cpu_core_count`  | Logical CPU count (header)          |
 | `memory_used_mb`  | Used RAM in MB                      |
 | `memory_total_mb` | Total RAM in MB                     |
-| `disk_used_mb`    | Used disk on root filesystem in MB  |
-| `disk_total_mb`   | Total disk on root filesystem in MB |
+| `disk_used_mb`    | Used disk in MB, summed across real filesystems (deduplicated by device) |
+| `disk_total_mb`   | Total disk in MB, same set of filesystems |
 | `load_1m`         | 1-minute load average               |
-| `hostname`        | System hostname                     |
+| `hostname`        | System hostname, only with the opt-in (`CONNLOG_EXPOSE_SYSTEM_INFO=true`) |
 | `os`              | Operating system                    |
 | `arch`            | CPU architecture                    |
 | `uptime_seconds`  | System uptime                       |
+| `machine_id`      | SHA-256 hash of `/etc/machine-id` (header), never the raw value |
 
 Each metric category (CPU, memory, disk, load) can be toggled on/off from the dashboard.
+
+With a BMC configured, the agent also reports hardware health (drive, volume, controller, fan, PSU and temperature status with model and capacity attributes) to `POST /api/agents/hardware-health`. Drive serial numbers are included only with the same opt-in as the hostname.
 
 ## File layout
 
 ```txt
-/usr/local/bin/connlog-agent              # Binary
-/etc/connlog/agent.conf                   # Token + platform URL (mode 600, root-only)
+/usr/local/bin/connlog-agent              # Binary (0755 root:root; the update path refuses anything else)
+/etc/connlog/agent.conf                   # Token, platform URL, opt-ins, BMC settings (mode 600, root-only)
+/etc/connlog/actions.toml                 # Local dashboard actions, if any (group-readable)
 /etc/systemd/system/connlog-agent.service
-/var/lib/connlog/heartbeat-telemetry.jsonl # Heartbeat delivery diagnostics (mode 700, connlog-agent)
+/var/lib/connlog/heartbeat-telemetry.jsonl # Heartbeat delivery diagnostics (dir mode 700, connlog-agent)
+/var/lib/connlog/update-failed            # Present only after an update was rejected; cleared on the next success
 ```
+
+`connlog-agent uninstall` (and a remote uninstall) removes all of these.
 
 ## Development
 
@@ -356,8 +370,11 @@ Requires [Rust](https://rustup.rs) (stable).
 # Debug build — includes --endpoint flag for local testing
 cargo run -- --token <TOKEN> --endpoint http://localhost:3000
 
-# Release build — hardcoded to https://connlog.com
-cargo build --release
+# Release build. The platform URL is https://connlog.com unless
+# CONNLOG_PLATFORM_URL is set in the environment; the --endpoint flag is
+# debug-only. A release build refuses to compile without the release
+# signing public key, so a local one needs the opt-out:
+CONNLOG_ALLOW_UNSIGNED_BUILD=1 cargo build --release
 ```
 
 ### Cross-compilation
@@ -365,7 +382,7 @@ cargo build --release
 CI uses [cross](https://github.com/cross-rs/cross):
 
 ```bash
-cargo install cross --git https://github.com/cross-rs/cross
+cargo install cross@0.2.5 --locked
 
 # Linux x86_64 (musl static)
 cross build --release --target x86_64-unknown-linux-musl
@@ -382,7 +399,16 @@ Push a version tag to trigger CI:
 git tag vX.Y.Z && git push origin vX.Y.Z
 ```
 
-GitHub Actions builds both Linux targets (`x86_64-musl`, `aarch64-musl`), creates tarballs with SHA-256 checksums and Ed25519 signatures, and publishes a GitHub release. The install script picks up the latest release automatically.
+GitHub Actions builds both Linux targets (`x86_64-musl`, `aarch64-musl`) with the release signing public key compiled in (the build fails without it), signs each raw binary with the Ed25519 release key using OpenSSL (`scripts/sign-release.sh`, which also checks that the private key matches the compiled-in public key), attaches SHA-256 checksums and build provenance attestations, and publishes a GitHub release. The install script picks up the latest release automatically and verifies it with the pinned public key. The full runbook is in [`docs/RELEASING.md`](docs/RELEASING.md).
+
+## Security
+
+- **Transport.** All platform traffic is HTTPS with rustls. Redirects are disabled on every request that carries the token. Heartbeats can be reassigned only to a `*.connlog.com` host (or a domain you list in `CONNLOG_ALLOWED_ENDPOINT_DOMAINS`).
+- **Updates.** Only a release signed with the ConnLog Ed25519 key is ever installed, and only if it is newer than the running version. The running (unprivileged) agent verifies the download; the root-side `apply-staged-update` step verifies the staged bytes again with its own compiled-in key and runs the binary to confirm the version before the atomic swap. There is no way to skip verification: a build without the key refuses all updates.
+- **Privilege.** The service runs as the `connlog-agent` system user with the systemd sandbox in `src/install/linux.rs`. Root is used only by the `ExecStopPost` hook, for the three things the agent cannot do itself: apply a verified update, remove itself, reboot the host.
+- **What leaves the host.** Exactly the fields in the table above, plus hardware health when a BMC is configured. Local actions are never executed on request from the platform in this version.
+- **Secrets.** The token and BMC password live in `/etc/connlog/agent.conf` (0600 root). They are redacted from logs and diagnostics and never inherited by local action processes.
+- **Reporting.** See the [ConnLog security page](https://connlog.com/security) for how to report a vulnerability.
 
 ## Platform support
 

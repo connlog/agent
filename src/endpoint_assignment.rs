@@ -309,8 +309,8 @@ impl EndpointAssignmentState {
     /// `FetchEndpointAssignment` validates and applies a freshly-fetched
     /// assignment. An untrusted/malformed URL is logged and discarded — the
     /// agent falls back to the default rather than ever sending heartbeats
-    /// (which never carry the bearer token, but do carry machine metadata) to
-    /// an arbitrary endpoint.
+    /// to an arbitrary endpoint. Heartbeats carry the bearer token, so the
+    /// host check below is what keeps the token on ConnLog infrastructure.
     fn apply(
         &mut self,
         response: EndpointAssignmentResponse,

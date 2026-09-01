@@ -54,6 +54,9 @@ const REPORT_TIMEOUT_SECS: u64 = 15;
 const MAX_COMPONENTS: usize = 256;
 const MAX_BMC_REQUESTS: usize = 200;
 
+/// Largest Redfish document the poller will read. Real ones are a few KB.
+const MAX_BMC_BODY_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Delay before the first poll so the initial heartbeat registers the agent
 /// before any hardware report arrives.
 const INITIAL_POLL_DELAY_SECS: u64 = 15;
@@ -218,7 +221,7 @@ fn insert_attr(attrs: &mut serde_json::Map<String, Value>, key: &str, value: Opt
 }
 
 /// Physical drive → component. `None` for absent bays or undecodable docs.
-pub(crate) fn drive_component(doc: &Value) -> Option<HardwareComponent> {
+pub(crate) fn drive_component(doc: &Value, include_identifiers: bool) -> Option<HardwareComponent> {
     if is_absent(doc) {
         return None;
     }
@@ -231,11 +234,15 @@ pub(crate) fn drive_component(doc: &Value) -> Option<HardwareComponent> {
 
     let mut attributes = serde_json::Map::new();
     insert_attr(&mut attributes, "model", doc.get("Model").cloned());
-    insert_attr(
-        &mut attributes,
-        "serial_number",
-        doc.get("SerialNumber").cloned(),
-    );
+    // A drive serial number identifies a physical machine more precisely
+    // than a hostname does, and the hostname is opt-in.
+    if include_identifiers {
+        insert_attr(
+            &mut attributes,
+            "serial_number",
+            doc.get("SerialNumber").cloned(),
+        );
+    }
     insert_attr(&mut attributes, "media_type", doc.get("MediaType").cloned());
     insert_attr(
         &mut attributes,
@@ -507,6 +514,12 @@ pub(crate) fn power_components(power_doc: &Value, chassis_key: &str) -> Vec<Hard
 struct RedfishClient {
     http: reqwest::blocking::Client,
     config: BmcConfig,
+    /// The configured endpoint, parsed once; every resource path is resolved
+    /// against it and must stay on the same origin.
+    base: reqwest::Url,
+    /// Whether identifying attributes (drive serial numbers) are reported.
+    /// Follows the hostname opt-in: identity leaves the host only when asked.
+    include_identifiers: bool,
 }
 
 struct RequestBudget(usize);
@@ -522,7 +535,15 @@ impl RequestBudget {
 }
 
 impl RedfishClient {
-    fn new(config: BmcConfig) -> Result<Self> {
+    fn new(config: BmcConfig, include_identifiers: bool) -> Result<Self> {
+        let base = reqwest::Url::parse(&config.endpoint)
+            .with_context(|| format!("BMC endpoint is not a valid URL: {}", config.endpoint))?;
+        if !matches!(base.scheme(), "http" | "https") || base.host_str().is_none() {
+            anyhow::bail!(
+                "BMC endpoint must be an http(s) URL with a host: {}",
+                config.endpoint
+            );
+        }
         let http = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(BMC_REQUEST_TIMEOUT_SECS))
             .connect_timeout(Duration::from_secs(BMC_CONNECT_TIMEOUT_SECS))
@@ -534,15 +555,42 @@ impl RedfishClient {
             .user_agent(concat!("connlog-agent/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("Failed to create BMC HTTP client")?;
-        Ok(Self { http, config })
+        Ok(Self {
+            http,
+            config,
+            base,
+            include_identifiers,
+        })
+    }
+
+    /// Resolve a Redfish `@odata.id` against the configured endpoint.
+    ///
+    /// The paths come out of documents the BMC sent, so they are data, not
+    /// configuration. A path that resolves anywhere but the configured
+    /// origin is refused: the request would carry the BMC credentials.
+    fn resource_url(&self, path: &str) -> Result<reqwest::Url> {
+        if !path.starts_with('/') || path.starts_with("//") {
+            anyhow::bail!("BMC resource path is not an absolute path on the BMC: {path}");
+        }
+        let url = self
+            .base
+            .join(path)
+            .with_context(|| format!("BMC resource path does not resolve: {path}"))?;
+        let same_origin = url.scheme() == self.base.scheme()
+            && url.host_str() == self.base.host_str()
+            && url.port_or_known_default() == self.base.port_or_known_default();
+        if !same_origin {
+            anyhow::bail!("BMC resource path left the configured endpoint: {path}");
+        }
+        Ok(url)
     }
 
     fn get_json(&self, path: &str, budget: &mut RequestBudget) -> Result<Value> {
         budget.take()?;
-        let url = format!("{}{}", self.config.endpoint, path);
+        let url = self.resource_url(path)?;
         let response = self
             .http
-            .get(&url)
+            .get(url)
             .basic_auth(&self.config.username, Some(&self.config.password))
             .header("Accept", "application/json")
             .send()
@@ -553,9 +601,17 @@ impl RedfishClient {
                 response.status()
             ));
         }
-        response
-            .json()
-            .with_context(|| format!("BMC returned non-JSON for {path}"))
+        // Bounded read: a Redfish document is kilobytes, and the BMC is on
+        // the same LAN as the host, so a body that keeps coming is a fault
+        // to refuse rather than buffer.
+        let mut body = Vec::new();
+        let mut limited = std::io::Read::take(response, MAX_BMC_BODY_BYTES + 1);
+        std::io::Read::read_to_end(&mut limited, &mut body)
+            .with_context(|| format!("BMC response could not be read for {path}"))?;
+        if body.len() as u64 > MAX_BMC_BODY_BYTES {
+            anyhow::bail!("BMC response for {path} exceeded {MAX_BMC_BODY_BYTES} bytes");
+        }
+        serde_json::from_slice(&body).with_context(|| format!("BMC returned non-JSON for {path}"))
     }
 
     /// Walk Systems → Storage → {controllers, drives, volumes}.
@@ -646,7 +702,7 @@ impl RedfishClient {
                     break;
                 }
                 if let Ok(doc) = self.get_json(&drive_ref, budget) {
-                    components.extend(drive_component(&doc));
+                    components.extend(drive_component(&doc, self.include_identifiers));
                 }
             }
 
@@ -739,6 +795,7 @@ pub fn spawn_if_configured(
     bmc_config: Option<BmcConfig>,
     platform_endpoint: String,
     token: String,
+    include_identifiers: bool,
 ) -> Option<thread::JoinHandle<()>> {
     let config = bmc_config?;
     info!(
@@ -748,14 +805,28 @@ pub fn spawn_if_configured(
 
     let handle = thread::Builder::new()
         .name("bmc-poller".to_string())
-        .spawn(move || run_poller(&stop, config, &platform_endpoint, token))
+        .spawn(move || {
+            run_poller(
+                &stop,
+                config,
+                &platform_endpoint,
+                token,
+                include_identifiers,
+            )
+        })
         .ok()?;
     Some(handle)
 }
 
-fn run_poller(stop: &AtomicBool, config: BmcConfig, platform_endpoint: &str, token: String) {
+fn run_poller(
+    stop: &AtomicBool,
+    config: BmcConfig,
+    platform_endpoint: &str,
+    token: String,
+    include_identifiers: bool,
+) {
     let interval = Duration::from_secs(config.poll_interval_secs);
-    let redfish = match RedfishClient::new(config) {
+    let redfish = match RedfishClient::new(config, include_identifiers) {
         Ok(client) => client,
         Err(e) => {
             warn!("BMC poller disabled: {e}");
@@ -911,7 +982,7 @@ mod tests {
 
     #[test]
     fn drive_component_maps_idrac_fields() {
-        let component = drive_component(&idrac_drive("OK", false)).expect("drive must map");
+        let component = drive_component(&idrac_drive("OK", false), true).expect("drive must map");
         assert_eq!(component.component_type, "drive");
         assert_eq!(
             component.component_key,
@@ -939,12 +1010,85 @@ mod tests {
     }
 
     #[test]
+    fn drive_component_omits_serial_number_unless_identifiers_are_shared() {
+        let component = drive_component(&idrac_drive("OK", false), false).expect("drive must map");
+        assert!(
+            !component.attributes.contains_key("serial_number"),
+            "serial numbers leave the host only with the system-info opt-in"
+        );
+        assert_eq!(
+            component.attributes.get("model").and_then(|v| v.as_str()),
+            Some("ST4000NM0023"),
+            "non-identifying attributes are still reported"
+        );
+    }
+
+    fn client_for(endpoint: &str) -> RedfishClient {
+        let config = BmcConfig {
+            endpoint: endpoint.to_string(),
+            username: "u".to_string(),
+            password: "p".to_string(),
+            poll_interval_secs: 60,
+            insecure_tls: false,
+        };
+        RedfishClient::new(config, true).expect("client")
+    }
+
+    #[test]
+    fn resource_url_stays_on_the_configured_bmc() {
+        let client = client_for("https://10.0.0.120");
+        let url = client
+            .resource_url("/redfish/v1/Systems/System.Embedded.1")
+            .expect("absolute path resolves");
+        assert_eq!(
+            url.as_str(),
+            "https://10.0.0.120/redfish/v1/Systems/System.Embedded.1"
+        );
+        let with_port = client_for("https://bmc.example:8443");
+        assert_eq!(
+            with_port.resource_url("/redfish/v1").unwrap().as_str(),
+            "https://bmc.example:8443/redfish/v1"
+        );
+    }
+
+    #[test]
+    fn resource_url_refuses_paths_that_would_leave_the_bmc() {
+        let client = client_for("https://10.0.0.120");
+        for path in [
+            "@evil.example/x",
+            "//evil.example/redfish/v1",
+            "https://evil.example/redfish/v1",
+            "redfish/v1",
+            "",
+        ] {
+            assert!(
+                client.resource_url(path).is_err(),
+                "{path:?} must not be fetched with BMC credentials"
+            );
+        }
+    }
+
+    #[test]
+    fn redfish_client_rejects_endpoints_without_a_host() {
+        for endpoint in ["10.0.0.120", "file:///etc/passwd", "https://"] {
+            let config = BmcConfig {
+                endpoint: endpoint.to_string(),
+                username: "u".to_string(),
+                password: "p".to_string(),
+                poll_interval_secs: 60,
+                insecure_tls: false,
+            };
+            assert!(RedfishClient::new(config, true).is_err(), "{endpoint:?}");
+        }
+    }
+
+    #[test]
     fn drive_component_flags_critical_and_predicted_failure() {
-        let critical = drive_component(&idrac_drive("Critical", true)).unwrap();
+        let critical = drive_component(&idrac_drive("Critical", true), true).unwrap();
         assert_eq!(critical.health, Health::Critical);
         assert!(critical.failure_predicted);
 
-        let warning = drive_component(&idrac_drive("Warning", false)).unwrap();
+        let warning = drive_component(&idrac_drive("Warning", false), true).unwrap();
         assert_eq!(warning.health, Health::Warning);
     }
 
@@ -956,7 +1100,7 @@ mod tests {
             "Status": { "Health": null, "State": "Absent" }
         });
         assert!(
-            drive_component(&absent).is_none(),
+            drive_component(&absent, true).is_none(),
             "empty bays are not components"
         );
     }
@@ -968,7 +1112,7 @@ mod tests {
             "Name": "Disk 1",
             "Status": { "Health": null, "State": "Enabled" }
         });
-        assert_eq!(drive_component(&doc).unwrap().health, Health::Unknown);
+        assert_eq!(drive_component(&doc, true).unwrap().health, Health::Unknown);
     }
 
     #[test]
@@ -1165,7 +1309,7 @@ mod tests {
         let report = HardwareHealthReport {
             source: "redfish",
             collected_at_unix_ms: 1234,
-            components: vec![drive_component(&idrac_drive("Critical", true)).unwrap()],
+            components: vec![drive_component(&idrac_drive("Critical", true), true).unwrap()],
         };
         let value: Value = serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
 

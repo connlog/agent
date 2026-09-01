@@ -6,7 +6,7 @@ use std::fmt;
 #[command(about = "ConnLog monitoring agent")]
 #[command(long_about = "ConnLog monitoring agent")]
 #[command(
-    after_help = "Common usage:\n  sudo connlog-agent install --token agent_xxxxxxxxxxxx\n  sudo connlog-agent action add\n  sudo connlog-agent config enable-hostname\n  sudo connlog-agent status\n\nTip:\n  Use `connlog-agent action --help` to manage dashboard buttons.\n  Use `connlog-agent diagnostics --help` for heartbeat/config checks.\n\nLegacy flags still work for existing scripts: --install, --uninstall, --status, --update, --check-config, --test-heartbeat."
+    after_help = "Common usage:\n  sudo CONNLOG_TOKEN=agent_xxxxxxxxxxxx connlog-agent install\n  sudo connlog-agent action add\n  sudo connlog-agent config enable-hostname\n  sudo connlog-agent status\n\nTip:\n  Use `connlog-agent action --help` to manage dashboard buttons.\n  Use `connlog-agent diagnostics --help` for heartbeat/config checks.\n\nLegacy flags still work for existing scripts: --install, --uninstall, --status, --update, --check-config, --test-heartbeat."
 )]
 #[command(version)]
 pub struct Config {
@@ -165,6 +165,10 @@ pub enum AgentCommand {
 
     /// Check for and apply the latest release
     Update,
+
+    /// Apply a verified staged update (root; run by the systemd ExecStopPost hook)
+    #[command(hide = true)]
+    ApplyStagedUpdate,
 
     /// Manage local dashboard actions
     #[command(
@@ -747,7 +751,7 @@ mod tests {
         use clap::CommandFactory;
 
         let help = Config::command().render_long_help().to_string();
-        assert!(help.contains("sudo connlog-agent install --token agent_xxxxxxxxxxxx"));
+        assert!(help.contains("sudo CONNLOG_TOKEN=agent_xxxxxxxxxxxx connlog-agent install"));
         assert!(help.contains("sudo connlog-agent action add"));
         assert!(help.contains("Commands:"));
         assert!(help.contains("action"));

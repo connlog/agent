@@ -1,17 +1,22 @@
 use anyhow::{Context, Result};
-use log::{info, warn};
+use log::{error, info, warn};
 use ring::digest::{self, Digest};
 use ring::signature;
 use serde::Deserialize;
 use std::fs;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-use std::time::Duration;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::heartbeat::UpdateInfo;
 use crate::http::{is_transient_http_status, transient_retry_delay};
 use crate::install;
-use crate::platform::{INSTALLED_BINARY, STAGED_BINARY, UPDATE_MARKER};
+use crate::platform::{
+    INSTALLED_BINARY, INSTALLED_BINARY_NEW, INSTALLED_BINARY_OLD, SAFE_PATH, STAGED_BINARY,
+    STAGED_SIGNATURE, UPDATE_FAILED_NOTE, UPDATE_MARKER,
+};
 
 /// Ed25519 public key (hex) for verifying update signatures.
 ///
@@ -35,16 +40,18 @@ pub fn has_signing_key() -> bool {
 
 /// Attempt to apply a verified update from the platform heartbeat response.
 ///
-/// `force` bypasses the `has_signing_key()` guard — use only when the platform
-/// has explicitly set `force_update: true` in the heartbeat response (one-shot
-/// flag gated by workspace-owner auth, so it is no less trusted than the rest
-/// of the heartbeat payload).  SHA-256 integrity is always checked regardless.
+/// Every path through here needs a compiled-in signing key, a matching
+/// SHA-256, a valid Ed25519 signature and a strictly higher version. The
+/// platform's `force_update` flag (its "Force update" button) is logged and
+/// otherwise ignored: it once allowed a build without a signing key to install
+/// a binary on the strength of a server-supplied hash alone, which is the one
+/// thing a signed update pipeline exists to rule out.
 ///
 /// Returns:
 /// - `Ok(true)`  - update staged, caller should exit for systemd to apply it
 /// - `Ok(false)` - update skipped (missing fields, no signing key, etc.)
 /// - `Err(..)`   - update failed (download, checksum, or signature error)
-pub fn try_apply_update(update: &UpdateInfo, force: bool) -> Result<bool> {
+pub fn try_apply_update(update: &UpdateInfo) -> Result<bool> {
     if !update.available {
         info!("UPDATE SKIP: available=false");
         return Ok(false);
@@ -84,25 +91,22 @@ pub fn try_apply_update(update: &UpdateInfo, force: bool) -> Result<bool> {
     };
 
     if !has_signing_key() {
-        if force {
-            warn!(
-                "UPDATE FORCE: No signing key compiled — skipping Ed25519 verification. \
-                 SHA-256 integrity is still checked. This was explicitly authorised by \
-                 the workspace owner via the platform."
-            );
-        } else {
-            warn!(
-                "UPDATE SKIP: No signing key compiled into this build (key_hex_len={}). \
-                 Rebuild with CONNLOG_SIGNING_PUBLIC_KEY=<hex> to enable auto-updates.",
-                SIGNING_PUBLIC_KEY_HEX.len()
-            );
-            return Ok(false);
-        }
+        error!(
+            "UPDATE REFUSED: this build has no signing key compiled in, so no update can be \
+             verified (key_hex_len={}). Release builds always carry the key; rebuild with \
+             CONNLOG_SIGNING_PUBLIC_KEY=<hex>.",
+            SIGNING_PUBLIC_KEY_HEX.len()
+        );
+        return Ok(false);
+    }
+
+    if update.force_update {
+        info!("UPDATE: platform marked this update as forced; verification is unchanged");
     }
 
     info!(
         "UPDATE: Signing key present (first 8 chars: {}...)",
-        &SIGNING_PUBLIC_KEY_HEX[..8]
+        SIGNING_PUBLIC_KEY_HEX.get(..8).unwrap_or("?")
     );
 
     let current_version = env!("CARGO_PKG_VERSION");
@@ -111,11 +115,22 @@ pub fn try_apply_update(update: &UpdateInfo, force: bool) -> Result<bool> {
         return Ok(false);
     }
 
-    // Reject version downgrades (prevents rollback attacks)
+    // Reject version downgrades (prevents rollback attacks). This is the
+    // platform's claim; the root-side apply step checks what the binary
+    // itself reports before it is installed.
     if !is_version_upgrade(current_version, &update.latest_version) {
         warn!(
             "UPDATE: Rejecting downgrade from v{} to v{} - only upgrades are allowed",
             current_version, update.latest_version
+        );
+        return Ok(false);
+    }
+
+    if let Some(reason) = recent_apply_failure(&update.latest_version) {
+        warn!(
+            "UPDATE SKIP: v{} could not be applied earlier ({}); not downloading it again \
+             until the note in {} is older than a day",
+            update.latest_version, reason, UPDATE_FAILED_NOTE
         );
         return Ok(false);
     }
@@ -125,12 +140,7 @@ pub fn try_apply_update(update: &UpdateInfo, force: bool) -> Result<bool> {
         current_version, update.latest_version
     );
 
-    // Separate download client: no auth headers, follows redirects (GitHub CDN),
-    // longer timeout for large binary downloads.
-    let dl_client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()
-        .context("Failed to create download client")?;
+    let dl_client = download_client()?;
 
     stage_verified_update(
         &dl_client,
@@ -138,7 +148,6 @@ pub fn try_apply_update(update: &UpdateInfo, force: bool) -> Result<bool> {
         signature_url,
         expected_sha256,
         &update.latest_version,
-        force && !has_signing_key(),
     )?;
 
     Ok(true)
@@ -155,6 +164,44 @@ const MAX_BINARY_BYTES: u64 = 50 * 1024 * 1024;
 /// Maximum size of a checksum file. sha256sum format is `<64 hex>  <filename>\n`,
 /// so a few hundred bytes is more than enough.
 const MAX_CHECKSUM_BYTES: u64 = 4 * 1024;
+
+/// Longest redirect chain the download clients follow. GitHub's CDN uses one.
+const MAX_DOWNLOAD_REDIRECTS: usize = 5;
+
+/// Follow redirects, but only to HTTPS. `require_https` checks the URL we
+/// were handed; this keeps a 302 in the middle of the chain from quietly
+/// downgrading the rest of it.
+fn https_only_redirects() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= MAX_DOWNLOAD_REDIRECTS {
+            return attempt.error("too many redirects while fetching an update artifact");
+        }
+        if attempt.url().scheme() != "https" {
+            return attempt.error("refusing to follow a redirect to a non-HTTPS URL");
+        }
+        attempt.follow()
+    })
+}
+
+/// Client for release metadata: short timeout, HTTPS-only redirects.
+fn metadata_client() -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(https_only_redirects())
+        .user_agent(concat!("connlog-agent/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("Failed to create HTTP client")
+}
+
+/// Client for binaries: no auth headers, long timeout, HTTPS-only redirects.
+fn download_client() -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .redirect(https_only_redirects())
+        .user_agent(concat!("connlog-agent/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("Failed to create download client")
+}
 
 /// SECURITY: Reject any non-HTTPS URL handed to us by the platform or used in
 /// release metadata. The Ed25519 signature already protects integrity, but
@@ -368,10 +415,11 @@ fn atomic_replace(data: &[u8], path: &str) -> Result<()> {
 
 /// Download, verify (SHA-256 + Ed25519), and stage a new binary.
 ///
-/// The staged binary is written to `/run/connlog/connlog-agent-new` and an update
-/// marker to `/run/connlog/.update_requested`. The caller (main loop) then exits
-/// cleanly so systemd's ExecStopPost handler can atomically replace the binary and
-/// restart the service.
+/// The staged binary is written to `/run/connlog/connlog-agent-new`, its
+/// signature next to it, and an update marker to `/run/connlog/.update_requested`.
+/// The caller (main loop) then exits cleanly so systemd's ExecStopPost handler
+/// can run `connlog-agent apply-staged-update` as root, which verifies the
+/// staged bytes again before they replace the live binary.
 ///
 /// `client` should have a long timeout (≥120s) suitable for large binary downloads.
 fn stage_verified_update(
@@ -380,30 +428,25 @@ fn stage_verified_update(
     signature_url: &str,
     expected_sha256: &str,
     version: &str,
-    skip_ed25519: bool,
 ) -> Result<()> {
     // 1. Download binary
     let binary_data = download_binary(client, download_url)?;
     info!("UPDATE: Downloaded {} bytes", binary_data.len());
 
-    // 2. Verify SHA-256 (always — this is the last integrity check when skip_ed25519 is true)
+    // 2. Verify SHA-256
     let hash = verify_sha256(&binary_data, expected_sha256)?;
     info!("UPDATE: SHA-256 checksum verified ✓");
 
-    if skip_ed25519 {
-        warn!(
-            "UPDATE: Ed25519 verification SKIPPED (force-update mode, no signing key compiled in)"
-        );
-    } else {
-        // 3. Download Ed25519 signature
-        let sig_data = download_signature(client, signature_url)?;
+    // 3. Download Ed25519 signature
+    let sig_data = download_signature(client, signature_url)?;
 
-        // 4. Verify Ed25519 signature
-        verify_ed25519(&hash, &sig_data)?;
-        info!("UPDATE: Ed25519 signature verified ✓");
-    }
+    // 4. Verify Ed25519 signature
+    verify_ed25519(&hash, &sig_data)?;
+    info!("UPDATE: Ed25519 signature verified ✓");
 
-    // 5. Write staged binary
+    // 5. Write staged binary and its signature. The root-side apply step
+    //    verifies them again with its own key: this directory is writable by
+    //    the service account, so nothing in it is trusted on arrival.
     fs::write(STAGED_BINARY, &binary_data).context("Failed to write staged binary")?;
 
     #[cfg(unix)]
@@ -415,9 +458,10 @@ fn stage_verified_update(
         fs::set_permissions(STAGED_BINARY, perms)
             .context("Failed to set staged binary permissions")?;
     }
+    fs::write(STAGED_SIGNATURE, &sig_data).context("Failed to write staged signature")?;
 
     // 6. Write update marker
-    let marker = format!("version={}\n", version);
+    let marker = format!("version={}\nsha256={}\n", version, expected_sha256);
     fs::write(UPDATE_MARKER, marker).context("Failed to write update marker")?;
 
     info!(
@@ -427,6 +471,357 @@ fn stage_verified_update(
     );
 
     Ok(())
+}
+
+// ── Root-side apply (run by ExecStopPost) ────────────────────────
+
+/// How long `--version` on the staged binary may take. A real binary answers
+/// in milliseconds; one that hangs is not one we install.
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a failed apply keeps the agent from downloading the same version
+/// again. The note lives in the state directory, so it survives the restart.
+const APPLY_FAILURE_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Apply the update the unprivileged agent staged in `/run/connlog`.
+///
+/// Runs as root from the systemd `ExecStopPost` hook, using the binary that is
+/// currently installed. The hook used to copy the staged file into place and
+/// execute it on trust; the staging directory is writable by the service
+/// account, so anything running as that account could have put its own binary
+/// there and had root execute it. Now nothing reaches `/usr/local/bin` until
+/// this step has, with its own compiled-in key, verified the Ed25519 signature
+/// over the staged bytes, confirmed the staged binary reports a strictly higher
+/// version than this one, and checked that the live binary is still root-owned.
+/// The swap is a same-filesystem rename, the previous binary stays reachable as
+/// a hard link, and a failed service refresh rolls back before returning.
+pub fn apply_staged_update() -> Result<()> {
+    if !crate::platform::is_admin() {
+        anyhow::bail!(
+            "apply-staged-update must run as root (the systemd ExecStopPost hook runs it)"
+        );
+    }
+    let claimed_version = read_marker_version();
+
+    match apply_staged_update_inner() {
+        Ok(Some(version)) => {
+            let _ = fs::remove_file(UPDATE_FAILED_NOTE);
+            println!("ConnLog: updated to v{version}");
+            Ok(())
+        }
+        Ok(None) => {
+            let _ = fs::remove_file(UPDATE_FAILED_NOTE);
+            println!("ConnLog: staged binary is already the installed version; nothing to apply");
+            Ok(())
+        }
+        Err(err) => {
+            note_apply_failure(claimed_version.as_deref().unwrap_or("unknown"), &err);
+            eprintln!("ConnLog: update not applied: {err:#}");
+            Err(err)
+        }
+    }
+}
+
+/// `Ok(Some(version))` when the live binary was replaced, `Ok(None)` when the
+/// staged binary is the version already installed.
+fn apply_staged_update_inner() -> Result<Option<String>> {
+    if !has_signing_key() {
+        anyhow::bail!(
+            "this build has no signing key compiled in; refusing to apply a staged binary"
+        );
+    }
+
+    let staged = read_bounded(STAGED_BINARY, MAX_BINARY_BYTES)?;
+    if staged.len() < 100_000 {
+        anyhow::bail!(
+            "staged binary is suspiciously small ({} bytes)",
+            staged.len()
+        );
+    }
+    let sig = fs::read(STAGED_SIGNATURE).context("Failed to read the staged signature")?;
+    if sig.len() != 64 {
+        anyhow::bail!("staged signature has {} bytes, expected 64", sig.len());
+    }
+
+    // Authenticity and integrity in one check: the signature covers the digest.
+    let hash = digest::digest(&digest::SHA256, &staged);
+    verify_ed25519(&hash, &sig)?;
+
+    assert_live_binary_trusted()?;
+
+    // The verified bytes go next to the live binary (same filesystem), owned
+    // by root and executable, before anything runs them.
+    let _ = fs::remove_file(INSTALLED_BINARY_NEW);
+    write_root_executable(INSTALLED_BINARY_NEW, &staged)?;
+
+    let new_version = match probe_binary_version(INSTALLED_BINARY_NEW) {
+        Ok(version) => version,
+        Err(err) => {
+            let _ = fs::remove_file(INSTALLED_BINARY_NEW);
+            return Err(err);
+        }
+    };
+
+    let current_version = env!("CARGO_PKG_VERSION");
+    if new_version == current_version {
+        let _ = fs::remove_file(INSTALLED_BINARY_NEW);
+        return Ok(None);
+    }
+    if !is_version_upgrade(current_version, &new_version) {
+        let _ = fs::remove_file(INSTALLED_BINARY_NEW);
+        anyhow::bail!(
+            "refusing to replace v{current_version} with v{new_version}: only upgrades are applied"
+        );
+    }
+
+    // Keep the previous binary reachable for rollback. A hard link on the same
+    // filesystem survives the rename below and costs no copy.
+    let _ = fs::remove_file(INSTALLED_BINARY_OLD);
+    fs::hard_link(INSTALLED_BINARY, INSTALLED_BINARY_OLD)
+        .context("Failed to keep a rollback link to the previous binary")?;
+    fs::rename(INSTALLED_BINARY_NEW, INSTALLED_BINARY)
+        .context("Failed to move the verified binary into place")?;
+
+    // The new binary refreshes the unit from its own embedded template.
+    match refresh_service_via(INSTALLED_BINARY) {
+        Ok(()) => {
+            let _ = fs::remove_file(INSTALLED_BINARY_OLD);
+            Ok(Some(new_version))
+        }
+        Err(err) => match fs::rename(INSTALLED_BINARY_OLD, INSTALLED_BINARY) {
+            Ok(()) => Err(err.context(
+                "service refresh failed after the swap; rolled back to the previous binary",
+            )),
+            Err(rollback_err) => Err(err.context(format!(
+                "service refresh failed and rollback also failed ({rollback_err}); \
+                 run: sudo connlog-agent refresh-service --restart"
+            ))),
+        },
+    }
+}
+
+/// The live binary must be owned by root and writable by root only. Root is
+/// about to execute it (and its successor) from the ExecStopPost hook; a
+/// binary another account could have written is not one root should run.
+pub fn assert_live_binary_trusted() -> Result<()> {
+    assert_root_owned_executable(Path::new(INSTALLED_BINARY))
+}
+
+#[cfg(unix)]
+fn assert_root_owned_executable(path: &Path) -> Result<()> {
+    let meta = fs::metadata(path)
+        .with_context(|| format!("Failed to read metadata for {}", path.display()))?;
+    if !meta.is_file() {
+        anyhow::bail!("{} is not a regular file", path.display());
+    }
+    if meta.uid() != 0 {
+        anyhow::bail!(
+            "{} is owned by uid {} rather than root; refusing to run it as root. \
+             Fix with: sudo chown root:root {}",
+            path.display(),
+            meta.uid(),
+            path.display()
+        );
+    }
+    if meta.mode() & 0o022 != 0 {
+        anyhow::bail!(
+            "{} is writable by group or others (mode {:o}); refusing to run it as root. \
+             Fix with: sudo chmod 0755 {}",
+            path.display(),
+            meta.mode() & 0o7777,
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn assert_root_owned_executable(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Write `data` to `path` as a root-owned 0755 executable.
+fn write_root_executable(path: &str, data: &[u8]) -> Result<()> {
+    fs::write(path, data).with_context(|| format!("Failed to write {}", path))?;
+    #[cfg(unix)]
+    {
+        let mut perms = fs::metadata(path)
+            .with_context(|| format!("Failed to read metadata for {}", path))?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms)
+            .with_context(|| format!("Failed to set permissions on {}", path))?;
+        std::os::unix::fs::chown(path, Some(0), Some(0))
+            .with_context(|| format!("Failed to set root ownership on {}", path))?;
+    }
+    Ok(())
+}
+
+/// Read a file into memory, refusing anything larger than `max` bytes.
+fn read_bounded(path: &str, max: u64) -> Result<Vec<u8>> {
+    let file = fs::File::open(path).with_context(|| format!("Failed to open {}", path))?;
+    let mut data = Vec::new();
+    let mut limited = std::io::Read::take(file, max + 1);
+    std::io::Read::read_to_end(&mut limited, &mut data)
+        .with_context(|| format!("Failed to read {}", path))?;
+    if data.len() as u64 > max {
+        anyhow::bail!("{} exceeds the {} byte cap", path, max);
+    }
+    Ok(data)
+}
+
+/// Run `<binary> --version` and return the version it reports.
+///
+/// Exec is the only reliable way to learn what a binary is. The signature has
+/// already been verified at this point, so what runs here is a release we
+/// built; the check is that it is the release we were told it is, for this
+/// architecture, and newer than what is installed.
+fn probe_binary_version(path: &str) -> Result<String> {
+    let mut child = Command::new(path)
+        .arg("--version")
+        .env_clear()
+        .env("PATH", SAFE_PATH)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("Failed to execute {} --version", path))?;
+
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < VERSION_PROBE_TIMEOUT => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!(
+                    "{} --version did not finish within {:?}",
+                    path,
+                    VERSION_PROBE_TIMEOUT
+                );
+            }
+            Err(err) => return Err(err).context("Failed to wait for --version"),
+        }
+    };
+    if !status.success() {
+        anyhow::bail!("{} --version exited with {}", path, status);
+    }
+
+    let mut stdout = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let mut limited = std::io::Read::take(&mut out, 4 * 1024);
+        std::io::Read::read_to_string(&mut limited, &mut stdout)
+            .context("--version output is not UTF-8")?;
+    }
+    parse_version_output(&stdout).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} --version printed something unexpected: {:?}",
+            path,
+            stdout
+        )
+    })
+}
+
+/// `connlog-agent 1.19.0` → `1.19.0`. Accepts only `MAJOR.MINOR.PATCH`.
+fn parse_version_output(output: &str) -> Option<String> {
+    let candidate = output.split_whitespace().last()?.trim_start_matches('v');
+    let mut parts = candidate.split('.');
+    let well_formed = (0..3).all(|_| {
+        parts
+            .next()
+            .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    }) && parts.next().is_none();
+    well_formed.then(|| candidate.to_string())
+}
+
+fn refresh_service_via(binary: &str) -> Result<()> {
+    let status = Command::new(binary)
+        .arg("refresh-service")
+        .env_clear()
+        .env("PATH", SAFE_PATH)
+        .stdin(Stdio::null())
+        .status()
+        .with_context(|| format!("Failed to run {} refresh-service", binary))?;
+    if !status.success() {
+        anyhow::bail!("{} refresh-service exited with {}", binary, status);
+    }
+    Ok(())
+}
+
+fn read_marker_version() -> Option<String> {
+    let text = fs::read_to_string(UPDATE_MARKER).ok()?;
+    text.lines()
+        .find_map(|line| line.strip_prefix("version="))
+        .map(|v| v.trim().to_string())
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Record that `version` could not be applied, so the agent stops downloading
+/// it on every heartbeat. Best effort: a note that cannot be written only
+/// costs repeated downloads, never correctness.
+fn note_apply_failure(version: &str, err: &anyhow::Error) {
+    let reason: String = format!("{err:#}")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(300)
+        .collect();
+    let note = format!(
+        "version={}\nat={}\nreason={}\n",
+        version,
+        unix_now_secs(),
+        reason
+    );
+    if let Err(write_err) = fs::write(UPDATE_FAILED_NOTE, note) {
+        eprintln!(
+            "ConnLog: could not record the failed update in {}: {}",
+            UPDATE_FAILED_NOTE, write_err
+        );
+        return;
+    }
+    #[cfg(unix)]
+    {
+        // The state directory belongs to the service account; the note is
+        // root's, so make it readable for the agent that checks it.
+        if let Ok(meta) = fs::metadata(UPDATE_FAILED_NOTE) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o644);
+            let _ = fs::set_permissions(UPDATE_FAILED_NOTE, perms);
+        }
+    }
+}
+
+/// The reason a recent apply of `version` failed, if the note is younger than
+/// the cooldown.
+fn recent_apply_failure(version: &str) -> Option<String> {
+    let text = fs::read_to_string(UPDATE_FAILED_NOTE).ok()?;
+    parse_apply_failure(&text, version, unix_now_secs())
+}
+
+fn parse_apply_failure(note: &str, version: &str, now: u64) -> Option<String> {
+    let field = |key: &str| {
+        note.lines()
+            .find_map(|line| line.strip_prefix(key))
+            .map(str::trim)
+    };
+    if field("version=")? != version {
+        return None;
+    }
+    let at: u64 = field("at=")?.parse().ok()?;
+    if now.saturating_sub(at) > APPLY_FAILURE_COOLDOWN.as_secs() {
+        return None;
+    }
+    Some(field("reason=").unwrap_or("no reason recorded").to_string())
 }
 
 // ── GitHub release checking ─────────────────────────────────────
@@ -548,11 +943,7 @@ pub fn check_github_for_update() -> Result<bool> {
         return Ok(false);
     }
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .user_agent("connlog-agent")
-        .build()
-        .context("Failed to create HTTP client")?;
+    let client = metadata_client()?;
 
     let (latest_version, release) = match fetch_github_release_if_newer(&client)? {
         Some(r) => r,
@@ -569,12 +960,7 @@ pub fn check_github_for_update() -> Result<bool> {
     let (binary_asset, sig_asset, sha256_asset) =
         find_release_assets(&release, &binary_name, &sig_name, &sha256_name)?;
 
-    // Download client: no auth headers, long timeout for binary download
-    let dl_client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .user_agent("connlog-agent")
-        .build()
-        .context("Failed to create download client")?;
+    let dl_client = download_client()?;
 
     let expected_sha256 = download_sha256(&dl_client, &sha256_asset.browser_download_url)?;
 
@@ -584,7 +970,6 @@ pub fn check_github_for_update() -> Result<bool> {
         &sig_asset.browser_download_url,
         &expected_sha256,
         &latest_version,
-        false,
     )?;
 
     Ok(true)
@@ -607,11 +992,7 @@ pub fn run_manual_update() -> Result<()> {
         );
     }
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .user_agent("connlog-agent")
-        .build()
-        .context("Failed to create HTTP client")?;
+    let client = metadata_client()?;
 
     let (latest_version, release) = match fetch_github_release_if_newer(&client)? {
         Some(r) => r,
@@ -634,11 +1015,7 @@ pub fn run_manual_update() -> Result<()> {
 
     println!("Downloading {}...", binary_name);
 
-    let dl_client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .user_agent("connlog-agent")
-        .build()
-        .context("Failed to create download client")?;
+    let dl_client = download_client()?;
 
     // Download binary
     let binary_data = download_binary(&dl_client, &binary_asset.browser_download_url)?;
@@ -658,11 +1035,34 @@ pub fn run_manual_update() -> Result<()> {
     verify_ed25519(&hash, &sig_data)?;
     println!("Ed25519 signature verified ✓");
 
+    // What the binary says it is has to match what the release says it is,
+    // and it has to run on this machine at all, before it replaces anything.
+    assert_live_binary_trusted()?;
+    let _ = fs::remove_file(INSTALLED_BINARY_NEW);
+    write_root_executable(INSTALLED_BINARY_NEW, &binary_data)?;
+    let reported = match probe_binary_version(INSTALLED_BINARY_NEW) {
+        Ok(version) => version,
+        Err(err) => {
+            let _ = fs::remove_file(INSTALLED_BINARY_NEW);
+            return Err(err);
+        }
+    };
+    if reported != latest_version {
+        let _ = fs::remove_file(INSTALLED_BINARY_NEW);
+        anyhow::bail!(
+            "Downloaded binary reports v{} but the release is v{}; refusing to install it",
+            reported,
+            latest_version
+        );
+    }
+    println!("Binary reports v{} ✓", reported);
+
     let previous_binary = fs::read(INSTALLED_BINARY)
         .with_context(|| format!("Failed to read existing binary at {}", INSTALLED_BINARY))?;
 
     // Atomically replace the installed binary
-    atomic_replace(&binary_data, INSTALLED_BINARY)?;
+    fs::rename(INSTALLED_BINARY_NEW, INSTALLED_BINARY)
+        .with_context(|| format!("Failed to move the verified binary to {}", INSTALLED_BINARY))?;
     println!("Binary replaced at {}", INSTALLED_BINARY);
 
     let restart_service = service_is_active();

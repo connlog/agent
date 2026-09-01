@@ -6,7 +6,85 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 [`VERSIONING.md`](./VERSIONING.md) for the full policy. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [1.19.0] — 2026-09-02
+
+Security hardening release. Every item below came out of a full read-only
+audit of the agent, the installer and the release pipeline.
+
+### Security
+
+- **Root never executes an unverified binary.** The systemd `ExecStopPost`
+  hook used to copy the staged update from `/run/connlog` (writable by the
+  unprivileged service account) into `/usr/local/bin` and run it as root.
+  It now runs `connlog-agent apply-staged-update` from the installed binary,
+  which verifies the staged file's Ed25519 signature with its own compiled-in
+  key, checks that the live binary is root-owned and not group/other
+  writable, runs the staged binary to confirm it reports a strictly higher
+  version (a wrong-architecture or downgraded build is refused here), swaps
+  it in with an atomic same-filesystem rename, and rolls back if the new
+  binary cannot refresh the service. The service is started again in every
+  case; a rejected update no longer leaves a host silent.
+- **No signature bypass.** `force_update` from the platform used to skip
+  Ed25519 verification on a build without a compiled-in key, leaving a
+  server-supplied SHA-256 as the only check. The flag is now logged and
+  changes nothing; a build without a key refuses every update.
+- **Release builds cannot lack the key.** `build.rs` fails a release-profile
+  build without a valid `CONNLOG_SIGNING_PUBLIC_KEY`, the release workflow
+  checks the secret before building, CI proves the guard trips, and the
+  signing script refuses to sign with a private key that does not match the
+  compiled-in public key.
+- **Signed downgrades and wrong-arch builds are refused** by executing the
+  staged binary's `--version` before it is installed, in both the automatic
+  and the manual (`connlog-agent update`) paths.
+- **Redirects stay on HTTPS.** Every hop of a redirect chain during an
+  artifact download must be HTTPS (five hops at most).
+- **BMC requests stay on the BMC.** Redfish `@odata.id` paths from BMC
+  documents are resolved against the configured endpoint and refused if they
+  would leave its origin, so BMC credentials can no longer be sent to another
+  host. Redfish response bodies are capped at 4 MB.
+- **Local actions get a clean environment.** Action processes no longer
+  inherit `CONNLOG_TOKEN` or the BMC password from the service environment.
+- **Error bodies are bounded and sanitized.** Non-success response bodies are
+  read to 8 KB at most, whitespace-collapsed, secret-redacted and capped
+  before they are logged; config responses are capped at 1 MB.
+- **A rejected token never removes the agent.** Fifty consecutive 401s used to
+  self-uninstall (files deleted, no dashboard visibility). The agent now keeps
+  its files, keeps retrying at the capped backoff and logs an error at
+  intervals; only a 410 or a confirmed uninstall request removes anything.
+- **Panic isolation is real again.** The release profile no longer sets
+  `panic = "abort"`, which had made the `catch_unwind` around metric
+  collection a no-op.
+- **Dependency advisories fixed**: `rustls-webpki` (RUSTSEC-2026-0049,
+  -0098, -0099), `crossbeam-epoch` (RUSTSEC-2026-0204), `anyhow`
+  (RUSTSEC-2026-0190). `cargo deny` now runs in CI; GitHub Actions are pinned
+  to commit SHAs; release signing uses OpenSSL only (no `pip install` in the
+  job that holds the private key); releases carry build provenance
+  attestations.
+- **Install hygiene.** The installed binary is written 0755 root:root and the
+  update and refresh paths refuse anything else; helper commands run with a
+  fixed `PATH`; the token must be `agent_` plus 64 hex characters and no
+  EnvironmentFile value may contain a control character (a newline in a token
+  could otherwise add lines to `/etc/connlog/agent.conf`).
+- **Drive serial numbers follow the hostname opt-in.** BMC hardware reports
+  include `serial_number` only when `CONNLOG_EXPOSE_SYSTEM_INFO=true`.
+- **Nothing is published for a feature that is off.** The quick-actions
+  manifest is no longer sent to the platform while remote control is
+  compiled out.
+
+### Changed
+
+- **Uninstall removes everything.** `connlog-agent uninstall` and the remote
+  uninstall now also remove `/var/lib/connlog` and any update leftovers.
+- **Token via the environment.** Documentation, `--help` and the installer
+  use `CONNLOG_TOKEN=... connlog-agent install`; `--token` still works but
+  is visible to every user on the host through `/proc`.
+- **The installer lives in the platform repository** (`public/install.sh`,
+  served at `https://connlog.com/install.sh`). It is POSIX `sh`, fails closed
+  on every check, verifies the release signature with the pinned public key,
+  installs root-owned, and no longer falls back to `v0.1.0`. The stale copy
+  in this repository is gone.
+- New `/var/lib/connlog/update-failed` note: after a rejected update the
+  agent does not download the same version again for a day.
 
 ### Added
 
@@ -843,6 +921,7 @@ considered stable; breaking changes from this point on require a major bump.
 
 - Last pre-1.0 release. See git history for prior changes.
 
+[1.19.0]: https://github.com/connlog/agent/compare/v1.18.0...v1.19.0
 [1.18.0]: https://github.com/connlog/agent/compare/v1.17.1...v1.18.0
 [1.17.1]: https://github.com/connlog/agent/compare/v1.17.0...v1.17.1
 [1.17.0]: https://github.com/connlog/agent/compare/v1.16.0...v1.17.0

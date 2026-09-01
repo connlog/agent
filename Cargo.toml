@@ -1,6 +1,6 @@
 [package]
 name = "connlog-agent"
-version = "1.18.0"
+version = "1.19.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/connlog/agent"
@@ -25,8 +25,12 @@ libc = "0.2"
 # Optimise the release binary for size (and to drop a few hundred KB of
 # debug symbols + per-crate codegen units). Link time is noticeably slower
 # under LTO; that is acceptable for release builds.
+#
+# `panic` stays at the default (unwind): metric collection wraps `sysinfo` in
+# `catch_unwind` so a panic there costs one heartbeat of zeros, not the
+# process. `panic = "abort"` would make that guard a no-op and turn every
+# collector panic into a restart of the whole agent.
 [profile.release]
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
-panic = "abort"

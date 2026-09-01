@@ -1,7 +1,10 @@
 //! Stable per-host machine identifier.
 //!
 //! Returns a SHA-256 hash (lowercase hex) of a per-OS-stable identifier so
-//! the platform can refuse a token that's been copied to a second machine.
+//! the platform can notice a token that has been copied to a second machine
+//! (a cloned image, a config pasted onto the wrong host). It is not a theft
+//! control: `/etc/machine-id` is world-readable, so anyone who can read the
+//! token can compute this header too.
 //!
 //! ## Sources
 //!

@@ -73,20 +73,20 @@ cargo build --release && ./target/release/connlog-agent --version   # must print
 
 ### 5. Land the release commit on canary
 
+Feature work lands via PR as usual. The version bump itself goes straight to
+`canary`: CI runs on every push there, and the Release workflow only runs on
+a tag, so a broken bump fails before anything can ship. A separate PR for
+`chore: release vX.Y.Z` adds clicks without adding safety.
+
 ```bash
+git checkout canary && git pull --ff-only origin canary
 git add Cargo.toml Cargo.lock CHANGELOG.md
 git commit -m "chore: release vX.Y.Z"
-git push -u origin release/vX.Y.Z
-gh pr create --base canary --title "chore: release vX.Y.Z" ...
-# merge once CI is green
+git push origin canary
 ```
 
-> ⚠️ **If you bundle the release commit into a feature PR** (fine in
-> principle — v1.14.1 shipped that way), make sure the PR is merged **at a
-> head that includes the release commit**. v1.15.0 nearly shipped wrong
-> because the PR was merged moments before the release commit was pushed to
-> its branch: the feature landed on canary, the version bump did not, and
-> tagging the merge commit would have violated the invariant above.
+A hardening or feature PR may carry the bump itself (v1.19.0 did). Then
+merge the PR and continue with step 6 against the merge commit.
 
 ### 6. Verify, then tag
 
@@ -116,7 +116,11 @@ Pushing the tag triggers `.github/workflows/release.yml`:
 2. `sign-and-release` — runs in the protected `release` environment and
    waits for **your approval** (GitHub → the run → *Review deployments*).
    On approval it signs each raw binary with the Ed25519 private key held in
-   CI secrets (`scripts/sign-release.py`) and creates the GitHub release.
+   CI secrets (`scripts/sign-release.sh`, OpenSSL only, which also refuses
+   to sign if the key does not match `CONNLOG_SIGNING_PUBLIC_KEY`), attaches
+   build provenance attestations, and creates the GitHub release. The
+   `build` job fails first if `CONNLOG_SIGNING_PUBLIC_KEY` is missing or if
+   the built binary does not report the tagged version.
 
 Watch it with:
 

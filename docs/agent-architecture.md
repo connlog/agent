@@ -14,8 +14,11 @@ Its only job is to send authenticated heartbeats to the ConnLog platform every
 average, uptime).
 
 It does nothing else. There is no log shipping, no remote command execution,
-no service discovery, no network probing. Host reboot can be requested from
-the dashboard and is confirmed on three consecutive heartbeats.
+no service discovery. The one optional outbound connection besides the
+platform is to this machine's own BMC (iDRAC/iLO/OpenBMC over Redfish), when
+the operator configures one, for hardware health. Host reboot and removal of
+the agent can be requested from the dashboard; each is confirmed on three
+consecutive heartbeats.
 
 ---
 
@@ -117,13 +120,19 @@ On OK response:
   ├─ Ignore response.quick_actions  — never execute remote commands
   ├─ Check response.update          — try_apply_update() (see Update flow)
   ├─ Check response.config_outdated — fetch new config if true
-  └─ Sleep jittered(interval_secs)  — ±10% to spread fleet load
+  └─ Sleep jittered(interval_secs)  — +0..10% to spread fleet load (never
+                                       shorter than the interval, so the
+                                       plan limiter is never undershot)
 
 On error:
-  ├─ 401 Unauthorized  → linear backoff; self-uninstall after 50 consecutive
+  ├─ 401 Unauthorized  → linear backoff (30s + 10s/attempt, 120s cap); an
+  │                       error is logged every 50 consecutive; files are
+  │                       never touched — only a 410 or a confirmed
+  │                       uninstall request removes anything
   ├─ 410 Gone          → immediate self-uninstall
   ├─ 423 Locked        → 5-minute backoff; do NOT uninstall
-  └─ Other             → exponential backoff (30s → 3600s cap); counts toward
+  └─ Other             → near-interval backoff for transient failures
+                          (`heartbeat_error_backoff_secs`); counts toward
                           endpoint-reassignment (see below)
 ```
 
@@ -203,9 +212,17 @@ try_apply_update(UpdateInfo)
   ├─ download_signature()  — HTTPS only, must be exactly 64 bytes
   ├─ verify_ed25519()      — signature over SHA-256 hash; Err aborts the update
   ├─ Write staged binary   → /run/connlog/connlog-agent-new
+  ├─ Write its signature   → /run/connlog/connlog-agent-new.sig
   ├─ Write update marker   → /run/connlog/.update_requested
   └─ Return Ok(true)       — caller exits with code 0
 ```
+
+Before any of that, `try_apply_update` refuses when the build has no signing
+key, when the offered version is not strictly higher, and when
+`/var/lib/connlog/update-failed` says the same version was rejected by the
+root-side step within the last day (so a rejected build is not downloaded
+again on every heartbeat). The platform's `force_update` flag is logged and
+changes nothing.
 
 The caller (`run_agent_with_shutdown_inner`) exits cleanly on `Ok(true)`.
 The systemd service is configured with `Restart=on-failure`, so a clean exit
@@ -215,23 +232,40 @@ completes the update atomically:
 ```
 ExecStopPost (runs as root, +/bin/bash)
   ├─ If /run/connlog/.update_requested exists:
-  │    ├─ cp /run/connlog/connlog-agent-new → /usr/local/bin/connlog-agent.new
-  │    ├─ chmod 755 /usr/local/bin/connlog-agent.new
-  │    ├─ mv /usr/local/bin/connlog-agent.new → /usr/local/bin/connlog-agent
-  │    │    └─ atomic rename() within the same filesystem
-  │    ├─ Refresh service file (if --emit-service succeeds)
-  │    │    ├─ Write to /etc/systemd/system/connlog-agent.service.new
-  │    │    └─ mv .service.new → .service  (atomic within /etc/systemd/system)
+  │    ├─ /usr/local/bin/connlog-agent apply-staged-update   (the INSTALLED binary)
+  │    │    ├─ refuse unless this build has a signing key
+  │    │    ├─ read staged binary (50 MB cap) + 64-byte staged signature
+  │    │    ├─ verify Ed25519 over SHA-256(staged) with the compiled-in key
+  │    │    ├─ refuse unless /usr/local/bin/connlog-agent is root:root, not group/other-writable
+  │    │    ├─ write verified bytes → /usr/local/bin/connlog-agent.new (0755 root:root, same fs)
+  │    │    ├─ run connlog-agent.new --version; refuse unless it parses and is
+  │    │    │    strictly higher than the installed version (equal = no-op)
+  │    │    ├─ hard-link connlog-agent → connlog-agent.old  (rollback copy, same fs)
+  │    │    ├─ rename connlog-agent.new → connlog-agent      (atomic rename())
+  │    │    ├─ run the NEW binary: connlog-agent refresh-service
+  │    │    │    ├─ ok    → rm connlog-agent.old, rm /var/lib/connlog/update-failed
+  │    │    │    └─ fails → rename connlog-agent.old → connlog-agent (rollback)
+  │    │    └─ on any failure: write /var/lib/connlog/update-failed (version, time, reason)
+  │    ├─ rm update marker + staged binary + staged signature
+  │    └─ systemctl start connlog-agent   (whether or not the update applied)
+  ├─ If /run/connlog/.uninstall_requested exists:
+  │    ├─ systemctl disable connlog-agent
+  │    ├─ rm /etc/systemd/system/connlog-agent.service
   │    ├─ systemctl daemon-reload
-  │    ├─ rm update marker + staged binary
-  │    └─ systemctl start connlog-agent
-  └─ If /run/connlog/.uninstall_requested exists:
-       ├─ systemctl disable connlog-agent
-       ├─ rm /etc/systemd/system/connlog-agent.service
-       ├─ systemctl daemon-reload
-       ├─ rm -rf /etc/connlog  (removes token — security-critical)
-       └─ rm /usr/local/bin/connlog-agent
+  │    ├─ rm -rf /etc/connlog /var/lib/connlog  (token, BMC credentials, actions, diagnostics)
+  │    └─ rm /usr/local/bin/connlog-agent{,.old,.new}
+  └─ If /run/connlog/.reboot_requested exists:
+       └─ systemctl reboot --no-block  (systemd-run fallback)
 ```
+
+`/run/connlog` is writable by the service account, so the hook trusts nothing
+it finds there. Only `apply-staged-update`, running from the root-owned
+installed binary with its own compiled-in key, can move bytes into
+`/usr/local/bin`. What the hook cannot protect against is the service account
+writing the uninstall or reboot markers directly: those two requests are
+signals from the agent to root by design, and an attacker who already runs as
+the service account could equally stop the agent. That residual risk is
+accepted and documented here.
 
 ### Updater safety invariants
 
@@ -240,13 +274,16 @@ These invariants must never be broken. They are pinned by tests in
 
 | Invariant                                              | How it is enforced                                                                                                                            |
 | ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| Current binary untouched until replacement is verified | Staged to `/run/connlog/connlog-agent-new`; original at `/usr/local/bin/connlog-agent` is only replaced after a verified copy+rename sequence |
-| Binary replacement is atomic                           | `cp → .new` on the destination filesystem, `chmod`, then `mv` (kernel `rename()` — atomic within same fs)                                     |
+| Current binary untouched until replacement is verified | Staged to `/run/connlog/connlog-agent-new`; `apply-staged-update` re-verifies the Ed25519 signature with the installed binary's own key before writing anything under `/usr/local/bin` |
+| Root-side verification                                 | The hook never copies from `/run/connlog` itself; `install::tests::systemd_unit_update_hook_verifies_before_swapping` pins that                |
+| Binary replacement is atomic                           | Verified bytes written to `connlog-agent.new` on the destination filesystem, then `rename()`; the previous binary stays as a hard link until the new one has refreshed the service |
+| Failed refresh rolls back and the service starts       | `apply_staged_update_inner` renames `.old` back on a failed refresh; the hook runs `systemctl start` in every case                            |
 | Service file refresh is atomic                         | Temp file written directly to `/etc/systemd/system/*.new`, then `mv` within same fs                                                           |
 | SHA-256 always checked                                 | `verify_sha256()` called before `verify_ed25519()`; mismatch aborts immediately                                                               |
-| Ed25519 always checked                                 | `verify_ed25519()` called after SHA-256; can only be skipped with `force=true` AND no compiled-in key                                         |
-| Downgrades rejected                                    | `is_version_upgrade()` blocks any version ≤ current                                                                                           |
-| Non-HTTPS URLs rejected                                | `require_https()` called before every download                                                                                                |
+| Ed25519 always checked                                 | `verify_ed25519()` in the agent and again in `apply-staged-update`; there is no bypass, and a build without a key refuses every update        |
+| Downgrades rejected                                    | `is_version_upgrade()` on the platform's claim in the agent, and on the version the staged binary itself reports in `apply-staged-update`     |
+| Non-HTTPS URLs rejected                                | `require_https()` before every download, and `https_only_redirects()` on every hop of a redirect chain                                        |
+| Release builds carry the key                           | `build.rs` fails a release-profile build without a valid `CONNLOG_SIGNING_PUBLIC_KEY` (opt-out `CONNLOG_ALLOW_UNSIGNED_BUILD=1` for local builds only); `release.yml` checks the secret before building and `scripts/sign-release.sh` checks the private key matches it |
 | Oversized downloads rejected                           | 50 MB hard cap + streaming read; also a 100 KB floor (too small = suspicious)                                                                 |
 | Failed update leaves agent running                     | `try_apply_update()` returns `Err` on any failure; main loop catches it, logs, and continues                                                  |
 | Signing key placeholder ≠ real key                     | All-zero 64-char hex key is a sentinel; `has_signing_key()` returns false                                                                     |
@@ -255,15 +292,16 @@ These invariants must never be broken. They are pinned by tests in
 
 ## Install / uninstall flow
 
-### Install (`install --token agent_<token>`)
+### Install (`CONNLOG_TOKEN=agent_<token> install`)
 
-1. Require root (`geteuid() == 0`)
+1. Require root (`geteuid() == 0`) and a well-formed token (`agent_` + 64 hex)
 2. Create system user `connlog-agent` (no home, no login shell)
-3. Create `/etc/connlog/` (mode 0700, root:connlog-agent)
-4. Write `/etc/connlog/agent.conf` (mode 0600) with `CONNLOG_TOKEN=` and
-   `CONNLOG_PLATFORM_URL=`. Values are shell-escaped before writing to
-   prevent injection via crafted tokens.
-5. Copy the current binary to `/usr/local/bin/connlog-agent`
+3. Create `/etc/connlog/` (mode 0750, root:connlog-agent)
+4. Write `/etc/connlog/agent.conf` (mode 0600) with `CONNLOG_TOKEN=`,
+   `CONNLOG_PLATFORM_URL=` and any opt-in / BMC settings. Values with control
+   characters are refused; the rest are shell-escaped before writing.
+5. Copy the current binary to `/usr/local/bin/connlog-agent` (0755 root:root)
+   and refuse to continue unless it is
 6. Write the embedded systemd unit to `/etc/systemd/system/connlog-agent.service`
 7. `systemctl daemon-reload && systemctl enable && systemctl start`
 
@@ -293,6 +331,9 @@ can remove it manually with `userdel connlog-agent` if desired.
 - HTTP 410 (Decommissioned): immediate self-uninstall
 - `uninstall: true` in heartbeat response: requires 3 consecutive confirmations
   before acting (prevents a single transient response from uninstalling)
+- HTTP 401 (Unauthorized): never. A rejected token is logged and retried at
+  the capped backoff; a platform-side auth regression must not be able to
+  remove a fleet.
 
 Self-uninstall under systemd writes `/run/connlog/.uninstall_requested` and
 exits cleanly (code 0). `ExecStopPost` performs the actual cleanup as root.
@@ -350,9 +391,12 @@ network, no service mutation, no root.
 ## Config persistence
 
 There is no config file on disk for the agent config. Config comes exclusively
-from the server (`GET /api/agents/config`). The only persistent files are the
-token + platform URL in `/etc/connlog/agent.conf` and the bounded heartbeat
-delivery diagnostics in `/var/lib/connlog/heartbeat-telemetry.jsonl` (above).
+from the server (`GET /api/agents/config`). The persistent files are the
+token, platform URL, opt-ins and BMC credentials in `/etc/connlog/agent.conf`,
+local dashboard actions in `/etc/connlog/actions.toml`, the bounded heartbeat
+delivery diagnostics in `/var/lib/connlog/heartbeat-telemetry.jsonl` (above),
+and `/var/lib/connlog/update-failed` while a rejected update is on cooldown.
+Uninstall removes all of them.
 
 `AgentConfig::clamp()` is called on every config response to prevent a buggy
 or malicious server from pushing values that would spin the CPU or prevent

@@ -45,14 +45,9 @@ const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// There is intentionally no JSON fallback — both ends speak binary only.
 const PROTOCOL_VERSION: u32 = 1;
 
-/// Maximum consecutive 401 errors before self-uninstall.
-///
-/// Only counts genuine `401 Unauthorized` responses from the platform — network
-/// errors, DNS failures, machine-down scenarios, etc. are tracked separately in
-/// `consecutive_errors` and never trigger self-uninstall. This guarantees the
-/// agent only removes itself when the platform has authoritatively rejected the
-/// token (deleted agent, deleted workspace, revoked auth) — not when the host
-/// is offline or the platform is briefly unreachable.
+/// After this many consecutive 401s the agent logs an error (and again every
+/// multiple of it). It never uninstalls on 401: only a 410 or an explicit
+/// uninstall request from the platform removes files.
 const MAX_UNAUTHORIZED_ATTEMPTS: u32 = 50;
 
 /// Consecutive uninstall commands required from server before acting
@@ -299,6 +294,7 @@ fn main() -> Result<()> {
                 }
             },
             AgentCommand::Update => return update::run_manual_update(),
+            AgentCommand::ApplyStagedUpdate => return update::apply_staged_update(),
             AgentCommand::CheckConfig => {
                 let token = config
                     .token
@@ -455,6 +451,7 @@ fn run_agent_with_shutdown_inner(
         bmc_config,
         endpoint.clone(),
         token.clone(),
+        expose_system_info,
     );
 
     let mut client = ApiClient::new(endpoint, token).context("Failed to initialize HTTP client")?;
@@ -496,7 +493,12 @@ fn run_agent_with_shutdown_inner(
 
     let mut quick_actions = QuickActionsRegistry::load();
     let mut quick_actions_fingerprint = quick_actions.fingerprint();
-    publish_quick_actions_manifest(&client, &quick_actions);
+    // The manifest is what the dashboard would run; while remote control is
+    // compiled out there is nothing for it to do, and no reason to send
+    // operator-authored action names anywhere.
+    if REMOTE_CONTROL_ENABLED {
+        publish_quick_actions_manifest(&client, &quick_actions);
+    }
     let mut quick_action_polling = QuickActionPollState::new(&config.quick_actions, &quick_actions);
 
     let mut first_heartbeat = true;
@@ -611,7 +613,7 @@ fn run_agent_with_shutdown_inner(
                         update_info.signature_url.is_some(),
                         update_info.sha256.is_some(),
                     );
-                    match update::try_apply_update(update_info, update_info.force_update) {
+                    match update::try_apply_update(update_info) {
                         Ok(true) => {
                             info!(
                                 "Update to v{} staged successfully. Restarting for update...",
@@ -696,23 +698,27 @@ fn run_agent_with_shutdown_inner(
                     consecutive_unauthorized, MAX_UNAUTHORIZED_ATTEMPTS
                 );
 
-                if consecutive_unauthorized >= MAX_UNAUTHORIZED_ATTEMPTS {
+                // A rejected token is never a reason to delete the install. A
+                // platform-side auth regression that answered 401 for an hour
+                // would otherwise have wiped every agent in the fleet; a token
+                // the owner really revoked answers 410 and is handled below.
+                // Keep the files, keep retrying at the capped backoff, and say
+                // so loudly at intervals.
+                if consecutive_unauthorized >= MAX_UNAUTHORIZED_ATTEMPTS
+                    && consecutive_unauthorized.is_multiple_of(MAX_UNAUTHORIZED_ATTEMPTS)
+                {
                     error!(
-                        "Token rejected {} consecutive times. Agent will self-uninstall to prevent zombie pings.",
-                        MAX_UNAUTHORIZED_ATTEMPTS
+                        "Token rejected {} consecutive times. The install is kept; if the token \
+                         was rotated, run: sudo CONNLOG_TOKEN=<new token> connlog-agent install",
+                        consecutive_unauthorized
                     );
-                    trigger_self_uninstall(
-                        "Token rejected too many times (likely deleted or revoked)",
-                    );
-                    return Ok(());
                 }
 
                 // Linear backoff for unauthorized — start at 30 s, ramp by 10 s per
                 // attempt, cap at 120 s. A 401 is cheap on the server (the token
                 // lookup is indexed, no work done), so there's no reason to back
                 // off for hours; we just want enough spacing to absorb a brief
-                // platform glitch. At the cap, 50 attempts ≈ 95 minutes total
-                // before self-uninstall.
+                // platform glitch.
                 let backoff = std::cmp::min(30 + 10 * consecutive_unauthorized as u64, 120);
                 if interruptible_sleep(&stop, backoff).is_err() {
                     return Ok(());
@@ -943,7 +949,9 @@ fn reload_quick_actions_if_changed(
     if reloaded_fingerprint != *quick_actions_fingerprint {
         *quick_actions = reloaded_quick_actions;
         *quick_actions_fingerprint = reloaded_fingerprint;
-        publish_quick_actions_manifest(client, quick_actions);
+        if REMOTE_CONTROL_ENABLED {
+            publish_quick_actions_manifest(client, quick_actions);
+        }
         return true;
     }
     false
