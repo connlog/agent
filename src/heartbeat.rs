@@ -30,6 +30,11 @@ pub struct Metrics {
     pub cpu_percent: Option<f64>,
     #[serde(skip)]
     pub cpu_peak_percent: Option<f64>,
+    /// Logical CPU count. Travels as the `X-Cpu-Core-Count` header rather
+    /// than in the frame, so the 32-byte layout is untouched and an older
+    /// platform simply ignores it.
+    #[serde(skip)]
+    pub cpu_core_count: Option<u32>,
     pub memory_used_mb: u64,
     pub memory_total_mb: u64,
     pub disk_used_mb: u64,
@@ -540,6 +545,7 @@ mod tests {
         let m = Metrics {
             cpu_percent: Some(42.5),
             cpu_peak_percent: Some(50.0),
+            cpu_core_count: None,
             memory_used_mb: 1024,
             memory_total_mb: 8192,
             disk_used_mb: 20480,
@@ -592,6 +598,7 @@ mod tests {
         let m = Metrics {
             cpu_percent: Some(0.0),
             cpu_peak_percent: Some(0.0),
+            cpu_core_count: None,
             memory_used_mb: 0,
             memory_total_mb: 0,
             disk_used_mb: 0,
@@ -638,6 +645,7 @@ mod tests {
             metrics: Metrics {
                 cpu_percent: Some(0.0),
                 cpu_peak_percent: Some(0.0),
+                cpu_core_count: None,
                 memory_used_mb: 0,
                 memory_total_mb: 0,
                 disk_used_mb: 0,

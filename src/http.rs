@@ -20,6 +20,8 @@ use crate::heartbeat::{AgentConfig, HeartbeatPayload, HeartbeatResponse};
 /// headers, so adding this is fully backward-compatible and never alters
 /// authentication semantics or the 32-byte binary frame.
 const REQUEST_ID_HEADER: &str = "X-ConnLog-Request-Id";
+/// Logical CPU count of the host; parsed by the platform as `x-cpu-core-count`.
+pub const CPU_CORE_COUNT_HEADER: &str = "X-Cpu-Core-Count";
 
 const CPU_UNAVAILABLE_X100: u16 = u16::MAX;
 
@@ -374,6 +376,17 @@ impl ApiClient {
             headers.insert(
                 "X-Machine-Id",
                 HeaderValue::from_str(mid).context("Failed to create machine-id header")?,
+            );
+        }
+
+        // Logical CPU count, so the platform can read the load average
+        // against the machine's size. A header rather than a frame field:
+        // the 32-byte layout stays put and an older platform ignores it.
+        if let Some(cores) = payload.metrics.cpu_core_count {
+            headers.insert(
+                CPU_CORE_COUNT_HEADER,
+                HeaderValue::from_str(&cores.to_string())
+                    .context("Failed to create cpu-core-count header")?,
             );
         }
 
@@ -1019,6 +1032,7 @@ mod tests {
             metrics: Metrics {
                 cpu_percent: Some(cpu),
                 cpu_peak_percent: Some(cpu),
+                cpu_core_count: None,
                 memory_used_mb: mem_used,
                 memory_total_mb: mem_total,
                 disk_used_mb: disk_used,

@@ -108,6 +108,7 @@ send_heartbeat()
                 X-Agent-Version, X-Protocol-Version, X-Config-Version
                 X-Hostname, X-OS, X-Arch
                 X-Machine-Id (if available)
+                X-Cpu-Core-Count (logical CPUs, if known)
 
 On OK response:
   ├─ Reset consecutive error counters
@@ -382,7 +383,8 @@ Binary frame (v1), 32 bytes, little-endian:
 | 30     | 2    | load_max × 100 (u16 LE)    |
 
 Identity metadata travels in HTTP headers (`X-Agent-Version`, `X-Hostname`,
-`X-OS`, `X-Arch`, `X-Machine-Id`, etc.). There is no JSON fallback.
+`X-OS`, `X-Arch`, `X-Machine-Id`, `X-Cpu-Core-Count`, etc.). There is no JSON
+fallback.
 
 See `src/http.rs::encode_heartbeat` and `src/http.rs::tests` for the
 byte-level encoding tests that pin this layout.

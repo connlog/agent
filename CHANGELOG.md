@@ -8,6 +8,16 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 
 ## [Unreleased]
 
+### Added
+
+- **Logical CPU count in heartbeats.** The agent now sends an
+  `X-Cpu-Core-Count` header alongside each heartbeat (from `/proc/stat` on
+  Linux, `sysinfo` elsewhere), so the dashboard can read the load average
+  against the size of the machine instead of a fixed scale. Hardware
+  identity, not a metric: it is sent regardless of the CPU metric toggle and
+  is not affected by hostname sharing. The 32-byte frame is unchanged; an
+  older platform ignores the header.
+
 ## [1.18.0] — 2026-08-18
 
 ### Added
