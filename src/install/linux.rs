@@ -4,6 +4,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
+use crate::platform::{SAFE_PATH, STATE_DIR};
+
 pub const SYSTEMD_SERVICE_PATH: &str = "/etc/systemd/system/connlog-agent.service";
 const SYSTEMD_SERVICE_TMP_PATH: &str = "/etc/systemd/system/connlog-agent.service.new";
 
@@ -85,31 +87,30 @@ RemoveIPC=yes
 UMask=0077
 
 # Post-stop hook: handles self-update, self-uninstall, and host reboot
-# (runs as root via + prefix). The agent process itself is unprivileged.
+# (runs as root via + prefix). The agent process itself is unprivileged and
+# /run/connlog is writable by it, so nothing found there is trusted here:
+# `apply-staged-update` re-verifies the staged binary's Ed25519 signature with
+# the key compiled into the installed binary, checks the version the staged
+# binary reports, swaps it in with a same-filesystem rename, and rolls back if
+# the new binary cannot refresh the service. The service is started again in
+# every case, so a rejected update never leaves a host silent.
 ExecStopPost=+/bin/bash -c '\
 if [ -f /run/connlog/.update_requested ]; then \
-    echo "ConnLog: Update marker detected, applying update..."; \
-    cp /usr/local/bin/connlog-agent /run/connlog/connlog-agent-old && \
-    cp /run/connlog/connlog-agent-new /usr/local/bin/connlog-agent.new && \
-    chmod 755 /usr/local/bin/connlog-agent.new && \
-    mv /usr/local/bin/connlog-agent.new /usr/local/bin/connlog-agent; \
-    if ! /usr/local/bin/connlog-agent refresh-service; then \
-        echo "ConnLog: ERROR - service refresh failed after binary replacement."; \
-        echo "ConnLog: Rolling back binary and leaving service stopped."; \
-        mv /run/connlog/connlog-agent-old /usr/local/bin/connlog-agent; \
-        rm -f /run/connlog/.update_requested /run/connlog/connlog-agent-new; \
-        exit 1; \
+    echo "ConnLog: Update marker detected, verifying staged binary..."; \
+    if /usr/local/bin/connlog-agent apply-staged-update; then \
+        echo "ConnLog: Update complete."; \
+    else \
+        echo "ConnLog: Update not applied; the previous binary stays in place."; \
     fi; \
-    rm -f /run/connlog/.update_requested /run/connlog/connlog-agent-new /run/connlog/connlog-agent-old; \
+    rm -f /run/connlog/.update_requested /run/connlog/connlog-agent-new /run/connlog/connlog-agent-new.sig; \
     systemctl start connlog-agent; \
-    echo "ConnLog: Update complete."; \
 elif [ -f /run/connlog/.uninstall_requested ]; then \
     echo "ConnLog: Uninstall marker detected, performing cleanup..."; \
     systemctl disable connlog-agent 2>/dev/null || true; \
     rm -f /etc/systemd/system/connlog-agent.service; \
     systemctl daemon-reload 2>/dev/null || true; \
-    rm -rf /etc/connlog; \
-    rm -f /usr/local/bin/connlog-agent; \
+    rm -rf /etc/connlog /var/lib/connlog; \
+    rm -f /usr/local/bin/connlog-agent /usr/local/bin/connlog-agent.old /usr/local/bin/connlog-agent.new; \
     echo "ConnLog: Agent fully uninstalled."; \
 elif [ -f /run/connlog/.reboot_requested ]; then \
     echo "ConnLog: Reboot marker detected, scheduling host reboot..."; \
@@ -138,6 +139,8 @@ pub fn install(
     }
 
     println!("Installing ConnLog agent as systemd service...");
+
+    validate_token_format(token)?;
 
     // Get platform URL from environment or use default
     let platform_url = std::env::var("CONNLOG_PLATFORM_URL")
@@ -188,13 +191,13 @@ pub fn uninstall() -> Result<()> {
     println!("Uninstalling ConnLog agent...");
 
     // 1. Stop the service FIRST (prevents resurrection)
-    let _ = Command::new("systemctl")
+    let _ = system_command("systemctl")
         .args(["stop", "connlog-agent"])
         .status();
     println!("  Stopped service");
 
     // 2. Disable the service (prevents boot start)
-    let _ = Command::new("systemctl")
+    let _ = system_command("systemctl")
         .args(["disable", "connlog-agent"])
         .status();
     println!("  Disabled service");
@@ -204,14 +207,20 @@ pub fn uninstall() -> Result<()> {
     println!("  Removed service file");
 
     // 4. Reload systemd (forgets the unit)
-    let _ = Command::new("systemctl").arg("daemon-reload").status();
+    let _ = system_command("systemctl").arg("daemon-reload").status();
     println!("  Reloaded systemd");
 
     // 5. Remove config (includes token - security critical)
     let _ = fs::remove_dir_all("/etc/connlog");
     println!("  Removed /etc/connlog");
 
-    // 6. Remove binary LAST (we're running from it)
+    // 6. Remove local diagnostics (heartbeat telemetry, update notes)
+    let _ = fs::remove_dir_all(STATE_DIR);
+    println!("  Removed {}", STATE_DIR);
+
+    // 7. Remove binary LAST (we're running from it), plus any swap leftovers
+    let _ = fs::remove_file("/usr/local/bin/connlog-agent.old");
+    let _ = fs::remove_file("/usr/local/bin/connlog-agent.new");
     let _ = fs::remove_file("/usr/local/bin/connlog-agent");
     println!("  Removed binary");
 
@@ -225,7 +234,7 @@ pub fn uninstall() -> Result<()> {
 }
 
 pub fn status() -> Result<()> {
-    let output = Command::new("systemctl")
+    let output = system_command("systemctl")
         .args(["status", "connlog-agent"])
         .output()
         .context("Failed to check service status")?;
@@ -361,7 +370,7 @@ fn write_service_atomically(path: &Path, service_text: &str) -> Result<()> {
 }
 
 fn run_systemctl(args: &[&str]) -> Result<()> {
-    let status = Command::new("systemctl")
+    let status = system_command("systemctl")
         .args(args)
         .status()
         .with_context(|| format!("Failed to run systemctl {}", args.join(" ")))?;
@@ -372,7 +381,7 @@ fn run_systemctl(args: &[&str]) -> Result<()> {
 }
 
 fn systemd_needs_daemon_reload() -> Option<bool> {
-    let output = Command::new("systemctl")
+    let output = system_command("systemctl")
         .args([
             "show",
             "connlog-agent",
@@ -395,9 +404,40 @@ fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+/// A system tool with a fixed `PATH`, so a root-run install never resolves
+/// `systemctl` or `useradd` through whatever the caller's shell put first.
+fn system_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    command.env("PATH", SAFE_PATH);
+    command
+}
+
+/// Tokens are `agent_` followed by 64 hex characters, which is also what the
+/// platform generates and validates. Checking it here keeps anything else,
+/// control characters included, out of the systemd EnvironmentFile.
+fn validate_token_format(token: &str) -> Result<()> {
+    let hex = token.strip_prefix("agent_").unwrap_or("");
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        anyhow::bail!(
+            "Invalid token format: expected agent_ followed by 64 hex characters (copy it from the dashboard)"
+        );
+    }
+    Ok(())
+}
+
+/// Values written to the EnvironmentFile are one line each. A newline or
+/// other control character would end the assignment early and start another
+/// one, so it is refused rather than escaped.
+fn validate_env_value(name: &str, value: &str) -> Result<()> {
+    if value.chars().any(char::is_control) {
+        anyhow::bail!("{name} contains a control character and cannot be written to agent.conf");
+    }
+    Ok(())
+}
+
 fn create_system_user() -> Result<()> {
     // Check if user already exists
-    let output = Command::new("id").arg("connlog-agent").output();
+    let output = system_command("id").arg("connlog-agent").output();
 
     if output.map(|o| o.status.success()).unwrap_or(false) {
         println!("  User 'connlog-agent' already exists");
@@ -405,7 +445,7 @@ fn create_system_user() -> Result<()> {
     }
 
     // Create system user
-    let status = Command::new("useradd")
+    let status = system_command("useradd")
         .args([
             "--system",
             "--no-create-home",
@@ -427,7 +467,7 @@ fn create_system_user() -> Result<()> {
 fn create_config_dir() -> Result<()> {
     fs::create_dir_all("/etc/connlog").context("Failed to create /etc/connlog directory")?;
 
-    let chown_status = Command::new("chown")
+    let chown_status = system_command("chown")
         .args(["root:connlog-agent", "/etc/connlog"])
         .status()
         .context("Failed to set /etc/connlog ownership")?;
@@ -450,7 +490,8 @@ fn create_config_dir() -> Result<()> {
 }
 
 /// Escape a value for systemd EnvironmentFile double-quoted context.
-/// Prevents shell injection through crafted token or URL values.
+/// Prevents shell injection through crafted token or URL values. Control
+/// characters are refused earlier by `validate_env_value`; this only quotes.
 fn escape_env_value(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('"', "\\\"")
@@ -464,6 +505,14 @@ fn write_config(
     bmc: Option<&crate::features::bmc::BmcConfig>,
     expose_system_info: bool,
 ) -> Result<()> {
+    validate_env_value("CONNLOG_TOKEN", token)?;
+    validate_env_value("CONNLOG_PLATFORM_URL", platform_url)?;
+    if let Some(b) = bmc {
+        validate_env_value("CONNLOG_BMC_ENDPOINT", &b.endpoint)?;
+        validate_env_value("CONNLOG_BMC_USERNAME", &b.username)?;
+        validate_env_value("CONNLOG_BMC_PASSWORD", &b.password)?;
+    }
+
     let mut config = format!(
         "CONNLOG_TOKEN=\"{}\"\nCONNLOG_PLATFORM_URL=\"{}\"\n",
         escape_env_value(token),
@@ -569,7 +618,7 @@ fn restart_agent_service() -> Result<()> {
         return Ok(());
     }
 
-    let status = Command::new("systemctl")
+    let status = system_command("systemctl")
         .args(["restart", "connlog-agent"])
         .status()
         .context("Failed to restart connlog-agent")?;
@@ -596,16 +645,21 @@ fn install_binary() -> Result<()> {
         // Copy binary to target location
         fs::copy(&current_exe, target_path).context("Failed to copy binary to /usr/local/bin")?;
 
-        // Make executable
+        // Root-owned and writable by root only: the ExecStopPost hook runs
+        // this file as root, so it must not be anyone else's to change.
         let mut perms = fs::metadata(target_path)
             .context("Failed to read installed binary metadata")?
             .permissions();
         perms.set_mode(0o755);
         fs::set_permissions(target_path, perms)
             .context("Failed to set installed binary permissions")?;
+        std::os::unix::fs::chown(target_path, Some(0), Some(0))
+            .context("Failed to set installed binary ownership")?;
 
-        println!("  Installed binary to /usr/local/bin/connlog-agent");
+        println!("  Installed binary to /usr/local/bin/connlog-agent (0755 root:root)");
     }
+
+    crate::update::assert_live_binary_trusted()?;
 
     Ok(())
 }
@@ -620,7 +674,7 @@ fn create_systemd_service() -> Result<()> {
 }
 
 fn enable_service() -> Result<()> {
-    let status = Command::new("systemctl")
+    let status = system_command("systemctl")
         .args(["enable", "connlog-agent"])
         .status()
         .context("Failed to enable service")?;
@@ -635,7 +689,7 @@ fn enable_service() -> Result<()> {
 
 fn start_service() -> Result<()> {
     // Check if service is already running - use restart to pick up the new binary
-    let is_active = Command::new("systemctl")
+    let is_active = system_command("systemctl")
         .args(["is-active", "--quiet", "connlog-agent"])
         .status()
         .map(|s| s.success())
@@ -643,7 +697,7 @@ fn start_service() -> Result<()> {
 
     let action = if is_active { "restart" } else { "start" };
 
-    let status = Command::new("systemctl")
+    let status = system_command("systemctl")
         .args([action, "connlog-agent"])
         .status()
         .with_context(|| format!("Failed to {} service", action))?;
@@ -824,29 +878,57 @@ mod tests {
             !SYSTEMD_SERVICE.contains("systemctl reboot;"),
             "synchronous systemctl reboot inside ExecStopPost deadlocks"
         );
-        assert!(SYSTEMD_SERVICE.contains("refresh-service"));
-        assert!(SYSTEMD_SERVICE.contains("ConnLog: ERROR - service refresh failed"));
+        assert!(SYSTEMD_SERVICE.contains("apply-staged-update"));
+        assert!(SYSTEMD_SERVICE.contains("ConnLog: Update not applied"));
     }
 
-    /// The binary replacement in ExecStopPost MUST NOT overwrite the live binary
-    /// directly with `cp`. A crash during `cp` leaves a corrupt binary and a
-    /// permanently bricked agent. The correct pattern is:
-    ///   1. cp → connlog-agent.new   (safe: original is untouched if cp fails)
-    ///   2. chmod                     (sets executable bit on the staging file)
-    ///   3. mv .new → connlog-agent  (atomic rename() within the same fs)
+    /// The update hook must never move anything out of /run/connlog on trust.
+    /// That directory is writable by the unprivileged service account, so the
+    /// only path into /usr/local/bin is `apply-staged-update`, which verifies
+    /// the staged bytes with the installed binary's own key first.
     #[test]
-    fn systemd_unit_binary_replacement_is_atomic() {
-        // The staged binary must land in a .new file first, then be atomically
-        // renamed into place. Direct cp to the live path is not atomic.
+    fn systemd_unit_update_hook_verifies_before_swapping() {
         assert!(
-            SYSTEMD_SERVICE.contains("connlog-agent.new"),
-            "binary must be staged to connlog-agent.new before atomic mv into place"
+            SYSTEMD_SERVICE.contains("/usr/local/bin/connlog-agent apply-staged-update"),
+            "the installed binary must verify and apply the staged update"
         );
         assert!(
-            SYSTEMD_SERVICE
-                .contains("mv /usr/local/bin/connlog-agent.new /usr/local/bin/connlog-agent"),
-            "final replacement must be an atomic mv, not a direct cp"
+            !SYSTEMD_SERVICE.contains("cp /run/connlog/")
+                && !SYSTEMD_SERVICE.contains("mv /run/connlog/connlog-agent-new"),
+            "the hook must not copy a file from /run/connlog into place itself"
         );
+        assert!(
+            SYSTEMD_SERVICE.contains("rm -f /run/connlog/.update_requested /run/connlog/connlog-agent-new /run/connlog/connlog-agent-new.sig"),
+            "the staged binary, its signature and the marker are removed after every attempt"
+        );
+    }
+
+    /// A rejected or failed update must leave the host with a running agent,
+    /// not a stopped one.
+    #[test]
+    fn systemd_unit_update_hook_always_starts_the_service_again() {
+        let update_branch = SYSTEMD_SERVICE
+            .split("elif [ -f /run/connlog/.uninstall_requested ]")
+            .next()
+            .expect("update branch precedes the uninstall branch");
+        assert!(
+            update_branch.contains("systemctl start connlog-agent"),
+            "the update branch must start the service whether or not the update applied"
+        );
+        assert!(
+            !update_branch.contains("exit 1"),
+            "the update branch must not exit early and leave the service stopped"
+        );
+    }
+
+    /// Uninstall means uninstall: config, local diagnostics and the binary
+    /// (with any swap leftovers) all go.
+    #[test]
+    fn systemd_unit_uninstall_removes_state_and_binaries() {
+        assert!(SYSTEMD_SERVICE.contains("rm -rf /etc/connlog /var/lib/connlog"));
+        assert!(SYSTEMD_SERVICE.contains(
+            "rm -f /usr/local/bin/connlog-agent /usr/local/bin/connlog-agent.old /usr/local/bin/connlog-agent.new"
+        ));
     }
 
     /// The service-file refresh temp file must be created on the same
@@ -856,10 +938,6 @@ mod tests {
     /// is NOT atomic.
     #[test]
     fn systemd_unit_service_file_refresh_is_atomic() {
-        assert!(
-            SYSTEMD_SERVICE.contains("connlog-agent refresh-service"),
-            "self-update must use the shared refresh-service implementation"
-        );
         assert!(
             !SYSTEMD_SERVICE.contains("/run/connlog/connlog-agent.service.new"),
             "service file temp must NOT be on /run (tmpfs) — cross-fs mv is not atomic"
@@ -967,6 +1045,29 @@ mod tests {
     /// for CPU, memory, load, disk and uptime. Keep this test as a tripwire:
     /// re-introducing either flag without also re-implementing metric
     /// collection will fail here loudly.
+    #[test]
+    fn token_format_is_agent_prefix_plus_64_hex() {
+        let good = format!("agent_{}", "ab".repeat(32));
+        assert!(validate_token_format(&good).is_ok());
+        for bad in [
+            "agent_short",
+            "token_0000",
+            "",
+            &format!("agent_{}\n", "ab".repeat(32)),
+            &format!("agent_{}", "zz".repeat(32)),
+        ] {
+            assert!(validate_token_format(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn env_values_with_control_characters_are_refused() {
+        assert!(validate_env_value("X", "https://connlog.com").is_ok());
+        for bad in ["a\nb", "a\rb", "a\0b", "tab\tvalue"] {
+            assert!(validate_env_value("X", bad).is_err(), "{bad:?}");
+        }
+    }
+
     #[test]
     fn systemd_unit_does_not_block_proc_reads() {
         assert!(

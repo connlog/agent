@@ -956,8 +956,13 @@ pub fn command_looks_risky(argv: &[String]) -> bool {
 
 fn run_action(request: &QuickActionRequest, action: &QuickAction) -> QuickActionResultPayload {
     let start = Instant::now();
+    // A clean environment: the service process holds CONNLOG_TOKEN (and any
+    // BMC password) from the EnvironmentFile, and an action that merely runs
+    // `env` must not be able to read them back into the dashboard.
     let mut child = match Command::new(&action.exec[0])
         .args(&action.exec[1..])
+        .env_clear()
+        .env("PATH", crate::platform::SAFE_PATH)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -10,6 +10,8 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
+# Actions are pinned to commit SHAs (the tag is a comment) so a moved tag
+# cannot change what runs here.
 jobs:
   fmt-clippy-test:
     name: linux / fmt + clippy + test
@@ -18,15 +20,15 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           components: rustfmt, clippy
 
       - name: Cache cargo registry + target
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -45,6 +47,11 @@ jobs:
         run: cargo test --all-targets
 
       - name: cargo build --release
+        # This build exists for the size budget below, never ships, and so
+        # may be built without the release signing key (build.rs refuses a
+        # release build without one otherwise).
+        env:
+          CONNLOG_ALLOW_UNSIGNED_BUILD: "1"
         run: cargo build --release
 
       - name: Binary size budget
@@ -62,3 +69,31 @@ jobs:
             echo "::error::Release binary exceeds 12 MiB budget ($SIZE bytes). Investigate before bumping the budget."
             exit 1
           fi
+
+      - name: Release build refuses to ship without a signing key
+        # The guard in build.rs is the only thing standing between an unset
+        # CI secret and a fleet-wide update that cannot be verified. Prove it
+        # still trips.
+        run: |
+          set +e
+          out=$(cargo build --release 2>&1)
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "::error::A release build without CONNLOG_SIGNING_PUBLIC_KEY succeeded; build.rs must refuse it."
+            exit 1
+          fi
+          echo "$out" | grep -q "CONNLOG_SIGNING_PUBLIC_KEY" || { echo "::error::Unexpected failure output"; echo "$out"; exit 1; }
+          echo "build.rs refused the unsigned release build as intended"
+
+  cargo-deny:
+    name: linux / cargo deny (advisories, licences, sources)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --all-features
