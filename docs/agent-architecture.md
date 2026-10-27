@@ -21,6 +21,12 @@ the agent can be requested from the dashboard; each is confirmed on three
 consecutive heartbeats. A host can refuse remote reboot outright (see "Remote
 reboot" below).
 
+One more outbound behaviour exists only when the host opts in with
+`CONNLOG_NETWORK_MAP=true` in its root-only `agent.conf`: the network map
+(see "Network map" below). The agent then reports its own interface
+addresses and listening TCP port numbers, and runs the capped reachability
+probes the platform asks for against other opted-in hosts. Off by default.
+
 ---
 
 ## Source map
@@ -64,6 +70,14 @@ src/
                               storage, fans, temps, PSUs; own thread + clients
     remote_reboot.rs       — What became of a remote reboot: the attempt record
                               across the reboot, X-Reboot-State reports
+    network_map.rs         — Opt-in network map: CONNLOG_NETWORK_MAP* settings,
+                              the inventory schedule, the inventory and probe
+                              threads (own HTTP clients), X-Network-Map
+    network_inventory.rs   — Addresses (getifaddrs), TCP listeners
+                              (/proc/net/tcp{,6}), gateway (/proc/net/route,
+                              /proc/net/arp); the inventory JSON
+    reachability.rs        — Probe requests cut to the compiled-in caps, the
+                              private-range guard, TCP and ICMP probes, results
     flight_recorder/       — The last day of the host, one record a minute:
       ring.rs                the fixed-size ring file (format, CRC, rotation)
       signals.rs             OOM kills and pressure stall readings from /proc
@@ -130,6 +144,7 @@ send_heartbeat()
                 X-Remote-Reboot: allowed | disabled (daemon only)
                 X-Host-Settings: bmc=on|off,hostname=on|off,postmortem=on|off
                                  (daemon only; on/off values, never the file)
+                X-Network-Map: enabled | disabled (daemon only)
                 X-Reboot-State, X-Reboot-Message (only while a report is queued)
 
 On OK response:
@@ -141,6 +156,8 @@ On OK response:
   ├─ Ignore response.quick_actions  — never execute remote commands
   ├─ Check response.update          — try_apply_update() (see Update flow)
   ├─ Check response.config_outdated — fetch new config if true
+  ├─ Hand inventory_request / probe_request to the network map
+  │                                    (never blocks; inert with the flag off)
   └─ Sleep jittered(interval_secs)  — +0..10% to spread fleet load (never
                                        shorter than the interval, so the
                                        plan limiter is never undershot)
@@ -479,6 +496,91 @@ the requested reboot, when flagged), a sample then a new boot is an unclean one
 restart, update or kill, and a run of `heartbeat failing` samples is the host up
 while the platform was unreachable.
 
+## Network map
+
+Opt-in on the host: nothing below runs unless the root-only
+`/etc/connlog/agent.conf` says `CONNLOG_NETWORK_MAP=true` (`config
+enable-network-map`, or `install --enable-network-map`), and the workspace
+must turn the map on as well. The design and the guarantees given to
+customers are in `docs/topology/PLAN.md`; the wire formats are
+`packages/agent-protocol/src/network.ts` and its fixtures.
+
+```
+run_agent_with_shutdown_inner()
+  ├─ NetworkMapSettings::from_config — flag, site, extra ports, public probes;
+  │    a site or port list that does not parse is warned about once and left out
+  ├─ client.set_network_map_enabled  — X-Network-Map on every heartbeat
+  └─ NetworkMap::start               — flag off: no thread, nothing else below
+       ├─ "network-inventory" thread (own ApiClient)
+       └─ "network-probes" thread    (own ApiClient)
+```
+
+### Inventory
+
+```
+first accepted heartbeat, then every 15 min, and on response.inventory_request
+  └─ network_inventory::collect()                (panic-isolated)
+       ├─ getifaddrs: address + prefix; skip loopback, fe80::/10, down
+       │    interfaces, container bridges by name (docker*, br-*, veth*, cni*,
+       │    flannel*, cali*, vxlan*, kube-*, podman*, virbr*, lxcbr*, cilium*,
+       │    weave*); real bridges (vmbr*) and VPNs (wg*, tailscale*, tun*) stay
+       ├─ /proc/net/tcp, tcp6: state 0A, loopback binds dropped, one entry per
+       │    port (wildcard if bound to 0.0.0.0 or :: anywhere)
+       ├─ /proc/net/route: default route, lowest metric → /proc/net/arp MAC
+       ├─ site and extra ports from agent.conf
+       └─ sorted, at most 256 addresses and 1024 listeners
+  └─ InventorySchedule: send when the SHA-256 of the body differs from the
+       last accepted one (the first after a start always), at least daily, and
+       on request; never twice within 60 s; a refused body (accepted: false,
+       400/404/413/415/422) is not sent again until it changes or a day passes
+       └─ POST {control}/api/agents/inventory
+            application/vnd.connlog.inventory.v1+json, bearer, X-Machine-Id
+```
+
+### Probes
+
+```
+response.probe_request { id, targets: [{ address, ports, icmp }] }
+  ├─ read leniently (ProbeRequest::from_json): a shape the agent cannot use is
+  │    no request, never a failed heartbeat; cut to 32 targets × 8 ports in the
+  │    order given before anything else is read; bad addresses/ports dropped
+  ├─ flag off → ignored
+  ├─ a request still running → this one is dropped
+  └─ "network-probes" thread: reachability::run
+       ├─ plan: each target's ports, then its echo; outside RFC 1918,
+       │    100.64/10, 169.254/16, fc00::/7, fe80::/10 → skipped unless
+       │    CONNLOG_PROBE_PUBLIC=true
+       ├─ at most 4 in flight, 1 s timeout each
+       ├─ TCP: connect_timeout, then close: open (rttMs) | refused | timeout
+       │    | unreachable; never a byte of payload
+       ├─ ICMP: unprivileged SOCK_DGRAM/IPPROTO_ICMP(V6) echo; skipped when
+       │    net.ipv4.ping_group_range does not include the service's group
+       └─ POST {control}/api/agents/probes
+            application/vnd.connlog.probes.v1+json; a delivery failure is tried
+            once more, a platform answer (accepted true or false) never
+```
+
+Safety invariants (pinned by tests in `network_map.rs`, `network_inventory.rs`,
+`reachability.rs`, `simulation.rs` and `http::shared_fixtures`):
+
+- **Off unless the host says true.** With the flag off there is no thread:
+  no inventory is read or sent and no probe runs, whatever a heartbeat
+  answer carries (`with_the_flag_off_nothing_is_probed_or_uploaded`).
+- **The caps are compiled in.** 32 targets, 8 ports each, 4 in flight, 1 s,
+  one request at a time; nothing in configuration or on the wire raises them.
+- **The range guard agrees with the platform's** (`isPrivateAddress`), pinned
+  by `probe-requests.json`. A public target is reported `skipped` and never
+  touched unless the host sets `CONNLOG_PROBE_PUBLIC=true`.
+- **No new privilege.** The ICMP echo uses the unprivileged ping socket; the
+  unit gains no capability and no address family.
+- **Minimal data.** Addresses with prefix length, listening port numbers, the
+  gateway and its MAC, the site name and extra ports. No interface names,
+  process names, users, UDP or peers; loopback-only listeners never leave
+  the host.
+- **A map failure never affects a heartbeat.** Both threads have their own
+  HTTP client; the heartbeat loop only sends them a message, and both new
+  response fields are read leniently.
+
 ## Heartbeat delivery diagnostics
 
 `heartbeat_telemetry.rs` records a bounded, persistent, agent-owned history of
@@ -638,7 +740,13 @@ In rough priority order:
    Any change to field offsets or encoding must be coordinated with
    `apps/web/src/app/api/agents/heartbeat/route.ts` in the same
    commit and must bump `PROTOCOL_VERSION`.
-6. **Endpoint assignment trust boundary** — `validate_assigned_endpoint` in
+6. **Network map consent and caps** — nothing in `network_map.rs` may run
+   unless the host's own agent.conf says `CONNLOG_NETWORK_MAP=true`, and the
+   probe caps and private-range guard in `reachability.rs` must hold whatever
+   the platform sends (guarantees 1 and 3 of `docs/topology/PLAN.md`). They
+   are what we tell a customer's security team; a change that loosens one is
+   a change to that promise.
+7. **Endpoint assignment trust boundary** — `validate_assigned_endpoint` in
    `endpoint_assignment.rs` is the only thing standing between "the platform
    tells us where to heartbeat" and "an attacker tells us where to heartbeat".
    It must keep rejecting non-HTTPS, untrusted-domain, and

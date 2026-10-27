@@ -134,6 +134,62 @@ pub struct Config {
     #[arg(long = "disable-remote-reboot", global = true)]
     pub disable_remote_reboot: bool,
 
+    // ── Network map (docs/topology/PLAN.md) ──
+    //
+    // Off unless the root-only agent.conf says CONNLOG_NETWORK_MAP=true. Site
+    // and ports are read as plain text and checked by
+    // `features::network_map`: a bad value is refused by `install` and
+    // `config`, and ignored with a warning by the daemon, so a typo in the
+    // file can never stop the agent from starting.
+    /// Whether this host takes part in the network map. Off unless set to true.
+    #[arg(
+        long = "network-map",
+        env = "CONNLOG_NETWORK_MAP",
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new(),
+        global = true,
+        hide = true
+    )]
+    pub network_map: Option<bool>,
+
+    /// With `install`: write CONNLOG_NETWORK_MAP=true, so this host takes
+    /// part in the network map (its workspace must turn the map on too).
+    #[arg(long = "enable-network-map", global = true)]
+    pub enable_network_map: bool,
+
+    /// Network map site name (CONNLOG_NETWORK_SITE): hosts with the same name
+    /// are drawn as one site. Lowercase letters, digits, `.`, `_`, `-`; at
+    /// most 64.
+    #[arg(
+        long = "network-site",
+        env = "CONNLOG_NETWORK_SITE",
+        global = true,
+        value_name = "NAME"
+    )]
+    pub network_site: Option<String>,
+
+    /// Extra TCP ports others should try on this host even if nothing listens
+    /// yet (CONNLOG_NETWORK_MAP_PORTS): a comma list of at most 16 ports.
+    #[arg(
+        long = "network-map-ports",
+        env = "CONNLOG_NETWORK_MAP_PORTS",
+        global = true,
+        value_name = "PORTS"
+    )]
+    pub network_map_ports: Option<String>,
+
+    /// Let network map probes reach addresses outside the private ranges.
+    /// Off unless set to true.
+    #[arg(
+        long = "probe-public",
+        env = "CONNLOG_PROBE_PUBLIC",
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new(),
+        global = true,
+        hide = true
+    )]
+    pub probe_public: Option<bool>,
+
     // ── BMC hardware-health (Dell iDRAC / HPE iLO / OpenBMC via Redfish) ──
     //
     // All three of endpoint/username/password must be set to enable the
@@ -301,6 +357,18 @@ pub enum LocalConfigCommand {
 
     /// Stop sending the previous boot's last warnings (the default)
     DisablePostmortem,
+
+    /// Take part in the network map
+    #[command(
+        long_about = "Set CONNLOG_NETWORK_MAP=true in /etc/connlog/agent.conf and restart the agent service.\n\nThe agent then sends this host's interface addresses (with prefix length), the TCP port numbers listening on a non-loopback address, its default gateway and the gateway's MAC address, every 15 minutes when they change; and it runs the reachability probes ConnLog asks for: TCP handshakes (never a payload) and ICMP echoes to other opted-in hosts in the same workspace, at most 32 addresses and 8 ports per request, 4 at a time, private addresses only unless CONNLOG_PROBE_PUBLIC=true. No process names, users, interface names or connections leave the host. Off by default; the workspace must turn the map on as well.\n\nWith --network-site or --network-map-ports, those are written too.\n\nExamples:\n  sudo connlog-agent config enable-network-map\n  sudo connlog-agent config enable-network-map --network-site hq --network-map-ports 443,8443"
+    )]
+    EnableNetworkMap,
+
+    /// Stop taking part in the network map (the default)
+    #[command(
+        long_about = "Set CONNLOG_NETWORK_MAP=false in /etc/connlog/agent.conf and restart the agent service.\n\nThe agent then sends no inventory, runs no probes, and tells ConnLog so; ConnLog stops offering this host as a target.\n\nExample:\n  sudo connlog-agent config disable-network-map"
+    )]
+    DisableNetworkMap,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
@@ -555,6 +623,11 @@ impl fmt::Debug for Config {
             .field("share_postmortem", &self.share_postmortem)
             .field("enable_remote_reboot", &self.enable_remote_reboot)
             .field("disable_remote_reboot", &self.disable_remote_reboot)
+            .field("network_map", &self.network_map)
+            .field("enable_network_map", &self.enable_network_map)
+            .field("network_site", &self.network_site)
+            .field("network_map_ports", &self.network_map_ports)
+            .field("probe_public", &self.probe_public)
             .finish()
     }
 }
@@ -576,6 +649,23 @@ impl Config {
             Some(true)
         } else {
             self.allow_remote_reboot
+        }
+    }
+
+    /// Whether the running agent takes part in the network map: only an
+    /// explicit true.
+    pub fn network_map_enabled(&self) -> bool {
+        self.network_map == Some(true)
+    }
+
+    /// The network map choice this `install` makes, if it makes one:
+    /// `--enable-network-map`, then an explicit CONNLOG_NETWORK_MAP. `None`
+    /// keeps whatever the host's agent.conf already says.
+    pub fn requested_network_map(&self) -> Option<bool> {
+        if self.enable_network_map {
+            Some(true)
+        } else {
+            self.network_map
         }
     }
 
@@ -900,6 +990,73 @@ mod tests {
             let cfg = Config::parse_from(["connlog-agent", "config", arg]);
             assert_eq!(cfg.command, Some(AgentCommand::Config { command }));
         }
+    }
+
+    #[test]
+    fn config_network_map_subcommands_parse() {
+        for (arg, command) in [
+            ("enable-network-map", LocalConfigCommand::EnableNetworkMap),
+            ("disable-network-map", LocalConfigCommand::DisableNetworkMap),
+        ] {
+            let cfg = Config::parse_from(["connlog-agent", "config", arg]);
+            assert_eq!(cfg.command, Some(AgentCommand::Config { command }));
+        }
+        let cfg = Config::parse_from([
+            "connlog-agent",
+            "config",
+            "enable-network-map",
+            "--network-site",
+            "hq",
+            "--network-map-ports",
+            "443,8443",
+        ]);
+        assert_eq!(cfg.network_site.as_deref(), Some("hq"));
+        assert_eq!(cfg.network_map_ports.as_deref(), Some("443,8443"));
+    }
+
+    #[test]
+    fn network_map_is_off_unless_set_to_true() {
+        let cfg = Config::parse_from(["connlog-agent"]);
+        assert_eq!(cfg.network_map, None);
+        assert!(!cfg.network_map_enabled());
+        for (value, on) in [
+            ("true", true),
+            ("yes", true),
+            ("false", false),
+            ("0", false),
+        ] {
+            let cfg = Config::parse_from(["connlog-agent", "--network-map", value]);
+            assert_eq!(cfg.network_map_enabled(), on, "{value}");
+        }
+    }
+
+    #[test]
+    fn install_network_map_choice() {
+        for (args, requested) in [
+            (&["install"][..], None),
+            (&["install", "--enable-network-map"][..], Some(true)),
+            (&["install", "--network-map", "false"][..], Some(false)),
+            (
+                &["install", "--network-map", "false", "--enable-network-map"][..],
+                Some(true),
+            ),
+        ] {
+            let cfg =
+                Config::parse_from(std::iter::once("connlog-agent").chain(args.iter().copied()));
+            assert_eq!(cfg.command, Some(AgentCommand::Install), "{args:?}");
+            assert_eq!(cfg.requested_network_map(), requested, "{args:?}");
+        }
+        let cfg = Config::parse_from([
+            "connlog-agent",
+            "install",
+            "--enable-network-map",
+            "--network-site",
+            "dc-1",
+            "--network-map-ports",
+            "8443",
+        ]);
+        assert_eq!(cfg.network_site.as_deref(), Some("dc-1"));
+        assert_eq!(cfg.network_map_ports.as_deref(), Some("8443"));
     }
 
     #[test]

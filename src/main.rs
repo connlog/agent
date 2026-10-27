@@ -288,11 +288,13 @@ fn main() -> Result<()> {
             AgentCommand::Install => {
                 let token = config.token.clone().context("Token required for install")?;
                 let bmc = features::bmc::BmcConfig::from_config(&config);
+                let network_map = features::network_map::ConfChoice::from_config(&config)?;
                 return install::install(
                     &token,
                     bmc.as_ref(),
                     config.expose_system_info,
                     config.requested_remote_reboot(),
+                    &network_map,
                 );
             }
             AgentCommand::Uninstall => return install::uninstall(),
@@ -310,6 +312,19 @@ fn main() -> Result<()> {
                 }
                 LocalConfigCommand::DisablePostmortem => {
                     return install::set_postmortem_sharing(false);
+                }
+                LocalConfigCommand::EnableNetworkMap => {
+                    let choice = features::network_map::ConfChoice {
+                        enabled: Some(true),
+                        ..features::network_map::ConfChoice::from_config(&config)?
+                    };
+                    return install::set_network_map(&choice);
+                }
+                LocalConfigCommand::DisableNetworkMap => {
+                    return install::set_network_map(&features::network_map::ConfChoice {
+                        enabled: Some(false),
+                        ..Default::default()
+                    });
                 }
             },
             AgentCommand::Update => return update::run_manual_update(),
@@ -420,11 +435,13 @@ fn main() -> Result<()> {
             .clone()
             .context("Token required for installation")?;
         let bmc = features::bmc::BmcConfig::from_config(&config);
+        let network_map = features::network_map::ConfChoice::from_config(&config)?;
         return install::install(
             &token,
             bmc.as_ref(),
             config.expose_system_info,
             config.requested_remote_reboot(),
+            &network_map,
         );
     }
 
@@ -444,6 +461,8 @@ fn main() -> Result<()> {
         hostname: expose_system_info,
         postmortem: config.share_postmortem,
     };
+    // Bad site or port values are warned about here, once, and left out.
+    let network_map = features::network_map::NetworkMapSettings::from_config(&config);
 
     // A service stop (or the host shutting down) sets `stop` instead of
     // killing the process, so the loop ends where it is and exits 0.
@@ -458,17 +477,21 @@ fn main() -> Result<()> {
         expose_system_info,
         allow_remote_reboot,
         host_settings,
+        network_map,
         bmc_config,
         stop,
     )
 }
 
+// One call site (`main`), each argument a setting it has already read.
+#[allow(clippy::too_many_arguments)]
 fn run_agent_with_shutdown_inner(
     token: String,
     endpoint: String,
     expose_system_info: bool,
     allow_remote_reboot: bool,
     host_settings: http::HostSettings,
+    network_map: features::network_map::NetworkMapSettings,
     bmc_config: Option<features::bmc::BmcConfig>,
     stop: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -506,6 +529,16 @@ fn run_agent_with_shutdown_inner(
         expose_system_info,
     );
 
+    // The network map: inert unless CONNLOG_NETWORK_MAP=true. Its own
+    // thread and HTTP client, like the BMC poller, so an inventory or probe
+    // problem can never delay a heartbeat.
+    let mut network = features::network_map::NetworkMap::start(
+        &network_map,
+        endpoint.clone(),
+        token.clone(),
+        Arc::clone(&stop),
+    );
+
     let mut client = ApiClient::new(endpoint, token).context("Failed to initialize HTTP client")?;
 
     // Attach the heartbeat delivery telemetry store. Best-effort and isolated:
@@ -521,6 +554,12 @@ fn run_agent_with_shutdown_inner(
     client.set_telemetry(telemetry);
     client.set_remote_reboot_allowed(allow_remote_reboot);
     client.set_host_settings(host_settings);
+    client.set_network_map_enabled(network_map.enabled);
+    if !network_map.enabled {
+        info!(
+            "Network map is off on this host; `sudo connlog-agent config enable-network-map` joins it"
+        );
+    }
     if !allow_remote_reboot {
         info!(
             "Remote reboot is off on this host; `sudo connlog-agent config enable-remote-reboot` allows it"
@@ -797,6 +836,9 @@ fn run_agent_with_shutdown_inner(
                         &mut history_answers,
                     );
                 }
+
+                // The network map: never blocks, does nothing with the flag off.
+                network.on_heartbeat(response.inventory_request, response.probe_request);
 
                 // Monitoring-only: do not execute dashboard-triggered commands.
                 if !response.quick_actions.is_empty() {
@@ -1503,6 +1545,8 @@ struct HeartbeatResult {
     update: Option<heartbeat::UpdateInfo>,
     quick_actions: Vec<features::quick_actions::QuickActionRequest>,
     history_request: Option<heartbeat::HistoryRequest>,
+    inventory_request: bool,
+    probe_request: Option<features::reachability::ProbeRequest>,
 }
 
 fn send_heartbeat(
@@ -1672,6 +1716,8 @@ fn send_heartbeat(
         update: response.update,
         quick_actions: response.quick_actions,
         history_request: response.history_request,
+        inventory_request: response.inventory_request,
+        probe_request: response.probe_request,
     })
 }
 

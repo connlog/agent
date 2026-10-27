@@ -93,6 +93,7 @@ struct HostSettings {
     remote_reboot: Option<bool>,
     hostname: Option<bool>,
     postmortem: Option<bool>,
+    network_map: Option<bool>,
 }
 
 impl HostSettings {
@@ -104,6 +105,9 @@ impl HostSettings {
             remote_reboot: Some(install::conf_allows_remote_reboot(conf)),
             hostname: Some(install::conf_bool(conf, "CONNLOG_EXPOSE_SYSTEM_INFO").unwrap_or(false)),
             postmortem: Some(install::conf_bool(conf, "CONNLOG_SHARE_POSTMORTEM").unwrap_or(false)),
+            network_map: Some(
+                install::conf_bool(conf, super::network_map::CONF_NETWORK_MAP) == Some(true),
+            ),
         }
     }
 }
@@ -113,6 +117,7 @@ enum Choice {
     RemoteReboot,
     Hostname,
     Postmortem,
+    NetworkMap,
     Status,
     CheckConfig,
     TestHeartbeat,
@@ -128,6 +133,7 @@ fn needs_root(choice: Choice) -> bool {
         Choice::RemoteReboot
             | Choice::Hostname
             | Choice::Postmortem
+            | Choice::NetworkMap
             | Choice::CheckConfig
             | Choice::TestHeartbeat
             | Choice::Uninstall
@@ -143,7 +149,7 @@ fn setting_label(name: &str, value: Option<bool>) -> String {
     format!("{name:<20}{value}")
 }
 
-/// The menu, in order: the three toggles, then the one-off actions.
+/// The menu, in order: the four toggles, then the one-off actions.
 fn menu_items(settings: &HostSettings) -> Vec<(Choice, String)> {
     vec![
         (
@@ -157,6 +163,10 @@ fn menu_items(settings: &HostSettings) -> Vec<(Choice, String)> {
         (
             Choice::Postmortem,
             setting_label("Crash reports", settings.postmortem),
+        ),
+        (
+            Choice::NetworkMap,
+            setting_label("Network map", settings.network_map),
         ),
         (Choice::Status, "Service status".to_string()),
         (Choice::CheckConfig, "Check config with ConnLog".to_string()),
@@ -367,6 +377,15 @@ fn act(choice: Choice, settings: &HostSettings, conf: Option<&str>) -> Result<()
                 install::set_postmortem_sharing(!now)?;
             }
         }
+        Choice::NetworkMap => {
+            let now = settings.network_map.unwrap_or(false);
+            if confirm_toggle("the network map", now)? {
+                install::set_network_map(&super::network_map::ConfChoice {
+                    enabled: Some(!now),
+                    ..Default::default()
+                })?;
+            }
+        }
         Choice::Status => install::status()?,
         Choice::CheckConfig | Choice::TestHeartbeat => {
             let conf = conf.unwrap_or_default();
@@ -504,6 +523,7 @@ mod tests {
                 remote_reboot: Some(false),
                 hostname: Some(true),
                 postmortem: Some(false),
+                network_map: Some(false),
             }
         );
         assert_eq!(HostSettings::from_conf(None), HostSettings::default());

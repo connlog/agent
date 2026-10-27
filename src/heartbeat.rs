@@ -63,6 +63,32 @@ pub struct HeartbeatResponse {
     /// flight recorder's records for (`POST /api/agents/history`).
     #[serde(default)]
     pub history_request: Option<HistoryRequest>,
+    /// The network map wants a fresh inventory (`POST /api/agents/inventory`).
+    /// Read leniently: a value that is not `true` is no request, never a
+    /// heartbeat that fails to parse. Ignored unless the host opted in.
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub inventory_request: bool,
+    /// Probes to run once and report (`POST /api/agents/probes`), already
+    /// cut to the agent's caps. Read leniently: a request the agent cannot
+    /// use is no request, never a heartbeat that fails to parse. Ignored
+    /// unless the host opted in.
+    #[serde(default, deserialize_with = "lenient_probe_request")]
+    pub probe_request: Option<crate::features::reachability::ProbeRequest>,
+}
+
+fn lenient_probe_request<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::features::reachability::ProbeRequest>, D::Error> {
+    Ok(crate::features::reachability::ProbeRequest::from_json(
+        &serde_json::Value::deserialize(deserializer)?,
+    ))
+}
+
+/// `true` only for JSON `true`; anything else, including a malformed value,
+/// is `false`. For optional requests a newer platform adds to the answer,
+/// so that no shape it sends can make a heartbeat count as failed.
+fn lenient_bool<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    Ok(serde_json::Value::deserialize(deserializer)?.as_bool() == Some(true))
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]

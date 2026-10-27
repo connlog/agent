@@ -155,6 +155,7 @@ pub fn install(
     bmc: Option<&crate::features::bmc::BmcConfig>,
     expose_system_info: bool,
     remote_reboot: Option<bool>,
+    network_map: &crate::features::network_map::ConfChoice,
 ) -> Result<()> {
     // Check if running as root
     if !is_root() {
@@ -178,9 +179,20 @@ pub fn install(
     // A reinstall keeps the host's existing remote-reboot choice unless this
     // install makes a new one; with neither, the line is left out (off).
     let remote_reboot = remote_reboot.or_else(existing_conf_remote_reboot);
+    // The same for the network map: its flag, site, ports and public probes.
+    let network_map = network_map
+        .clone()
+        .or_existing(read_agent_conf().as_deref());
 
     // Write config file with token (+ BMC settings if provided)
-    write_config(token, &platform_url, bmc, expose_system_info, remote_reboot)?;
+    write_config(
+        token,
+        &platform_url,
+        bmc,
+        expose_system_info,
+        remote_reboot,
+        &network_map,
+    )?;
     if bmc.is_some() {
         println!("  BMC hardware-health polling configured (iDRAC / iLO / OpenBMC)");
     }
@@ -195,6 +207,21 @@ pub fn install(
         println!(
             "  Remote reboot off (to allow it: sudo connlog-agent config enable-remote-reboot)"
         );
+    }
+
+    if network_map.enabled == Some(true) {
+        println!("  Network map on (CONNLOG_NETWORK_MAP=true)");
+        if let Some(site) = &network_map.site {
+            println!("    site: {site}");
+        }
+        if let Some(ports) = &network_map.ports {
+            println!(
+                "    extra ports: {}",
+                crate::features::network_map::format_ports(ports)
+            );
+        }
+    } else {
+        println!("  Network map off (to join it: sudo connlog-agent config enable-network-map)");
     }
 
     // Copy binary to /usr/local/bin
@@ -540,6 +567,7 @@ fn write_config(
     bmc: Option<&crate::features::bmc::BmcConfig>,
     expose_system_info: bool,
     remote_reboot: Option<bool>,
+    network_map: &crate::features::network_map::ConfChoice,
 ) -> Result<()> {
     validate_env_value("CONNLOG_TOKEN", token)?;
     validate_env_value("CONNLOG_PLATFORM_URL", platform_url)?;
@@ -561,6 +589,12 @@ fn write_config(
 
     if let Some(allowed) = remote_reboot {
         config.push_str(&format!("CONNLOG_ALLOW_REMOTE_REBOOT=\"{allowed}\"\n"));
+    }
+
+    // Validated by `ConfChoice` (site and port characters are a closed set),
+    // escaped anyway like every other value.
+    for (key, value) in network_map.conf_lines() {
+        config.push_str(&format!("{key}=\"{}\"\n", escape_env_value(&value)));
     }
 
     // Persist BMC hardware-health settings so the installed systemd service
@@ -607,6 +641,14 @@ pub fn set_remote_reboot(allowed: bool) -> Result<()> {
         "CONNLOG_ALLOW_REMOTE_REBOOT",
         if allowed { "true" } else { "false" },
     )
+}
+
+/// Join (with any site or ports the command gave) or leave the network map,
+/// then restart the service. Leaving keeps the site and ports for next time.
+pub fn set_network_map(choice: &crate::features::network_map::ConfChoice) -> Result<()> {
+    let lines = choice.conf_lines();
+    let pairs: Vec<(&str, &str)> = lines.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    set_agent_conf_values(&pairs)
 }
 
 const AGENT_CONF_PATH: &str = "/etc/connlog/agent.conf";
@@ -677,6 +719,11 @@ pub fn conf_bool(conf: &str, key: &str) -> Option<bool> {
 /// service so systemd reloads the EnvironmentFile. Token, URL and BMC keys are
 /// left as they are.
 fn set_agent_conf_value(key: &str, value: &str) -> Result<()> {
+    set_agent_conf_values(&[(key, value)])
+}
+
+/// `set_agent_conf_value` for several keys at once, with one restart.
+fn set_agent_conf_values(pairs: &[(&str, &str)]) -> Result<()> {
     if !is_root() {
         anyhow::bail!("This command requires root. Please run with sudo.");
     }
@@ -692,13 +739,19 @@ fn set_agent_conf_value(key: &str, value: &str) -> Result<()> {
     } else {
         fs::read_to_string(path).context("Failed to read /etc/connlog/agent.conf")?
     };
-    let next = upsert_env_line(&existing, key, value);
+    let mut next = existing;
+    for (key, value) in pairs {
+        validate_env_value(key, value)?;
+        next = upsert_env_line(&next, key, value);
+    }
     write_agent_conf(&next)?;
 
     if created {
         println!("  Created /etc/connlog/agent.conf (600 root:root)");
     }
-    println!("  Set {key}={value}");
+    for (key, value) in pairs {
+        println!("  Set {key}={value}");
+    }
 
     restart_agent_service()
 }

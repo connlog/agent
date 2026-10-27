@@ -6,6 +6,40 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 [`VERSIONING.md`](./VERSIONING.md) for the full policy. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+## [1.21.0] — 2026-10-28
+
+### Added
+
+- **The network map, opt-in on each host.** With `CONNLOG_NETWORK_MAP=true`
+  in the root-only `/etc/connlog/agent.conf` (`config enable-network-map`, or
+  `install --enable-network-map`; off again with `config
+  disable-network-map`, and a toggle in the menu), the agent:
+  - sends an inventory to `POST /api/agents/inventory`
+    (`application/vnd.connlog.inventory.v1+json`): interface addresses with
+    prefix length (loopback, IPv6 link-local and container bridges left
+    out), the TCP port numbers listening on a non-loopback address, the
+    default gateway and its MAC, an optional site name
+    (`CONNLOG_NETWORK_SITE`, `--network-site`) and extra ports
+    (`CONNLOG_NETWORK_MAP_PORTS`, `--network-map-ports`). Read every 15
+    minutes on its own thread and sent when it changed, at least daily, and
+    when a heartbeat answer carries `inventory_request`;
+  - runs the reachability probes a heartbeat answer's `probe_request` asks
+    for, on its own thread, within compiled-in caps: 32 addresses and 8 ports
+    per request, 4 in flight, 1 s each, one request at a time; a TCP
+    handshake and close (never a payload) and an unprivileged ICMP echo
+    (`skipped` where `ping_group_range` does not allow it). Addresses outside
+    the private ranges are `skipped` unless `CONNLOG_PROBE_PUBLIC=true`.
+    Results go to `POST /api/agents/probes`
+    (`application/vnd.connlog.probes.v1+json`).
+  A site name or port list that does not parse is refused by `install` and
+  `config` and ignored, with a warning, by the running agent. A reinstall
+  keeps the host's choice.
+- **`X-Network-Map: enabled | disabled`** on every heartbeat.
+
+No new crate; the systemd unit is unchanged.
+
 ## [1.20.0] — 2026-10-26
 
 ### Added
@@ -988,6 +1022,7 @@ considered stable; breaking changes from this point on require a major bump.
 
 - Last pre-1.0 release. See git history for prior changes.
 
+[1.21.0]: https://github.com/connlog/agent/compare/v1.20.0...v1.21.0
 [1.20.0]: https://github.com/connlog/agent/compare/v1.19.0...v1.20.0
 [1.19.0]: https://github.com/connlog/agent/compare/v1.18.0...v1.19.0
 [1.18.0]: https://github.com/connlog/agent/compare/v1.17.1...v1.18.0

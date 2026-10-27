@@ -58,6 +58,10 @@ CONNLOG_TOKEN=<TOKEN> connlog-agent register
 | `CONNLOG_EXPOSE_SYSTEM_INFO`      | Set to `true` to opt in to sending hostname with heartbeats (off by default). Prefer `sudo connlog-agent config enable-hostname`, which creates `/etc/connlog/agent.conf` if needed and restarts the service. |
 | `CONNLOG_ALLOW_REMOTE_REBOOT`     | `true` to let the dashboard reboot this host; unset or anything else refuses (the default). Prefer `sudo connlog-agent config enable-remote-reboot`, or `install --enable-remote-reboot`. The root-side hook checks the same root-only file, so neither the platform nor the running agent can turn it on. |
 | `CONNLOG_SHARE_POSTMORTEM`        | `true` to send, after the host went down without a clean stop, the previous boot's last journal and kernel warnings with the outage report: redacted, at most 8 KB, needs a persistent journal. Off by default. Prefer `sudo connlog-agent config enable-postmortem`. |
+| `CONNLOG_NETWORK_MAP`             | `true` to take part in the network map: the agent sends its interface addresses (with prefix length), the TCP port numbers listening on a non-loopback address, its default gateway and the gateway's MAC, and runs the reachability probes ConnLog asks for. Unset or anything else is off (the default). Prefer `sudo connlog-agent config enable-network-map`, or `install --enable-network-map`. The workspace must turn the map on too. |
+| `CONNLOG_NETWORK_SITE`            | Optional network map site name: hosts with the same name are drawn as one site. Lowercase letters, digits, `.`, `_`, `-`, starting with a letter or digit; at most 64. Also set by `install --network-site` or `config enable-network-map --network-site`. |
+| `CONNLOG_NETWORK_MAP_PORTS`       | Optional comma list of at most 16 TCP ports (1..65535) other hosts should try on this one even if nothing listens yet, e.g. `443,8443`. Also set by `install --network-map-ports` or `config enable-network-map --network-map-ports`. A bad site or port list is refused by `install` and `config`; the running agent warns and ignores it. |
+| `CONNLOG_PROBE_PUBLIC`            | `true` to let network map probes reach addresses outside the private ranges (RFC 1918, 100.64/10, 169.254/16, fc00::/7, fe80::/10). Off by default: public targets are reported `skipped`. |
 | `CONNLOG_ALLOWED_ENDPOINT_DOMAINS`| Comma-separated extra domains the agent will trust for heartbeat **endpoint assignments** (see below), in addition to `connlog.com`; only relevant for self-hosted/regional setups |
 | `CONNLOG_BMC_ENDPOINT`            | Optional. The Redfish endpoint of this machine's BMC (iDRAC, iLO, OpenBMC), e.g. `https://10.0.0.120`. With the username and password below, the agent polls it for hardware health (drives, volumes, controllers, fans, PSUs, temperatures) and reports it to ConnLog. Also set by `install --bmc-endpoint ...`. |
 | `CONNLOG_BMC_USERNAME`, `CONNLOG_BMC_PASSWORD` | BMC credentials. Stored in `/etc/connlog/agent.conf` (0600 root), sent only to the configured BMC origin, never to ConnLog. |
@@ -100,6 +104,15 @@ sudo connlog-agent config disable-postmortem
 # Let the dashboard reboot this machine (off by default), and refuse it again
 sudo connlog-agent config enable-remote-reboot
 sudo connlog-agent config disable-remote-reboot
+
+# Take part in the network map (off by default), optionally with a site name
+# and extra ports, and leave it again
+sudo connlog-agent config enable-network-map
+sudo connlog-agent config enable-network-map --network-site hq --network-map-ports 443,8443
+sudo connlog-agent config disable-network-map
+
+# Or at install time
+sudo CONNLOG_TOKEN=<TOKEN> connlog-agent install --enable-network-map --network-site hq
 
 # Uninstall (stops the service; removes the config, local diagnostics and the binary)
 sudo connlog-agent uninstall
@@ -369,6 +382,29 @@ every request unless its root-only `agent.conf` sets
 `CONNLOG_ALLOW_REMOTE_REBOOT=true`. Local
 `connlog-agent action` tooling may still exist on disk; the platform will not
 trigger it.
+
+### Network map (opt-in)
+
+With `CONNLOG_NETWORK_MAP=true` (and the map turned on for the workspace), the
+agent sends an inventory to ConnLog: this host's interface addresses with
+their prefix length (loopback, IPv6 link-local and container bridges left
+out), the TCP port numbers listening on a non-loopback address, the default
+gateway and its MAC address, and the site name and extra ports above. It is
+read every 15 minutes and sent when it changes, at least once a day. No
+interface names, process names, users, UDP sockets or connections leave the
+host.
+
+ConnLog can then ask the agent, on a heartbeat answer, to test whether it can
+reach other opted-in hosts in the same workspace. What the agent will do is
+compiled in, whatever it is asked: at most 32 addresses and 8 ports per
+address per request, 4 probes at a time with a 1 second timeout, one request
+at a time. A TCP probe is a handshake and a close, never a byte of data; an
+ICMP echo uses the kernel's unprivileged ping socket and is reported
+`skipped` where `net.ipv4.ping_group_range` does not allow the agent's group
+(the agent gains no capability for it). Addresses outside the private ranges
+are `skipped` unless `CONNLOG_PROBE_PUBLIC=true`. With the flag off the agent
+sends no inventory and runs no probe, and tells ConnLog so with every
+heartbeat (`X-Network-Map: disabled`).
 
 ### Collected metrics
 

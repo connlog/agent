@@ -9,6 +9,7 @@ use crate::endpoint_assignment::EndpointAssignmentResponse;
 use crate::features::heartbeat_telemetry::{
     new_request_id, ErrorCategory, EventBuilder, EventType, HeartbeatTelemetry, HB_LOG_TARGET,
 };
+use crate::features::network_map::{NETWORK_MAP_DISABLED, NETWORK_MAP_ENABLED, NETWORK_MAP_HEADER};
 use crate::features::quick_actions::{
     QuickActionRequest, QuickActionResultPayload, QuickActionsManifestPayload,
 };
@@ -155,6 +156,8 @@ pub struct ApiClient {
     remote_reboot_allowed: Option<bool>,
     /// `None` until the daemon says, for the same reason.
     host_settings: Option<HostSettings>,
+    /// CONNLOG_NETWORK_MAP (`X-Network-Map`); `None` until the daemon says.
+    network_map_enabled: Option<bool>,
     /// What became of the last reboot request, sent until a heartbeat is
     /// accepted (`features::remote_reboot`).
     reboot_report: Mutex<Option<RebootReport>>,
@@ -270,6 +273,7 @@ impl ApiClient {
             boot_id: crate::identity::boot_id(),
             remote_reboot_allowed: None,
             host_settings: None,
+            network_map_enabled: None,
             reboot_report: Mutex::new(None),
             heartbeat_url: Mutex::new(heartbeat_url),
             telemetry: None,
@@ -292,6 +296,12 @@ impl ApiClient {
     /// Report this host's other agent.conf settings on every heartbeat.
     pub fn set_host_settings(&mut self, settings: HostSettings) {
         self.host_settings = Some(settings);
+    }
+
+    /// Report whether this host takes part in the network map on every
+    /// heartbeat (`X-Network-Map`).
+    pub fn set_network_map_enabled(&mut self, enabled: bool) {
+        self.network_map_enabled = Some(enabled);
     }
 
     /// Queue (or, with `None`, clear) the reboot report for the next heartbeats.
@@ -511,6 +521,17 @@ impl ApiClient {
                 HOST_SETTINGS_HEADER,
                 HeaderValue::from_str(&settings.header_value())
                     .context("Failed to create host settings header")?,
+            );
+        }
+
+        if let Some(enabled) = self.network_map_enabled {
+            headers.insert(
+                NETWORK_MAP_HEADER,
+                HeaderValue::from_static(if enabled {
+                    NETWORK_MAP_ENABLED
+                } else {
+                    NETWORK_MAP_DISABLED
+                }),
             );
         }
 
@@ -867,6 +888,52 @@ impl ApiClient {
             });
         }
         Ok(())
+    }
+
+    /// Send a network map upload (`/api/agents/inventory` or
+    /// `/api/agents/probes`) to the control plane: same auth and machine
+    /// binding as the history upload. `Ok(accepted)` from the platform's
+    /// `{"ok":true,"data":{"accepted":bool}}`; a success the agent cannot
+    /// read counts as accepted, so it is not sent again and again.
+    pub fn upload_network(
+        &self,
+        path: &str,
+        content_type: &'static str,
+        body: Vec<u8>,
+    ) -> Result<bool, ApiError> {
+        let url = format!("{}{path}", self.base_url);
+        // SECURITY: Never log the token
+        let mut request = self
+            .client
+            .post(&url)
+            .header(CONTENT_TYPE, content_type)
+            .header(AUTHORIZATION, format!("Bearer {}", self.token));
+        if let Some(mid) = &self.machine_id {
+            request = request.header("X-Machine-Id", mid);
+        }
+        let response = request
+            .body(body)
+            .send()
+            .with_context(|| format!("Failed to send {path}"))?;
+        if !response.status().is_success() {
+            return Err(ApiError::HttpError {
+                status: response.status().as_u16(),
+                message: error_body_excerpt(response),
+            });
+        }
+        #[derive(serde::Deserialize)]
+        struct Data {
+            accepted: Option<bool>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Envelope {
+            data: Option<Data>,
+        }
+        Ok(read_body_bounded(response, MAX_ERROR_BODY_BYTES)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Envelope>(&text).ok())
+            .and_then(|envelope| envelope.data?.accepted)
+            .unwrap_or(true))
     }
 
     /// Send the previous boot's last words (opt-in, already redacted) to
@@ -1689,6 +1756,46 @@ mod shared_fixtures {
                 "{description}"
             );
 
+            assert_eq!(
+                resp.inventory_request,
+                json["inventory_request"].as_bool().unwrap_or(false),
+                "{description}"
+            );
+            let probes =
+                |id: &str, targets: Vec<(String, Vec<u64>, bool)>| (id.to_string(), targets);
+            assert_eq!(
+                resp.probe_request.as_ref().map(|p| probes(
+                    &p.id,
+                    p.targets
+                        .iter()
+                        .map(|t| (
+                            t.address.to_string(),
+                            t.ports.iter().map(|&p| u64::from(p)).collect(),
+                            t.icmp
+                        ))
+                        .collect()
+                )),
+                json["probe_request"].as_object().map(|p| probes(
+                    p["id"].as_str().unwrap(),
+                    p["targets"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|t| (
+                            t["address"].as_str().unwrap().to_string(),
+                            t["ports"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .map(|p| p.as_u64().unwrap())
+                                .collect(),
+                            t["icmp"].as_bool().unwrap()
+                        ))
+                        .collect()
+                )),
+                "{description}"
+            );
+
             let expected_actions = json["quick_actions"]
                 .as_array()
                 .cloned()
@@ -1751,6 +1858,10 @@ mod shared_fixtures {
             (super::REBOOT_STATE_HEADER, Sent::OneOf(&REBOOT_STATES)),
             (super::HOST_SETTINGS_HEADER, Sent::Encoded(host_settings)),
             (
+                super::NETWORK_MAP_HEADER,
+                Sent::OneOf(&[super::NETWORK_MAP_ENABLED, super::NETWORK_MAP_DISABLED]),
+            ),
+            (
                 super::REBOOT_MESSAGE_HEADER,
                 Sent::Parsed(crate::features::remote_reboot::sanitize_message),
             ),
@@ -1794,7 +1905,10 @@ mod shared_fixtures {
                     let mut read: Vec<&str> =
                         valid.iter().map(|c| c["read"].as_str().unwrap()).collect();
                     let mut ours = values.to_vec();
+                    // A value may be read from more than one spelling
+                    // (`Enabled` → `enabled`); the set is what counts.
                     read.sort_unstable();
+                    read.dedup();
                     ours.sort_unstable();
                     assert_eq!(read, ours, "{name}: the values the platform reads");
                     for value in *values {

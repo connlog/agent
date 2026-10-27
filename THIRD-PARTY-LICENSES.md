@@ -2933,7 +2933,7 @@ SOFTWARE.
 
 ### MIT License
 
-Used by: connlog-agent 1.20.0
+Used by: connlog-agent 1.21.0
 
 ```text
 MIT License

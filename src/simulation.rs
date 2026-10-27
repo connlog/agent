@@ -216,6 +216,49 @@ fn repeating_server(
     (format!("http://127.0.0.1:{port}"), rx)
 }
 
+/// A mock control plane that answers every connection, by path, until the
+/// test ends, and passes each request back. For the threads that upload on
+/// their own (the network map), where the test cannot know how many
+/// requests are coming.
+fn routing_server(
+    routes: Vec<(&'static str, &'static str, Vec<u8>)>,
+) -> (String, mpsc::Receiver<CapturedRequest>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { break };
+            let req = read_request(&stream);
+            let (status, body) = routes
+                .iter()
+                .find(|(path, _, _)| *path == req.path)
+                .map(|(_, status, body)| (*status, body.clone()))
+                .unwrap_or(("404 Not Found", br#"{"ok":false}"#.to_vec()));
+            if tx.send(req).is_err() {
+                break;
+            }
+            write_response(&stream, status, &body);
+        }
+    });
+
+    (format!("http://127.0.0.1:{port}"), rx)
+}
+
+/// Every request `rx` sees within `window`.
+fn drain_requests(rx: &mpsc::Receiver<CapturedRequest>, window: Duration) -> Vec<CapturedRequest> {
+    let deadline = std::time::Instant::now() + window;
+    let mut seen = Vec::new();
+    while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+        match rx.recv_timeout(left) {
+            Ok(req) => seen.push(req),
+            Err(_) => break,
+        }
+    }
+    seen
+}
+
 /// Return a port that has no listener (bind then drop), so a connection attempt
 /// is refused promptly — a deterministic transport failure.
 fn dead_port_base() -> String {
@@ -395,6 +438,28 @@ fn heartbeat_sends_host_settings_once_set() {
         recv_request(&rx).header("X-Host-Settings"),
         Some("bmc=on,hostname=off,postmortem=on")
     );
+}
+
+/// `X-Network-Map` carries the host's CONNLOG_NETWORK_MAP, and only once the
+/// daemon has set it.
+#[test]
+fn heartbeat_sends_the_network_map_setting_once_set() {
+    let body =
+        br#"{"ok":true,"server_time":"2026-04-30T00:00:00Z","expected_interval_seconds":60}"#
+            .to_vec();
+
+    let (base, rx) = one_shot_server("200 OK", body.clone());
+    let client = ApiClient::new(base, "test-token".into()).expect("ApiClient::new");
+    client.send_heartbeat(&make_payload(), None).expect("ok");
+    assert_eq!(recv_request(&rx).header("X-Network-Map"), None);
+
+    for (enabled, sent) in [(true, "enabled"), (false, "disabled")] {
+        let (base, rx) = one_shot_server("200 OK", body.clone());
+        let mut client = ApiClient::new(base, "test-token".into()).expect("ApiClient::new");
+        client.set_network_map_enabled(enabled);
+        client.send_heartbeat(&make_payload(), None).expect("ok");
+        assert_eq!(recv_request(&rx).header("X-Network-Map"), Some(sent));
+    }
 }
 
 #[test]
@@ -1012,4 +1077,372 @@ fn telemetry_write_failure_does_not_interrupt_heartbeat() {
         "heartbeat must succeed even when telemetry cannot be written"
     );
     fs::remove_dir_all(&base_dir).ok();
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// The network map
+// ────────────────────────────────────────────────────────────────────────
+
+const ACCEPTED: &[u8] = br#"{"ok":true,"data":{"accepted":true}}"#;
+
+/// The map's sources for a test: a fixed inventory, and real probes.
+fn fixed_sources() -> crate::features::network_map::Sources {
+    crate::features::network_map::Sources {
+        inventory: std::sync::Arc::new(fixed_inventory),
+        prober: std::sync::Arc::new(crate::features::reachability::SystemProber),
+    }
+}
+
+fn fixed_inventory() -> crate::features::network_inventory::Inventory {
+    use crate::features::network_inventory::{InterfaceAddress, Inventory};
+    {
+        Inventory::build(
+            &[InterfaceAddress {
+                interface: "eth0".into(),
+                up: true,
+                loopback: false,
+                ip: "10.0.10.5".parse().unwrap(),
+                prefix_length: 24,
+            }],
+            &[("0.0.0.0".parse().unwrap(), 22)],
+            None,
+            Some("hq".into()),
+            &[8443],
+        )
+    }
+}
+
+/// With the host's flag on, the first accepted heartbeat starts the
+/// inventory: one upload, the inventory content type, bearer and machine id.
+#[test]
+fn an_opted_in_host_sends_its_inventory_after_the_first_heartbeat() {
+    use crate::features::network_map::{NetworkMap, NetworkMapSettings};
+    let (base, rx) = routing_server(vec![("/api/agents/inventory", "200 OK", ACCEPTED.to_vec())]);
+    let settings = NetworkMapSettings {
+        enabled: true,
+        ..NetworkMapSettings::default()
+    };
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut map = NetworkMap::start_with(
+        &settings,
+        base,
+        "test-token".into(),
+        stop.clone(),
+        fixed_sources(),
+    );
+    assert!(
+        drain_requests(&rx, Duration::from_millis(300)).is_empty(),
+        "nothing before the first accepted heartbeat"
+    );
+
+    map.on_heartbeat(false, None);
+    let req = recv_request(&rx);
+    assert_eq!(req.method, "POST");
+    assert_eq!(req.path, "/api/agents/inventory");
+    assert_eq!(
+        req.header("Content-Type"),
+        Some("application/vnd.connlog.inventory.v1+json")
+    );
+    assert_eq!(req.header("Authorization"), Some("Bearer test-token"));
+    assert!(req.header("X-Machine-Id").is_some());
+    let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "version": 1,
+            "addresses": [{ "address": "10.0.10.5", "prefixLength": 24 }],
+            "tcpListeners": [{ "port": 22, "wildcard": true }],
+            "gateway": null,
+            "site": "hq",
+            "extraPorts": [8443]
+        })
+    );
+
+    // Later heartbeats without a request send nothing more.
+    map.on_heartbeat(false, None);
+    assert!(drain_requests(&rx, Duration::from_millis(300)).is_empty());
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Guarantee 1: with the flag off, no heartbeat answer makes the agent send
+/// an inventory.
+#[test]
+fn a_host_that_has_not_opted_in_sends_no_inventory() {
+    use crate::features::network_map::{NetworkMap, NetworkMapSettings};
+    let (base, rx) = routing_server(vec![("/api/agents/inventory", "200 OK", ACCEPTED.to_vec())]);
+    let mut map = NetworkMap::start_with(
+        &NetworkMapSettings::default(),
+        base,
+        "test-token".into(),
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        fixed_sources(),
+    );
+    map.on_heartbeat(true, None);
+    map.on_heartbeat(true, None);
+    assert!(drain_requests(&rx, Duration::from_millis(500)).is_empty());
+}
+
+/// A malformed `inventory_request` is no request, never a failed heartbeat.
+#[test]
+fn heartbeat_reads_inventory_request_leniently() {
+    for (field, expected) in [
+        (r#","inventory_request":true"#, true),
+        (r#","inventory_request":false"#, false),
+        (r#","inventory_request":"yes""#, false),
+        (r#","inventory_request":{"x":1}"#, false),
+        ("", false),
+    ] {
+        let body =
+            format!(r#"{{"ok":true,"server_time":"t","expected_interval_seconds":60{field}}}"#);
+        let (base, _rx) = one_shot_server("200 OK", body.into_bytes());
+        let client = ApiClient::new(base, "test-token".into()).expect("ApiClient::new");
+        let resp = client.send_heartbeat(&make_payload(), None).expect("ok");
+        assert_eq!(resp.inventory_request, expected, "{field}");
+    }
+}
+
+/// A local listener as a probe target, and how many connections it saw.
+fn probe_target() -> (TcpListener, u16) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    (listener, port)
+}
+
+fn connections_seen(listener: &TcpListener) -> usize {
+    let mut seen = 0;
+    while listener.accept().is_ok() {
+        seen += 1;
+    }
+    seen
+}
+
+/// A heartbeat answer that asks for one TCP probe of `port` on 127.0.0.1.
+fn heartbeat_with_probe(id: &str, port: u16) -> Vec<u8> {
+    format!(
+        r#"{{"ok":true,"server_time":"2026-10-28T12:00:00.000Z","expected_interval_seconds":60,"uninstall":false,"reboot":false,"update":null,"probe_request":{{"id":"{id}","targets":[{{"address":"127.0.0.1","ports":[{port}],"icmp":false}}]}}}}"#
+    )
+    .into_bytes()
+}
+
+fn network_map_settings(
+    enabled: bool,
+    probe_public: bool,
+) -> crate::features::network_map::NetworkMapSettings {
+    crate::features::network_map::NetworkMapSettings {
+        enabled,
+        probe_public,
+        ..Default::default()
+    }
+}
+
+fn probe_uploads(requests: &[CapturedRequest]) -> Vec<serde_json::Value> {
+    requests
+        .iter()
+        .filter(|r| r.path == "/api/agents/probes")
+        .map(|r| {
+            assert_eq!(r.method, "POST");
+            assert_eq!(
+                r.header("Content-Type"),
+                Some("application/vnd.connlog.probes.v1+json")
+            );
+            assert_eq!(r.header("Authorization"), Some("Bearer test-token"));
+            assert!(r.header("X-Machine-Id").is_some());
+            serde_json::from_slice(&r.body).expect("results are JSON")
+        })
+        .collect()
+}
+
+/// T2.2's simulation: a heartbeat carrying a probe request yields exactly
+/// one results upload, the probe itself a single handshake.
+#[test]
+fn a_heartbeat_with_a_probe_request_yields_exactly_one_results_upload() {
+    use crate::features::network_map::NetworkMap;
+    let (target, port) = probe_target();
+    let (base, rx) = routing_server(vec![
+        (
+            "/api/agents/heartbeat",
+            "200 OK",
+            heartbeat_with_probe("prb_sim1", port),
+        ),
+        ("/api/agents/probes", "200 OK", ACCEPTED.to_vec()),
+        ("/api/agents/inventory", "200 OK", ACCEPTED.to_vec()),
+    ]);
+    let client = ApiClient::new(base.clone(), "test-token".into()).expect("ApiClient::new");
+    let resp = client.send_heartbeat(&make_payload(), None).expect("ok");
+    assert_eq!(recv_request(&rx).path, "/api/agents/heartbeat");
+
+    // 127.0.0.1 is not a private address: this host allows public targets.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut map = NetworkMap::start_with(
+        &network_map_settings(true, true),
+        base,
+        "test-token".into(),
+        stop.clone(),
+        fixed_sources(),
+    );
+    map.on_heartbeat(resp.inventory_request, resp.probe_request);
+
+    let uploads = probe_uploads(&drain_requests(&rx, Duration::from_millis(1500)));
+    assert_eq!(uploads.len(), 1, "exactly one results upload");
+    let results = &uploads[0];
+    assert_eq!(results["version"], 1);
+    assert_eq!(results["id"], "prb_sim1");
+    let list = results["results"].as_array().unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["address"], "127.0.0.1");
+    assert_eq!(list[0]["port"], port);
+    assert_eq!(list[0]["outcome"], "open");
+    assert!(list[0]["rttMs"].is_u64());
+    assert_eq!(connections_seen(&target), 1, "one handshake");
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Guarantee 3 end to end: without CONNLOG_PROBE_PUBLIC, a public target is
+/// reported skipped and never touched.
+#[test]
+fn a_public_target_is_reported_skipped_and_never_touched() {
+    use crate::features::network_map::NetworkMap;
+    let (target, port) = probe_target();
+    let (base, rx) = routing_server(vec![
+        ("/api/agents/probes", "200 OK", ACCEPTED.to_vec()),
+        ("/api/agents/inventory", "200 OK", ACCEPTED.to_vec()),
+    ]);
+    let request = crate::features::reachability::ProbeRequest::from_json(
+        &serde_json::from_slice::<serde_json::Value>(&heartbeat_with_probe("prb_sim2", port))
+            .unwrap()["probe_request"],
+    );
+    let mut map = NetworkMap::start_with(
+        &network_map_settings(true, false),
+        base,
+        "test-token".into(),
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        fixed_sources(),
+    );
+    map.on_heartbeat(false, request);
+
+    let uploads = probe_uploads(&drain_requests(&rx, Duration::from_millis(1000)));
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(
+        uploads[0]["results"],
+        serde_json::json!([{ "address": "127.0.0.1", "port": port, "outcome": "skipped", "rttMs": null }])
+    );
+    assert_eq!(connections_seen(&target), 0);
+}
+
+/// One request at a time: a request that arrives while one runs is dropped,
+/// and the next one after it is run.
+#[test]
+fn a_probe_request_arriving_while_one_runs_is_dropped() {
+    use crate::features::network_map::{NetworkMap, Sources};
+    use crate::features::reachability::{Outcome, Probe, ProbeRequest, Prober};
+    use std::net::{IpAddr, SocketAddr};
+
+    struct Slow;
+    impl Prober for Slow {
+        fn tcp(&self, _: SocketAddr, _: Duration) -> Probe {
+            thread::sleep(Duration::from_millis(400));
+            Probe::of(Outcome::Refused)
+        }
+        fn echo(&self, _: IpAddr, _: Duration) -> Probe {
+            Probe::of(Outcome::Timeout)
+        }
+    }
+    let request = |id: &str| {
+        ProbeRequest::from_json(&serde_json::json!({
+            "id": id,
+            "targets": [{ "address": "10.0.20.7", "ports": [5432], "icmp": false }]
+        }))
+    };
+    let (base, rx) = routing_server(vec![
+        ("/api/agents/probes", "200 OK", ACCEPTED.to_vec()),
+        ("/api/agents/inventory", "200 OK", ACCEPTED.to_vec()),
+    ]);
+    let mut map = NetworkMap::start_with(
+        &network_map_settings(true, false),
+        base,
+        "test-token".into(),
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        Sources {
+            inventory: std::sync::Arc::new(fixed_inventory),
+            prober: std::sync::Arc::new(Slow),
+        },
+    );
+    map.on_heartbeat(false, request("prb_first"));
+    map.on_heartbeat(false, request("prb_dropped"));
+    let uploads = probe_uploads(&drain_requests(&rx, Duration::from_millis(1000)));
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(uploads[0]["id"], "prb_first");
+
+    map.on_heartbeat(false, request("prb_next"));
+    let uploads = probe_uploads(&drain_requests(&rx, Duration::from_millis(1000)));
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(uploads[0]["id"], "prb_next");
+}
+
+/// Guarantee 1: with the host's flag off, a heartbeat that asks for probes
+/// and an inventory gets neither: nothing is uploaded, nothing is probed.
+#[test]
+fn with_the_flag_off_nothing_is_probed_or_uploaded() {
+    use crate::features::network_map::NetworkMap;
+    let (target, port) = probe_target();
+    let mut body: serde_json::Value =
+        serde_json::from_slice(&heartbeat_with_probe("prb_off", port)).unwrap();
+    body["inventory_request"] = true.into();
+    let (base, rx) = routing_server(vec![
+        (
+            "/api/agents/heartbeat",
+            "200 OK",
+            serde_json::to_vec(&body).unwrap(),
+        ),
+        ("/api/agents/probes", "200 OK", ACCEPTED.to_vec()),
+        ("/api/agents/inventory", "200 OK", ACCEPTED.to_vec()),
+    ]);
+    let client = ApiClient::new(base.clone(), "test-token".into()).expect("ApiClient::new");
+    let resp = client.send_heartbeat(&make_payload(), None).expect("ok");
+    assert_eq!(recv_request(&rx).path, "/api/agents/heartbeat");
+    assert!(resp.inventory_request);
+    assert!(resp.probe_request.is_some(), "parsed, then ignored");
+
+    // Even with public targets allowed: the map flag is what counts.
+    let mut map = NetworkMap::start_with(
+        &network_map_settings(false, true),
+        base,
+        "test-token".into(),
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        fixed_sources(),
+    );
+    for _ in 0..3 {
+        map.on_heartbeat(resp.inventory_request, resp.probe_request.clone());
+    }
+    assert!(drain_requests(&rx, Duration::from_millis(1500)).is_empty());
+    assert_eq!(connections_seen(&target), 0);
+}
+
+/// A probe request the agent cannot use is no request, never a failed
+/// heartbeat; the shared fixture's request reads whole.
+#[test]
+fn heartbeat_reads_probe_request_leniently() {
+    for (field, expected) in [
+        (
+            r#","probe_request":{"id":"prb_1","targets":[]}"#,
+            Some("prb_1"),
+        ),
+        (r#","probe_request":{"id":"prb/1","targets":[]}"#, None),
+        (r#","probe_request":{"targets":"all"}"#, None),
+        (r#","probe_request":"10.0.0.0/8""#, None),
+        (r#","probe_request":null"#, None),
+        ("", None),
+    ] {
+        let body =
+            format!(r#"{{"ok":true,"server_time":"t","expected_interval_seconds":60{field}}}"#);
+        let (base, _rx) = one_shot_server("200 OK", body.into_bytes());
+        let client = ApiClient::new(base, "test-token".into()).expect("ApiClient::new");
+        let resp = client.send_heartbeat(&make_payload(), None).expect("ok");
+        assert_eq!(
+            resp.probe_request.as_ref().map(|p| p.id.as_str()),
+            expected,
+            "{field}"
+        );
+    }
 }
