@@ -10,6 +10,10 @@
 
 pub mod action_cli;
 pub mod bmc;
+pub mod flight_recorder;
 pub mod heartbeat_telemetry;
+pub mod menu;
 pub mod metrics;
+pub mod postmortem;
 pub mod quick_actions;
+pub mod remote_reboot;

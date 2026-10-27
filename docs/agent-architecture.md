@@ -18,7 +18,8 @@ no service discovery. The one optional outbound connection besides the
 platform is to this machine's own BMC (iDRAC/iLO/OpenBMC over Redfish), when
 the operator configures one, for hardware health. Host reboot and removal of
 the agent can be requested from the dashboard; each is confirmed on three
-consecutive heartbeats.
+consecutive heartbeats. A host can refuse remote reboot outright (see "Remote
+reboot" below).
 
 ---
 
@@ -61,6 +62,13 @@ src/
     bmc.rs                 — Optional BMC hardware health poller (Dell iDRAC /
                               HPE iLO / OpenBMC via Redfish): system health,
                               storage, fans, temps, PSUs; own thread + clients
+    remote_reboot.rs       — What became of a remote reboot: the attempt record
+                              across the reboot, X-Reboot-State reports
+    flight_recorder/       — The last day of the host, one record a minute:
+      ring.rs                the fixed-size ring file (format, CRC, rotation)
+      signals.rs             OOM kills and pressure stall readings from /proc
+      history.rs             reading it back: classification, text/JSON
+      mod.rs                 Recorder handle + sampler thread
 
   update/         — Self-update subsystem, isolated on purpose.
     mod.rs        — download → verify (SHA-256 + Ed25519) → atomic stage;
@@ -70,6 +78,7 @@ src/
     linux.rs      — systemd unit (embedded string), install/uninstall helpers
   platform/
     unix.rs       — Filesystem paths for Linux (installed binary, staging, markers)
+    signals.rs    — SIGTERM/SIGINT → the daemon's stop flag
 ```
 
 > `src/service/mod.rs` exists but is **not** part of the module tree (no `mod
@@ -90,7 +99,12 @@ main()
        ├─ ApiClient::new() — builds reqwest client, derives machine-id
        ├─ MetricsCollector::new() — initial sysinfo warmup
        ├─ fetch_config_with_retry() — up to 3 attempts, falls back to safe defaults
+       ├─ take the reboot-attempt record, if any → queue its X-Reboot-State report
        └─ main loop (see Heartbeat flow)
+
+The daemon installs SIGTERM/SIGINT handlers first (`platform/signals.rs`): a
+service stop or host shutdown sets the stop flag, the loop finishes its current
+step and the process exits 0. A second signal exits at once.
 ```
 
 ---
@@ -112,11 +126,18 @@ send_heartbeat()
                 X-Hostname, X-OS, X-Arch
                 X-Machine-Id (if available)
                 X-Cpu-Core-Count (logical CPUs, if known)
+                X-Boot-Id (kernel boot id, if readable)
+                X-Remote-Reboot: allowed | disabled (daemon only)
+                X-Host-Settings: bmc=on|off,hostname=on|off,postmortem=on|off
+                                 (daemon only; on/off values, never the file)
+                X-Reboot-State, X-Reboot-Message (only while a report is queued)
 
 On OK response:
   ├─ Reset consecutive error counters
   ├─ Check response.uninstall       — accumulate, act after 3 consecutive
-  ├─ Check response.reboot          — accumulate, act after 3 consecutive
+  ├─ Clear the queued reboot report (the platform has it)
+  ├─ Check response.reboot          — accumulate, act after 3 consecutive;
+  │                                    refused at once when the host disables it
   ├─ Ignore response.quick_actions  — never execute remote commands
   ├─ Check response.update          — try_apply_update() (see Update flow)
   ├─ Check response.config_outdated — fetch new config if true
@@ -290,6 +311,42 @@ These invariants must never be broken. They are pinned by tests in
 
 ---
 
+## Remote reboot
+
+```
+response.reboot on 3 consecutive heartbeats (src/main.rs)
+  ├─ CONNLOG_ALLOW_REMOTE_REBOOT not true → report refused-disabled, never count
+  ├─ installed unit lacks the hook     → report refused-unit, keep running
+  ├─ write /var/lib/connlog/reboot-attempt (boot id + time)
+  ├─ write /run/connlog/.reboot_requested; failure → report failed, keep running
+  └─ exit 0 → ExecStopPost (root):
+       ├─ agent.conf does not say CONNLOG_ALLOW_REMOTE_REBOOT=true → no reboot,
+       │    systemctl start --no-block connlog-agent
+       ├─ systemctl reboot --no-block, else systemd-run fallback
+       └─ both failed → systemctl start --no-block connlog-agent
+
+next start: take reboot-attempt
+  ├─ boot id changed (or, without ids, uptime < age) → report completed
+  └─ same boot                                       → report failed
+```
+
+Reports go out as `X-Reboot-State` (`completed`, `failed`, `refused-disabled`,
+`refused-unit`) with an `X-Reboot-Message`, on every heartbeat until one is
+accepted. The platform also settles a pending reboot on its own evidence: a
+changed `X-Boot-Id`, uptime, a return from OFFLINE; it fails a request an agent
+keeps beating through past `max(10 min, 5 intervals)`.
+
+The hook re-reads the setting itself because `/run/connlog` is writable by the
+service account: a compromised agent process can write the marker, but cannot
+make a host that has not allowed remote reboot reboot. Remote reboot is off
+unless the file says true: the hook reboots only on an explicit true (a
+missing file, a missing line or any other value refuses), and the agent's
+default is the same. It reads the file the way the agent does (last
+assignment wins); `install::tests::reboot_hook_*` run the
+hook script as systemd hands it to bash, with `systemctl` stubbed, to pin
+that. No line of the hook may start with `;`: systemd drops it as a comment
+even inside a continued line.
+
 ## Install / uninstall flow
 
 ### Install (`CONNLOG_TOKEN=agent_<token> install`)
@@ -339,6 +396,88 @@ Self-uninstall under systemd writes `/run/connlog/.uninstall_requested` and
 exits cleanly (code 0). `ExecStopPost` performs the actual cleanup as root.
 
 ---
+
+## Flight recorder
+
+`features/flight_recorder/` keeps the last 24 hours of the host on the host, so
+that after an outage there is something to say about it.
+
+```
+run_agent_with_shutdown_inner()
+  ├─ Recorder::open($STATE_DIRECTORY/flight.ring)   — None → no recorder, agent runs on
+  ├─ spawn_sampler()     — own thread, own MetricsCollector
+  │    ├─ start record (a real sample)
+  │    └─ every 60 s: sample record, flagged when the last heartbeat failed
+  ├─ exit for update     → stop record, flag EXIT_UPDATE
+  ├─ exit for reboot     → stop record, flag EXIT_REBOOT
+  └─ SIGTERM             → StopRecordGuard: join sampler, stop record
+```
+
+| Property | Value |
+| --- | --- |
+| File | `/var/lib/connlog/flight.ring`, 0600, opened `O_NOFOLLOW` |
+| Size | 64-byte header + 1440 × 64-byte slots = 92,224 bytes, fixed |
+| Record | seq, time, the 32-byte v1 heartbeat frame, boot tag, OOM kills, pressure (cpu some, memory full, io full), kind, flags, CRC-32 |
+| Rotation | slot = seq % 1440; writing the next record overwrites the oldest |
+| Durability | one `write_at` + `sync_data` per record (once a minute): a power cut loses at most the record in flight; a torn slot fails its CRC and is skipped |
+| Cost | one thread asleep 59.9 s a minute, a few `/proc` reads, 64 bytes written |
+
+Safety invariants (pinned by tests in `ring.rs` and `mod.rs`):
+
+- **A recorder failure never affects a heartbeat.** Opening or writing the ring
+  only ever logs; the sampler has its own collector and thread.
+- **Records never reorder.** They are placed by sequence number, not time, so a
+  clock step or two records in one second change nothing.
+- **The file never grows and never follows a symlink.**
+- **A foreign or damaged ring is replaced, not trusted.**
+
+### Sending it after an outage
+
+```
+heartbeat response history_request { since, until }   (after the platform saw a silence)
+  └─ answer_history_request()        — once per window, at most 3 tries
+       ├─ ring records from since − 10 min to until + 5 min, at most 2880
+       ├─ metrics the platform config does not collect: blanked, as in a heartbeat
+       ├─ upload::encode()            — application/vnd.connlog.history.v1
+       └─ POST {control}/api/agents/history   (bearer, X-Machine-Id)
+```
+
+The format (`upload.rs`) sends each field only when it differs from what the previous record
+predicts: a steady minute is about four bytes, a day with a reboot about 13 KB. The platform names
+the cause and shows it on the agent page ("Why it went down").
+
+### Last words (opt-in)
+
+`CONNLOG_SHARE_POSTMORTEM=true` (off by default; `config enable-postmortem`)
+turns on the one root step the recorder has:
+
+```
+ExecStartPre=-+ connlog-agent collect-postmortem     (root, before every start; `-`: never blocks it)
+  ├─ not opted in                         → exit 0
+  ├─ read flight.ring: only a plain file of exactly 92,224 bytes, O_NOFOLLOW
+  ├─ previous boot's last record is not a stop → it ended unclean; else exit 0
+  ├─ journalctl -b -1 -p warning -n 60; journalctl -b -1 -k -p err -n 30  (5 s deadline each)
+  ├─ redact: bearer values, agent_ tokens, password/secret/token/apikey values; printable only; last 8 KB
+  └─ write postmortem.txt: dir fd (O_DIRECTORY|O_NOFOLLOW) → openat(tmp, O_EXCL|O_NOFOLLOW, 0600)
+       → fchown to the directory's owner → fsync → renameat over the name
+after the next history upload: POST /api/agents/postmortem (text/plain), then delete the file
+```
+
+Security notes. The step runs as root over a directory the service account
+owns, which is why it trusts nothing there: a service account that planted a
+huge or linked ring gets nothing read; one that planted a link at the output
+name has the link replaced, not followed (pinned by
+`postmortem::tests::a_planted_link_is_replaced_never_followed`). What it can
+still do is make root run `journalctl` for the previous boot, which is what
+the operator opted into. Redaction is best-effort pattern matching: the
+opt-in is the control, and it is off by default for that reason.
+
+`diagnostics history` (`history.rs`) reads it back and names what happened
+between neighbouring records: a stop then a new boot is a clean shutdown (or
+the requested reboot, when flagged), a sample then a new boot is an unclean one
+(crash, power loss, hard reset), a new start on the same boot is an agent
+restart, update or kill, and a run of `heartbeat failing` samples is the host up
+while the platform was unreachable.
 
 ## Heartbeat delivery diagnostics
 
@@ -395,7 +534,9 @@ from the server (`GET /api/agents/config`). The persistent files are the
 token, platform URL, opt-ins and BMC credentials in `/etc/connlog/agent.conf`,
 local dashboard actions in `/etc/connlog/actions.toml`, the bounded heartbeat
 delivery diagnostics in `/var/lib/connlog/heartbeat-telemetry.jsonl` (above),
-and `/var/lib/connlog/update-failed` while a rejected update is on cooldown.
+`/var/lib/connlog/update-failed` while a rejected update is on cooldown,
+`/var/lib/connlog/reboot-attempt` between handing a reboot to systemd and the
+next start, and the flight recorder's `/var/lib/connlog/flight.ring`.
 Uninstall removes all of them.
 
 `AgentConfig::clamp()` is called on every config response to prevent a buggy
@@ -404,7 +545,7 @@ check-ins:
 
 | Field                     | Minimum              | Maximum        |
 | ------------------------- | -------------------- | -------------- |
-| `heartbeat_interval_secs` | 10 s                 | 86400 s (24 h) |
+| `heartbeat_interval_secs` | 5 s                  | 86400 s (24 h) |
 | `missed_threshold`        | 1                    | 100            |
 | `max_payload_size_kb`     | 1 KB (0 = unlimited) | 1024 KB        |
 
@@ -428,7 +569,10 @@ Binary frame (v1), 32 bytes, little-endian:
 
 Identity metadata travels in HTTP headers (`X-Agent-Version`, `X-Hostname`,
 `X-OS`, `X-Arch`, `X-Machine-Id`, `X-Cpu-Core-Count`, etc.). There is no JSON
-fallback.
+fallback. Every optional header's accepted values are in
+`packages/agent-protocol/fixtures/heartbeat-headers.json`, which the agent
+(`http::shared_fixtures`) and the platform (`@connlog/agent-protocol`) both
+test against.
 
 See `src/http.rs::encode_heartbeat` and `src/http.rs::tests` for the
 byte-level encoding tests that pin this layout.
@@ -492,7 +636,7 @@ In rough priority order:
    transient response from destroying the install.
 5. **Binary protocol** — the 32-byte frame layout is shared with the platform.
    Any change to field offsets or encoding must be coordinated with
-   `../connlog-platform/src/app/api/agents/heartbeat/route.ts` in the same
+   `apps/web/src/app/api/agents/heartbeat/route.ts` in the same
    commit and must bump `PROTOCOL_VERSION`.
 6. **Endpoint assignment trust boundary** — `validate_assigned_endpoint` in
    `endpoint_assignment.rs` is the only thing standing between "the platform

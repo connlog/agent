@@ -6,7 +6,7 @@ use std::fmt;
 #[command(about = "ConnLog monitoring agent")]
 #[command(long_about = "ConnLog monitoring agent")]
 #[command(
-    after_help = "Common usage:\n  sudo CONNLOG_TOKEN=agent_xxxxxxxxxxxx connlog-agent install\n  sudo connlog-agent action add\n  sudo connlog-agent config enable-hostname\n  sudo connlog-agent status\n\nTip:\n  Use `connlog-agent action --help` to manage dashboard buttons.\n  Use `connlog-agent diagnostics --help` for heartbeat/config checks.\n\nLegacy flags still work for existing scripts: --install, --uninstall, --status, --update, --check-config, --test-heartbeat."
+    after_help = "Common usage:\n  sudo CONNLOG_TOKEN=agent_xxxxxxxxxxxx connlog-agent install\n  sudo connlog-agent action add\n  sudo connlog-agent config enable-hostname\n  sudo connlog-agent status\n\nTip:\n  Run `sudo connlog-agent` with no arguments in a terminal for an interactive menu.\n  Use `connlog-agent action --help` to manage dashboard buttons.\n  Use `connlog-agent diagnostics --help` for heartbeat/config checks.\n\nLegacy flags still work for existing scripts: --install, --uninstall, --status, --update, --check-config, --test-heartbeat."
 )]
 #[command(version)]
 pub struct Config {
@@ -85,6 +85,54 @@ pub struct Config {
         hide = true
     )]
     pub expose_system_info: bool,
+
+    /// Whether the dashboard may reboot this host. Off unless set to true.
+    ///
+    /// Set CONNLOG_ALLOW_REMOTE_REBOOT=true in /etc/connlog/agent.conf (or run
+    /// `connlog-agent config enable-remote-reboot`) to allow it. Unset, or any
+    /// other value, and the agent refuses every remote reboot request and
+    /// tells the platform so; the root-side systemd hook checks the same file
+    /// before it reboots anything. The file is root-only, so neither the
+    /// platform nor the running agent can turn the setting on. `None` is
+    /// "not set", which `install` needs to tell apart from an explicit false.
+    #[arg(
+        long = "allow-remote-reboot",
+        env = "CONNLOG_ALLOW_REMOTE_REBOOT",
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new(),
+        global = true,
+        hide = true
+    )]
+    pub allow_remote_reboot: Option<bool>,
+
+    /// Opt-in: after the host went down without a clean stop, send the
+    /// previous boot's last journal and kernel warnings (redacted, at most
+    /// 8 KB) with the outage report. Off by default: logs can hold anything.
+    #[arg(
+        long = "share-postmortem",
+        env = "CONNLOG_SHARE_POSTMORTEM",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new(),
+        global = true,
+        hide = true
+    )]
+    pub share_postmortem: bool,
+
+    /// With `install`: write CONNLOG_ALLOW_REMOTE_REBOOT=true, so the
+    /// dashboard may reboot this host.
+    #[arg(
+        long = "enable-remote-reboot",
+        global = true,
+        conflicts_with = "disable_remote_reboot"
+    )]
+    pub enable_remote_reboot: bool,
+
+    /// With `install`: write CONNLOG_ALLOW_REMOTE_REBOOT=false. Off is already
+    /// the default; the flag stays so existing install scripts keep working,
+    /// and it records the refusal explicitly.
+    #[arg(long = "disable-remote-reboot", global = true)]
+    pub disable_remote_reboot: bool,
 
     // ── BMC hardware-health (Dell iDRAC / HPE iLO / OpenBMC via Redfish) ──
     //
@@ -170,6 +218,11 @@ pub enum AgentCommand {
     #[command(hide = true)]
     ApplyStagedUpdate,
 
+    /// Save the previous boot's last warnings when it ended badly (root; run
+    /// by the systemd ExecStartPre hook, only with CONNLOG_SHARE_POSTMORTEM)
+    #[command(hide = true)]
+    CollectPostmortem,
+
     /// Manage local dashboard actions
     #[command(
         alias = "actions",
@@ -221,6 +274,33 @@ pub enum LocalConfigCommand {
         long_about = "Create /etc/connlog/agent.conf if it is missing, set CONNLOG_EXPOSE_SYSTEM_INFO=true, and restart the agent service.\n\nHostname sharing is off by default. Run this on the server when you want ConnLog to display the hostname.\n\nExample:\n  sudo connlog-agent config enable-hostname"
     )]
     EnableHostname,
+
+    /// Stop sharing this machine's hostname with ConnLog (the default)
+    #[command(
+        long_about = "Set CONNLOG_EXPOSE_SYSTEM_INFO=false in /etc/connlog/agent.conf and restart the agent service.\n\nThe agent then stops sending the hostname; ConnLog keeps showing the server's name.\n\nExample:\n  sudo connlog-agent config disable-hostname"
+    )]
+    DisableHostname,
+
+    /// Refuse remote reboot requests from the dashboard (the default)
+    #[command(
+        long_about = "Set CONNLOG_ALLOW_REMOTE_REBOOT=false in /etc/connlog/agent.conf and restart the agent service.\n\nRemote reboot is already off unless the file says true; this records the refusal explicitly. The agent refuses every remote reboot request and reports that to ConnLog, which disables the reboot button for this host. The root-side systemd hook checks the same file, so the setting holds even if the agent process were compromised.\n\nExample:\n  sudo connlog-agent config disable-remote-reboot"
+    )]
+    DisableRemoteReboot,
+
+    /// Allow remote reboot requests from the dashboard
+    #[command(
+        long_about = "Set CONNLOG_ALLOW_REMOTE_REBOOT=true in /etc/connlog/agent.conf and restart the agent service.\n\nRemote reboot is off until this is run. Only root on this machine can turn it on; neither ConnLog nor the running agent can.\n\nExample:\n  sudo connlog-agent config enable-remote-reboot"
+    )]
+    EnableRemoteReboot,
+
+    /// Send the previous boot's last warnings with an outage report (opt-in)
+    #[command(
+        long_about = "Set CONNLOG_SHARE_POSTMORTEM=true in /etc/connlog/agent.conf and restart the agent service.\n\nAfter the host goes down without a clean stop (a crash, a power cut, a hard reset), the agent then sends the previous boot's last journal and kernel warnings, with anything that looks like a password, token or bearer credential masked and at most 8 KB kept, along with the outage report. Needs a persistent journal. Off by default.\n\nExample:\n  sudo connlog-agent config enable-postmortem"
+    )]
+    EnablePostmortem,
+
+    /// Stop sending the previous boot's last warnings (the default)
+    DisablePostmortem,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
@@ -260,9 +340,26 @@ pub enum DiagnosticCommand {
         #[arg(long, value_enum, default_value_t = DiagnosticsFormat::Text)]
         format: DiagnosticsFormat,
     },
+    /// Show the flight recorder: the last day of this host, one record a minute
+    #[command(
+        long_about = "Show what the flight recorder kept: one record a minute for the last 24 hours (CPU, memory, disk, load, OOM kills, pressure), written whether or not ConnLog was reachable, and what happened in between: reboots (clean, unclean, requested), agent restarts and updates, and stretches when the platform could not be reached.\n\nReads only the local ring file: no root, no network, no token.\n\nExamples:\n  connlog-agent diagnostics history\n  connlog-agent diagnostics history --since 2h --limit 120\n  connlog-agent diagnostics history --format json"
+    )]
+    History {
+        /// Look-back window: e.g. 24h, 2h, 30m (a bare number = seconds)
+        #[arg(long, default_value = "24h")]
+        since: String,
+
+        /// Maximum number of records to list (the most recent are kept)
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+
+        /// Output format
+        #[arg(long, value_enum, default_value_t = DiagnosticsFormat::Text)]
+        format: DiagnosticsFormat,
+    },
 }
 
-/// Output format for `diagnostics heartbeats`.
+/// Output format for `diagnostics heartbeats` and `diagnostics history`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum DiagnosticsFormat {
     /// Human-readable summary plus event list
@@ -454,11 +551,34 @@ impl fmt::Debug for Config {
             )
             .field("bmc_poll_interval_secs", &self.bmc_poll_interval_secs)
             .field("bmc_insecure_tls", &self.bmc_insecure_tls)
+            .field("allow_remote_reboot", &self.allow_remote_reboot)
+            .field("share_postmortem", &self.share_postmortem)
+            .field("enable_remote_reboot", &self.enable_remote_reboot)
+            .field("disable_remote_reboot", &self.disable_remote_reboot)
             .finish()
     }
 }
 
 impl Config {
+    /// Whether the running agent accepts remote reboot: only an explicit true,
+    /// and never with `--disable-remote-reboot`.
+    pub fn remote_reboot_allowed(&self) -> bool {
+        self.allow_remote_reboot == Some(true) && !self.disable_remote_reboot
+    }
+
+    /// The remote-reboot choice this `install` makes, if it makes one: the
+    /// install flags first, then an explicit CONNLOG_ALLOW_REMOTE_REBOOT.
+    /// `None` keeps whatever the host's agent.conf already says.
+    pub fn requested_remote_reboot(&self) -> Option<bool> {
+        if self.disable_remote_reboot {
+            Some(false)
+        } else if self.enable_remote_reboot {
+            Some(true)
+        } else {
+            self.allow_remote_reboot
+        }
+    }
+
     pub fn get_platform_url(&self) -> Option<String> {
         // Check environment variable set by systemd service
         std::env::var("CONNLOG_PLATFORM_URL").ok()
@@ -640,6 +760,39 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_history_parses_with_defaults_and_flags() {
+        let cfg = Config::parse_from(["connlog-agent", "diagnostics", "history"]);
+        assert_eq!(
+            cfg.command,
+            Some(AgentCommand::Diagnostics {
+                command: DiagnosticCommand::History {
+                    since: "24h".to_string(),
+                    limit: 30,
+                    format: DiagnosticsFormat::Text,
+                }
+            })
+        );
+        let cfg = Config::parse_from([
+            "connlog-agent",
+            "diagnostics",
+            "history",
+            "--since",
+            "2h",
+            "--format",
+            "json",
+        ]);
+        assert!(matches!(
+            cfg.command,
+            Some(AgentCommand::Diagnostics {
+                command: DiagnosticCommand::History {
+                    format: DiagnosticsFormat::Json,
+                    ..
+                }
+            })
+        ));
+    }
+
+    #[test]
     fn diagnostics_heartbeats_rejects_unknown_format() {
         let result = Config::try_parse_from([
             "connlog-agent",
@@ -657,6 +810,106 @@ mod tests {
         assert_eq!(
             cfg.command,
             Some(AgentCommand::RefreshService { restart: true })
+        );
+    }
+
+    #[test]
+    fn remote_reboot_is_refused_unless_set_to_true() {
+        let cfg = Config::parse_from(["connlog-agent"]);
+        assert_eq!(cfg.allow_remote_reboot, None);
+        assert!(!cfg.remote_reboot_allowed());
+
+        // agent.conf reaches clap as the environment; the flag form is the
+        // same parser.
+        for (value, allowed) in [
+            ("false", false),
+            ("0", false),
+            ("off", false),
+            ("true", true),
+            ("yes", true),
+            ("1", true),
+        ] {
+            let cfg = Config::parse_from(["connlog-agent", "--allow-remote-reboot", value]);
+            assert_eq!(cfg.allow_remote_reboot, Some(allowed), "{value}");
+            assert_eq!(cfg.remote_reboot_allowed(), allowed, "{value}");
+        }
+
+        let cfg = Config::parse_from([
+            "connlog-agent",
+            "--allow-remote-reboot",
+            "true",
+            "--disable-remote-reboot",
+        ]);
+        assert!(!cfg.remote_reboot_allowed());
+    }
+
+    #[test]
+    fn install_remote_reboot_choice() {
+        for (args, requested) in [
+            (&["install"][..], None),
+            (&["install", "--enable-remote-reboot"][..], Some(true)),
+            (&["install", "--disable-remote-reboot"][..], Some(false)),
+            (
+                &["install", "--allow-remote-reboot", "true"][..],
+                Some(true),
+            ),
+            (
+                &["install", "--allow-remote-reboot", "false"][..],
+                Some(false),
+            ),
+            (
+                &[
+                    "install",
+                    "--allow-remote-reboot",
+                    "true",
+                    "--disable-remote-reboot",
+                ][..],
+                Some(false),
+            ),
+        ] {
+            let cfg =
+                Config::parse_from(std::iter::once("connlog-agent").chain(args.iter().copied()));
+            assert_eq!(cfg.command, Some(AgentCommand::Install), "{args:?}");
+            assert_eq!(cfg.requested_remote_reboot(), requested, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn install_refuses_both_remote_reboot_flags() {
+        let parsed = Config::try_parse_from([
+            "connlog-agent",
+            "install",
+            "--enable-remote-reboot",
+            "--disable-remote-reboot",
+        ]);
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn config_remote_reboot_subcommands_parse() {
+        for (arg, command) in [
+            (
+                "disable-remote-reboot",
+                LocalConfigCommand::DisableRemoteReboot,
+            ),
+            (
+                "enable-remote-reboot",
+                LocalConfigCommand::EnableRemoteReboot,
+            ),
+        ] {
+            let cfg = Config::parse_from(["connlog-agent", "config", arg]);
+            assert_eq!(cfg.command, Some(AgentCommand::Config { command }));
+        }
+    }
+
+    #[test]
+    fn config_disable_hostname_subcommand_parses() {
+        let cfg = Config::parse_from(["connlog-agent", "config", "disable-hostname"]);
+        assert_eq!(
+            cfg.command,
+            Some(AgentCommand::Config {
+                command: LocalConfigCommand::DisableHostname
+            })
         );
     }
 

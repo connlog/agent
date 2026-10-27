@@ -1,6 +1,6 @@
 [package]
 name = "connlog-agent"
-version = "1.19.0"
+version = "1.20.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/connlog/agent"
@@ -17,6 +17,10 @@ env_logger = "0.11"
 log = "0.4"
 hostname = "0.4"
 ring = "0.17"
+# Arrow-key menus for `connlog-agent` run by hand in a terminal
+# (`features::menu`). Default features off: no editor (tempfile) and no
+# password prompts (zeroize); Select, Confirm and Input are all it uses.
+dialoguer = { version = "0.12", default-features = false }
 
 # Unix-only: geteuid() etc.
 [target.'cfg(unix)'.dependencies]

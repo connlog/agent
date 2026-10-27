@@ -12,6 +12,7 @@ use crate::features::heartbeat_telemetry::{
 use crate::features::quick_actions::{
     QuickActionRequest, QuickActionResultPayload, QuickActionsManifestPayload,
 };
+use crate::features::remote_reboot::{RebootReport, REBOOT_MESSAGE_HEADER, REBOOT_STATE_HEADER};
 use crate::heartbeat::{AgentConfig, HeartbeatPayload, HeartbeatResponse};
 
 /// Header carrying the agent-generated heartbeat correlation id. Authentication
@@ -22,6 +23,42 @@ use crate::heartbeat::{AgentConfig, HeartbeatPayload, HeartbeatResponse};
 const REQUEST_ID_HEADER: &str = "X-ConnLog-Request-Id";
 /// Logical CPU count of the host; parsed by the platform as `x-cpu-core-count`.
 pub const CPU_CORE_COUNT_HEADER: &str = "X-Cpu-Core-Count";
+/// The current boot's id (`identity::boot_id`); omitted when unreadable.
+pub const BOOT_ID_HEADER: &str = "X-Boot-Id";
+/// Whether this host accepts remote reboot (`CONNLOG_ALLOW_REMOTE_REBOOT`).
+pub const REMOTE_REBOOT_HEADER: &str = "X-Remote-Reboot";
+pub const REMOTE_REBOOT_ALLOWED: &str = "allowed";
+pub const REMOTE_REBOOT_DISABLED: &str = "disabled";
+/// The host-side settings in agent.conf, as on/off values only
+/// (`HostSettings`). Remote reboot keeps its own header.
+pub const HOST_SETTINGS_HEADER: &str = "X-Host-Settings";
+
+/// What this host's root-only agent.conf turns on, reported so the console
+/// can show it. Never the file itself: it holds the token and the BMC
+/// password.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostSettings {
+    /// BMC hardware-health polling is configured (CONNLOG_BMC_*).
+    pub bmc: bool,
+    /// CONNLOG_EXPOSE_SYSTEM_INFO.
+    pub hostname: bool,
+    /// CONNLOG_SHARE_POSTMORTEM.
+    pub postmortem: bool,
+}
+
+impl HostSettings {
+    /// `bmc=on,hostname=off,postmortem=off`: keys in this fixed order, so the
+    /// value only changes when a setting does.
+    pub fn header_value(&self) -> String {
+        let on = |v: bool| if v { "on" } else { "off" };
+        format!(
+            "bmc={},hostname={},postmortem={}",
+            on(self.bmc),
+            on(self.hostname),
+            on(self.postmortem)
+        )
+    }
+}
 
 const CPU_UNAVAILABLE_X100: u16 = u16::MAX;
 
@@ -112,6 +149,15 @@ pub struct ApiClient {
     /// source is available (e.g. an unsupported OS); platform falls back to
     /// hostname binding in that case.
     machine_id: Option<String>,
+    boot_id: Option<String>,
+    /// `None` until the daemon says; the header is then not sent, so a
+    /// diagnostic command never claims a setting it did not read.
+    remote_reboot_allowed: Option<bool>,
+    /// `None` until the daemon says, for the same reason.
+    host_settings: Option<HostSettings>,
+    /// What became of the last reboot request, sent until a heartbeat is
+    /// accepted (`features::remote_reboot`).
+    reboot_report: Mutex<Option<RebootReport>>,
     /// Where `send_heartbeat` currently POSTs to. Defaults to
     /// `{base_url}/api/agents/heartbeat` and can be repointed at a regional
     /// endpoint via `set_heartbeat_endpoint` once the platform hands out an
@@ -221,6 +267,10 @@ impl ApiClient {
             base_url,
             token,
             machine_id: crate::identity::machine_id(),
+            boot_id: crate::identity::boot_id(),
+            remote_reboot_allowed: None,
+            host_settings: None,
+            reboot_report: Mutex::new(None),
             heartbeat_url: Mutex::new(heartbeat_url),
             telemetry: None,
             heartbeat_cycle_budget: Mutex::new(None),
@@ -232,6 +282,31 @@ impl ApiClient {
     /// never call this keep behaving exactly as before (no recording).
     pub fn set_telemetry(&mut self, telemetry: HeartbeatTelemetry) {
         self.telemetry = Some(telemetry);
+    }
+
+    /// Report this host's remote-reboot setting on every heartbeat.
+    pub fn set_remote_reboot_allowed(&mut self, allowed: bool) {
+        self.remote_reboot_allowed = Some(allowed);
+    }
+
+    /// Report this host's other agent.conf settings on every heartbeat.
+    pub fn set_host_settings(&mut self, settings: HostSettings) {
+        self.host_settings = Some(settings);
+    }
+
+    /// Queue (or, with `None`, clear) the reboot report for the next heartbeats.
+    pub fn set_reboot_report(&self, report: Option<RebootReport>) {
+        *self
+            .reboot_report
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = report;
+    }
+
+    fn reboot_report(&self) -> Option<RebootReport> {
+        self.reboot_report
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     fn record(&self, builder: EventBuilder) {
@@ -411,6 +486,45 @@ impl ApiClient {
                 "X-Machine-Id",
                 HeaderValue::from_str(mid).context("Failed to create machine-id header")?,
             );
+        }
+
+        if let Some(boot_id) = &self.boot_id {
+            headers.insert(
+                BOOT_ID_HEADER,
+                HeaderValue::from_str(boot_id).context("Failed to create boot-id header")?,
+            );
+        }
+
+        if let Some(allowed) = self.remote_reboot_allowed {
+            headers.insert(
+                REMOTE_REBOOT_HEADER,
+                HeaderValue::from_static(if allowed {
+                    REMOTE_REBOOT_ALLOWED
+                } else {
+                    REMOTE_REBOOT_DISABLED
+                }),
+            );
+        }
+
+        if let Some(settings) = &self.host_settings {
+            headers.insert(
+                HOST_SETTINGS_HEADER,
+                HeaderValue::from_str(&settings.header_value())
+                    .context("Failed to create host settings header")?,
+            );
+        }
+
+        if let Some(report) = self.reboot_report() {
+            headers.insert(
+                REBOOT_STATE_HEADER,
+                HeaderValue::from_static(report.state.as_str()),
+            );
+            if let Some(message) = report.message.as_deref() {
+                // Printable ASCII by construction, so this cannot fail.
+                if let Ok(value) = HeaderValue::from_str(message) {
+                    headers.insert(REBOOT_MESSAGE_HEADER, value);
+                }
+            }
         }
 
         // Logical CPU count, so the platform can read the load average
@@ -722,6 +836,62 @@ impl ApiClient {
             });
         }
 
+        Ok(())
+    }
+
+    /// Send flight-recorder history (`application/vnd.connlog.history.v1`)
+    /// to the control plane. Same auth and machine binding as a heartbeat.
+    pub fn upload_history(&self, body: Vec<u8>) -> Result<(), ApiError> {
+        let url = format!("{}/api/agents/history", self.base_url);
+        // SECURITY: Never log the token
+        let mut request = self
+            .client
+            .post(&url)
+            .header(
+                CONTENT_TYPE,
+                crate::features::flight_recorder::upload::CONTENT_TYPE,
+            )
+            .header(AUTHORIZATION, format!("Bearer {}", self.token));
+        if let Some(mid) = &self.machine_id {
+            request = request.header("X-Machine-Id", mid);
+        }
+        let response = request
+            .body(body)
+            .send()
+            .context("Failed to send flight-recorder history")?;
+
+        if !response.status().is_success() {
+            return Err(ApiError::HttpError {
+                status: response.status().as_u16(),
+                message: error_body_excerpt(response),
+            });
+        }
+        Ok(())
+    }
+
+    /// Send the previous boot's last words (opt-in, already redacted) to
+    /// the control plane, for the outage the history just explained.
+    pub fn upload_postmortem(&self, text: String) -> Result<(), ApiError> {
+        let url = format!("{}/api/agents/postmortem", self.base_url);
+        // SECURITY: Never log the token
+        let mut request = self
+            .client
+            .post(&url)
+            .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+            .header(AUTHORIZATION, format!("Bearer {}", self.token));
+        if let Some(mid) = &self.machine_id {
+            request = request.header("X-Machine-Id", mid);
+        }
+        let response = request
+            .body(text)
+            .send()
+            .context("Failed to send the post-mortem")?;
+        if !response.status().is_success() {
+            return Err(ApiError::HttpError {
+                status: response.status().as_u16(),
+                message: error_body_excerpt(response),
+            });
+        }
         Ok(())
     }
 
@@ -1372,5 +1542,269 @@ mod tests {
         let cpu_max_x100 = u16::from_le_bytes(frame[10..12].try_into().unwrap());
         assert_eq!(cpu_x100, 1250);
         assert_eq!(cpu_max_x100, 2825);
+    }
+}
+
+/// The agent's half of the shared wire-format fixtures in
+/// `packages/agent-protocol/fixtures/`. The platform's half is
+/// `packages/agent-protocol/src/__tests__/heartbeat.test.ts`: this encodes each
+/// fixture's `agent` input and must produce exactly its `frame`; the platform
+/// decodes that `frame` and must produce exactly its `platform` values. A change
+/// to either side that breaks the other fails in the same pull request.
+///
+/// `include_str!` reaches outside the crate on purpose, and only in tests: a
+/// release build (including `cross`, which mounts only this crate) never reads
+/// these files.
+#[cfg(test)]
+mod shared_fixtures {
+    use super::encode_heartbeat;
+    use crate::heartbeat::{HeartbeatPayload, HeartbeatResponse, Metrics};
+    use serde_json::Value;
+
+    const FRAMES: &str =
+        include_str!("../../../packages/agent-protocol/fixtures/heartbeat-frames.json");
+    const RESPONSES: &str =
+        include_str!("../../../packages/agent-protocol/fixtures/heartbeat-responses.json");
+    const HEADERS: &str =
+        include_str!("../../../packages/agent-protocol/fixtures/heartbeat-headers.json");
+
+    fn fixtures(raw: &str) -> Vec<Value> {
+        let all: Vec<Value> = serde_json::from_str(raw).expect("fixture file must be a JSON array");
+        assert!(!all.is_empty(), "fixture file must not be empty");
+        all
+    }
+
+    fn hex(frame: &[u8]) -> String {
+        frame.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn payload(agent: &Value) -> HeartbeatPayload {
+        let u64_of = |key: &str| {
+            agent[key]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{key} must be u64"))
+        };
+        HeartbeatPayload {
+            agent_version: "0.0.0".to_string(),
+            protocol_version: 1,
+            config_version: 0,
+            hostname: None,
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            uptime_seconds: u64_of("uptime_seconds"),
+            metrics: Metrics {
+                cpu_percent: agent["cpu_percent"].as_f64(),
+                cpu_peak_percent: agent["cpu_peak_percent"].as_f64(),
+                cpu_core_count: None,
+                memory_used_mb: u64_of("memory_used_mb"),
+                memory_total_mb: u64_of("memory_total_mb"),
+                disk_used_mb: u64_of("disk_used_mb"),
+                disk_total_mb: u64_of("disk_total_mb"),
+                load_1m: agent["load_1m"].as_f64().expect("load_1m must be a number"),
+            },
+            dev_mode: None,
+        }
+    }
+
+    #[test]
+    fn encodes_every_fixture_frame_exactly() {
+        for fixture in fixtures(FRAMES) {
+            let description = fixture["description"].as_str().unwrap_or("?");
+            let frame = encode_heartbeat(&payload(&fixture["agent"]));
+            assert_eq!(
+                hex(&frame),
+                fixture["frame"]
+                    .as_str()
+                    .expect("frame must be a hex string"),
+                "frame mismatch for fixture: {description}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_every_fixture_response() {
+        for fixture in fixtures(RESPONSES) {
+            let description = fixture["description"].as_str().unwrap_or("?");
+            let json = &fixture["response"];
+            let resp: HeartbeatResponse = serde_json::from_value(json.clone())
+                .unwrap_or_else(|e| panic!("agent cannot parse fixture '{description}': {e}"));
+
+            assert_eq!(resp.ok, json["ok"].as_bool().unwrap(), "{description}");
+            assert_eq!(
+                resp.expected_interval_seconds,
+                json["expected_interval_seconds"].as_u64().unwrap(),
+                "{description}"
+            );
+            assert_eq!(
+                resp.uninstall,
+                json["uninstall"].as_bool().unwrap_or(false),
+                "{description}"
+            );
+            assert_eq!(
+                resp.reboot,
+                json["reboot"].as_bool().unwrap_or(false),
+                "{description}"
+            );
+            assert_eq!(
+                resp.config_outdated,
+                json["config_outdated"].as_bool(),
+                "{description}"
+            );
+            assert_eq!(
+                resp.latest_config_version,
+                json["latest_config_version"].as_u64().map(|v| v as u32),
+                "{description}"
+            );
+
+            match (&resp.update, &json["update"]) {
+                (None, Value::Null) => {}
+                (Some(update), expected) => {
+                    assert_eq!(update.available, expected["available"].as_bool().unwrap());
+                    assert_eq!(
+                        update.latest_version,
+                        expected["latest_version"].as_str().unwrap()
+                    );
+                    assert_eq!(
+                        update.download_url.as_deref(),
+                        expected["download_url"].as_str()
+                    );
+                    assert_eq!(
+                        update.signature_url.as_deref(),
+                        expected["signature_url"].as_str()
+                    );
+                    assert_eq!(update.sha256.as_deref(), expected["sha256"].as_str());
+                    assert_eq!(
+                        update.force_update,
+                        expected["force_update"].as_bool().unwrap_or(false)
+                    );
+                }
+                (None, other) => panic!("{description}: update {other} was dropped"),
+            }
+
+            assert_eq!(
+                resp.history_request.map(|h| (h.since, h.until)),
+                json["history_request"]
+                    .as_object()
+                    .map(|h| (h["since"].as_u64().unwrap(), h["until"].as_u64().unwrap())),
+                "{description}"
+            );
+
+            let expected_actions = json["quick_actions"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            assert_eq!(
+                resp.quick_actions.len(),
+                expected_actions.len(),
+                "{description}"
+            );
+            for (got, want) in resp.quick_actions.iter().zip(expected_actions.iter()) {
+                assert_eq!(got.request_id, want["request_id"].as_str().unwrap());
+                assert_eq!(got.action_id, want["action_id"].as_str().unwrap());
+            }
+        }
+    }
+
+    /// The agent's half of `heartbeat-headers.json`: every header the agent
+    /// sends has a fixture, and the agent's own reading of each value agrees
+    /// with the platform's (`packages/agent-protocol/src/headers.ts`).
+    #[test]
+    fn agrees_with_every_fixture_header() {
+        const REBOOT_STATES: [&str; 4] = {
+            use crate::features::remote_reboot::RebootState;
+            let all = RebootState::ALL;
+            [
+                all[0].as_str(),
+                all[1].as_str(),
+                all[2].as_str(),
+                all[3].as_str(),
+            ]
+        };
+
+        // A free-form header is checked by reading every fixture value the
+        // way the agent does; an enumerated one by the exact set of values
+        // the agent can put on the wire.
+        enum Sent {
+            Parsed(fn(&str) -> Option<String>),
+            OneOf(&'static [&'static str]),
+            /// Built from the `read` object: every case the agent can send
+            /// is exactly what it sends for that reading.
+            Encoded(fn(&Value) -> String),
+        }
+        fn host_settings(read: &Value) -> String {
+            super::HostSettings {
+                bmc: read["bmc"].as_bool().unwrap(),
+                hostname: read["hostname"].as_bool().unwrap(),
+                postmortem: read["postmortem"].as_bool().unwrap(),
+            }
+            .header_value()
+        }
+        let sent: Vec<(&str, Sent)> = vec![
+            (
+                super::BOOT_ID_HEADER,
+                Sent::Parsed(crate::identity::parse_boot_id),
+            ),
+            (
+                super::REMOTE_REBOOT_HEADER,
+                Sent::OneOf(&[super::REMOTE_REBOOT_ALLOWED, super::REMOTE_REBOOT_DISABLED]),
+            ),
+            (super::REBOOT_STATE_HEADER, Sent::OneOf(&REBOOT_STATES)),
+            (super::HOST_SETTINGS_HEADER, Sent::Encoded(host_settings)),
+            (
+                super::REBOOT_MESSAGE_HEADER,
+                Sent::Parsed(crate::features::remote_reboot::sanitize_message),
+            ),
+        ];
+
+        let all = fixtures(HEADERS);
+        let mut named: Vec<&str> = all.iter().map(|f| f["header"].as_str().unwrap()).collect();
+        let mut ours: Vec<&str> = sent.iter().map(|(name, _)| *name).collect();
+        named.sort_unstable();
+        ours.sort_unstable();
+        assert_eq!(named, ours, "every header the agent sends needs a fixture");
+
+        for fixture in &all {
+            let name = fixture["header"].as_str().unwrap();
+            let valid = fixture["valid"].as_array().unwrap();
+            match &sent.iter().find(|(n, _)| *n == name).unwrap().1 {
+                Sent::Parsed(read) => {
+                    for case in valid {
+                        assert_eq!(
+                            read(case["sent"].as_str().unwrap()).as_deref(),
+                            case["read"].as_str(),
+                            "{name}: {case}"
+                        );
+                    }
+                    for case in fixture["invalid"].as_array().unwrap() {
+                        assert_eq!(read(case.as_str().unwrap()), None, "{name}: {case}");
+                    }
+                }
+                Sent::Encoded(encode) => {
+                    let ours: Vec<&Value> = valid.iter().filter(|c| c["agent"] != false).collect();
+                    assert!(!ours.is_empty(), "{name}: no case the agent sends");
+                    for case in ours {
+                        assert_eq!(
+                            encode(&case["read"]),
+                            case["sent"].as_str().unwrap(),
+                            "{name}: {case}"
+                        );
+                    }
+                }
+                Sent::OneOf(values) => {
+                    let mut read: Vec<&str> =
+                        valid.iter().map(|c| c["read"].as_str().unwrap()).collect();
+                    let mut ours = values.to_vec();
+                    read.sort_unstable();
+                    ours.sort_unstable();
+                    assert_eq!(read, ours, "{name}: the values the platform reads");
+                    for value in *values {
+                        assert!(
+                            valid.iter().any(|c| c["sent"] == *value),
+                            "{name}: {value} is sent but has no fixture"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

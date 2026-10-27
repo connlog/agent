@@ -59,6 +59,16 @@ pub struct HeartbeatResponse {
     pub reboot: bool,
     #[serde(default)]
     pub quick_actions: Vec<crate::features::quick_actions::QuickActionRequest>,
+    /// After an outage: the window (unix seconds) the platform wants the
+    /// flight recorder's records for (`POST /api/agents/history`).
+    #[serde(default)]
+    pub history_request: Option<HistoryRequest>,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryRequest {
+    pub since: u64,
+    pub until: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -106,6 +116,28 @@ pub struct AgentConfig {
     #[serde(rename = "quickActions", default)]
     pub quick_actions: QuickActionsConfig,
 }
+
+/// The heartbeat schedule both sides agree on, pinned by
+/// `packages/agent-protocol/fixtures/heartbeat-schedule.json` (the platform
+/// reads the same numbers from `@connlog/agent-protocol`).
+///
+/// The floor is the fastest interval any plan can configure. It stops a buggy
+/// or malicious config from spinning the agent; it must not sit above what
+/// the platform sells, or a host on the fastest plan reports half as often as
+/// its dashboard expects and reads "late" on every beat.
+pub const HEARTBEAT_MIN_INTERVAL_SECS: u64 = 5;
+/// The ceiling: 24 h, so an agent always checks in eventually.
+pub const HEARTBEAT_MAX_INTERVAL_SECS: u64 = 86400;
+/// Heartbeat sleep jitter, +0..10% in whole seconds. Spreads the thundering
+/// herd when N agents installed at the same minute would otherwise all hit the
+/// platform on the same second every interval. Positive-only: heartbeats are
+/// scheduled from the cycle start (see `next_heartbeat_sleep`), so a negative
+/// offset could compress the server-observed gap below the plan's minimum
+/// interval and draw a 429.
+pub const HEARTBEAT_JITTER_PCT: u64 = 10;
+/// The shortest gap between two beats, in thousandths of the interval. The
+/// platform 429s anything faster than this fraction of the plan minimum.
+pub const HEARTBEAT_EARLIEST_GAP_PERMILLE: u64 = 900;
 
 pub const QUICK_ACTION_MIN_POLL_INTERVAL_SECS: u64 = 2;
 pub const QUICK_ACTION_DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
@@ -170,9 +202,9 @@ impl AgentConfig {
     /// Clamp server config values to safe client-side bounds.
     /// Prevents resource abuse from a malicious or buggy server response.
     pub fn clamp(&mut self) {
-        // Minimum 10s heartbeat to prevent CPU/network spin
-        // Maximum 86400s (24h) to ensure eventual check-in
-        self.heartbeat_interval_secs = self.heartbeat_interval_secs.clamp(10, 86400);
+        self.heartbeat_interval_secs = self
+            .heartbeat_interval_secs
+            .clamp(HEARTBEAT_MIN_INTERVAL_SECS, HEARTBEAT_MAX_INTERVAL_SECS);
 
         // Missed threshold: at least 1, at most 100
         self.missed_threshold = self.missed_threshold.clamp(1, 100);
@@ -233,9 +265,18 @@ mod tests {
         let mut c = cfg(0, 3, 32);
         c.clamp();
         assert_eq!(
-            c.heartbeat_interval_secs, 10,
-            "0s interval must be raised to floor (10s)"
+            c.heartbeat_interval_secs, HEARTBEAT_MIN_INTERVAL_SECS,
+            "0s interval must be raised to the floor"
         );
+    }
+
+    #[test]
+    fn clamp_interval_keeps_the_fastest_plan_interval() {
+        // The fastest interval a plan sells must survive the clamp; a floor
+        // above it made every beat on that plan arrive "late".
+        let mut c = cfg(5, 3, 32);
+        c.clamp();
+        assert_eq!(c.heartbeat_interval_secs, 5);
     }
 
     #[test]
@@ -626,7 +667,8 @@ mod tests {
                 "memory_used_mb",
             ],
             "wire format field set changed — update both this test and \
-             ../connlog-platform/src/app/api/agents/heartbeat/route.ts"
+             apps/web/src/app/api/agents/heartbeat/route.ts, and the fixtures in \
+             packages/agent-protocol/fixtures/"
         );
     }
 

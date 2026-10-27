@@ -33,10 +33,15 @@ use config::{AgentCommand, Config, DiagnosticCommand, LocalConfigCommand};
 use defaults::{CONFIG_FETCH_RETRY_DELAY_SECS, DEFAULT_ENDPOINT, DISABLED_BACKOFF_SECS};
 use endpoint_assignment::EndpointAssignmentState;
 use features::action_cli::run_action_command;
+use features::flight_recorder;
 use features::heartbeat_telemetry::HeartbeatTelemetry;
 use features::metrics::MetricsCollector;
 use features::quick_actions::{QuickActionRequest, QuickActionsRegistry};
-use heartbeat::{AgentConfig, HeartbeatPayload, QuickActionsConfig};
+use features::remote_reboot::{self, RebootReport, RebootState};
+use heartbeat::{
+    AgentConfig, HeartbeatPayload, QuickActionsConfig, HEARTBEAT_EARLIEST_GAP_PERMILLE,
+    HEARTBEAT_JITTER_PCT,
+};
 use http::{ApiClient, ApiError, QuickActionPollingReport};
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -61,14 +66,6 @@ const REMOTE_CONTROL_ENABLED: bool = false;
 
 /// Maximum config fetch failures before using fallback
 const MAX_CONFIG_FETCH_RETRIES: u32 = 3;
-
-/// Heartbeat sleep jitter, +0..10%. Spreads the thundering herd when N agents
-/// installed at the same minute would otherwise all hit the platform on the
-/// same second every interval. Positive-only: heartbeats are scheduled from
-/// the cycle start (see `next_heartbeat_sleep`), so a negative offset could
-/// compress the server-observed gap below the plan's minimum interval and
-/// draw a 429.
-const HEARTBEAT_JITTER_PCT: u64 = 10;
 
 /// Quick-action poll jitter, ±10%. A 5s interval becomes roughly 4.5s..5.5s,
 /// enough to spread fleet polling without making dashboard pickup feel slow.
@@ -132,7 +129,8 @@ fn jittered(secs: u64) -> u64 {
 /// (heartbeats arriving faster than 0.9 × the plan minimum draw a 429).
 fn next_heartbeat_sleep(interval_secs: u64, cycle_elapsed: Duration) -> Duration {
     let target = Duration::from_secs(jittered(interval_secs));
-    let floor = Duration::from_millis(interval_secs.saturating_mul(900));
+    let floor =
+        Duration::from_millis(interval_secs.saturating_mul(HEARTBEAT_EARLIEST_GAP_PERMILLE));
     target.saturating_sub(cycle_elapsed).max(floor)
 }
 
@@ -269,6 +267,13 @@ fn validate_token_prefix(token: &str) -> Result<()> {
 fn main() -> Result<()> {
     init_logger();
 
+    // A person typing `connlog-agent` in a terminal gets the menu; systemd
+    // (no terminal, INVOCATION_ID set) and every argument get what they
+    // always did. The rule is `features::menu::opens_menu`.
+    if features::menu::opens_menu(&features::menu::Launch::current()) {
+        return features::menu::run();
+    }
+
     let config = Config::parse();
 
     // Handle --emit-service (used by ExecStopPost during self-update on Linux)
@@ -283,18 +288,35 @@ fn main() -> Result<()> {
             AgentCommand::Install => {
                 let token = config.token.clone().context("Token required for install")?;
                 let bmc = features::bmc::BmcConfig::from_config(&config);
-                return install::install(&token, bmc.as_ref(), config.expose_system_info);
+                return install::install(
+                    &token,
+                    bmc.as_ref(),
+                    config.expose_system_info,
+                    config.requested_remote_reboot(),
+                );
             }
             AgentCommand::Uninstall => return install::uninstall(),
             AgentCommand::Status => return install::status(),
             AgentCommand::RefreshService { restart } => return install::refresh_service(restart),
             AgentCommand::Config { command } => match command {
-                LocalConfigCommand::EnableHostname => {
-                    return install::enable_hostname_sharing();
+                LocalConfigCommand::EnableHostname => return install::set_hostname_sharing(true),
+                LocalConfigCommand::DisableHostname => return install::set_hostname_sharing(false),
+                LocalConfigCommand::DisableRemoteReboot => {
+                    return install::set_remote_reboot(false)
+                }
+                LocalConfigCommand::EnableRemoteReboot => return install::set_remote_reboot(true),
+                LocalConfigCommand::EnablePostmortem => {
+                    return install::set_postmortem_sharing(true)
+                }
+                LocalConfigCommand::DisablePostmortem => {
+                    return install::set_postmortem_sharing(false);
                 }
             },
             AgentCommand::Update => return update::run_manual_update(),
             AgentCommand::ApplyStagedUpdate => return update::apply_staged_update(),
+            AgentCommand::CollectPostmortem => {
+                return features::postmortem::run_collect(config.share_postmortem);
+            }
             AgentCommand::CheckConfig => {
                 let token = config
                     .token
@@ -341,6 +363,14 @@ fn main() -> Result<()> {
                     return features::heartbeat_telemetry::run_diagnostics_cli(
                         &since, limit, format,
                     );
+                }
+                DiagnosticCommand::History {
+                    since,
+                    limit,
+                    format,
+                } => {
+                    // Local-only, like `heartbeats`: reads the flight ring.
+                    return flight_recorder::history::run_history_cli(&since, limit, format);
                 }
             },
         }
@@ -390,7 +420,12 @@ fn main() -> Result<()> {
             .clone()
             .context("Token required for installation")?;
         let bmc = features::bmc::BmcConfig::from_config(&config);
-        return install::install(&token, bmc.as_ref(), config.expose_system_info);
+        return install::install(
+            &token,
+            bmc.as_ref(),
+            config.expose_system_info,
+            config.requested_remote_reboot(),
+        );
     }
 
     // Run mode - require token
@@ -400,16 +435,31 @@ fn main() -> Result<()> {
 
     let endpoint = config.resolve_endpoint(DEFAULT_ENDPOINT);
     let expose_system_info = config.expose_system_info;
+    let allow_remote_reboot = config.remote_reboot_allowed();
     // Resolve BMC config here (where the parsed Config is in scope). None ->
     // the poller stays inert.
     let bmc_config = features::bmc::BmcConfig::from_config(&config);
+    let host_settings = http::HostSettings {
+        bmc: bmc_config.is_some(),
+        hostname: expose_system_info,
+        postmortem: config.share_postmortem,
+    };
+
+    // A service stop (or the host shutting down) sets `stop` instead of
+    // killing the process, so the loop ends where it is and exits 0.
+    let stop = Arc::new(AtomicBool::new(false));
+    if !platform::signals::install_stop_handlers(&stop) {
+        warn!("Could not install SIGTERM/SIGINT handlers; a stop will kill the agent");
+    }
 
     run_agent_with_shutdown_inner(
         token,
         endpoint,
         expose_system_info,
+        allow_remote_reboot,
+        host_settings,
         bmc_config,
-        Arc::new(AtomicBool::new(false)),
+        stop,
     )
 }
 
@@ -417,6 +467,8 @@ fn run_agent_with_shutdown_inner(
     token: String,
     endpoint: String,
     expose_system_info: bool,
+    allow_remote_reboot: bool,
+    host_settings: http::HostSettings,
     bmc_config: Option<features::bmc::BmcConfig>,
     stop: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -467,6 +519,47 @@ fn run_agent_with_shutdown_inner(
         telemetry.log_path().display()
     );
     client.set_telemetry(telemetry);
+    client.set_remote_reboot_allowed(allow_remote_reboot);
+    client.set_host_settings(host_settings);
+    if !allow_remote_reboot {
+        info!(
+            "Remote reboot is off on this host; `sudo connlog-agent config enable-remote-reboot` allows it"
+        );
+    }
+
+    // A reboot this agent handed to systemd before it last exited: say what
+    // became of it on the next heartbeats.
+    let state_dir = features::heartbeat_telemetry::default_state_dir();
+    let boot_id = identity::boot_id();
+    if let Some(report) = remote_reboot::take_attempt_outcome(
+        &state_dir,
+        boot_id.as_deref(),
+        remote_reboot::system_uptime_secs(),
+    ) {
+        info!(
+            "REBOOT: previous remote reboot {}: {}",
+            report.state.as_str(),
+            report.message.as_deref().unwrap_or("")
+        );
+        client.set_reboot_report(Some(report));
+    }
+
+    // The flight recorder: one record a minute to a fixed ring on disk, on
+    // its own thread, whether or not the platform answers. The guard records
+    // the clean stop when the loop ends on SIGTERM.
+    let heartbeat_failing = Arc::new(AtomicBool::new(false));
+    let recorder = flight_recorder::Recorder::open(&state_dir, boot_id.as_deref());
+    let _stop_record = StopRecordGuard {
+        sampler: recorder.as_ref().and_then(|r| {
+            flight_recorder::spawn_sampler(
+                r.clone(),
+                Arc::clone(&stop),
+                Arc::clone(&heartbeat_failing),
+            )
+        }),
+        recorder: recorder.clone(),
+        stop: Arc::clone(&stop),
+    };
 
     // Initialize reusable metrics collector (avoids re-creating sysinfo each heartbeat)
     let mut collector =
@@ -506,6 +599,8 @@ fn run_agent_with_shutdown_inner(
     let mut consecutive_errors = 0u32;
     let mut consecutive_uninstall_commands = 0u32;
     let mut consecutive_reboot_commands = 0u32;
+    let mut reboot_refusal_logged = false;
+    let mut history_answers = HistoryAnswers::default();
 
     // ── Update strategy ──────────────────────────────────────────
     //
@@ -539,14 +634,19 @@ fn run_agent_with_shutdown_inner(
         // `client`'s heartbeat target in place via `set_heartbeat_endpoint`.
         endpoint_assignment.refresh_if_needed(&client, cfg!(debug_assertions));
 
-        match send_heartbeat(
+        let outcome = send_heartbeat(
             &client,
             &config,
             &mut collector,
             Some(&quick_action_polling),
             expose_system_info,
-        ) {
+        );
+        heartbeat_failing.store(outcome.is_err(), Ordering::SeqCst);
+        match outcome {
             Ok(response) => {
+                // The platform has the reboot report this heartbeat carried.
+                client.set_reboot_report(None);
+
                 // Reset error counters on success
                 consecutive_unauthorized = 0;
                 consecutive_errors = 0;
@@ -579,8 +679,20 @@ fn run_agent_with_shutdown_inner(
                 }
 
                 // Remote host reboot (require consecutive confirmations). Uninstall
-                // takes precedence when both flags are present.
-                if !response.uninstall && response.reboot {
+                // takes precedence when both flags are present. A host that
+                // refuses remote reboot never counts a request at all.
+                if !response.uninstall && response.reboot && !allow_remote_reboot {
+                    if !reboot_refusal_logged {
+                        warn!(
+                            "Refusing remote reboot request: remote reboot is off on this host (CONNLOG_ALLOW_REMOTE_REBOOT is not true)"
+                        );
+                        client.set_reboot_report(Some(RebootReport::new(
+                            RebootState::RefusedDisabled,
+                            "Remote reboot is off on this host (CONNLOG_ALLOW_REMOTE_REBOOT is not true)",
+                        )));
+                        reboot_refusal_logged = true;
+                    }
+                } else if !response.uninstall && response.reboot {
                     consecutive_reboot_commands += 1;
                     warn!(
                         "Received remote reboot command ({}/{})",
@@ -591,15 +703,20 @@ fn run_agent_with_shutdown_inner(
                             "Reboot confirmed after {} consecutive commands",
                             REBOOT_CONFIRM_THRESHOLD
                         );
-                        if trigger_host_reboot("Remote reboot confirmed by workspace owner") {
-                            return Ok(());
-                        }
-                        // Stale unit / marker write failed — keep running and
-                        // retry on later confirmed deliveries.
+                        // Returns only when the reboot could not be handed
+                        // to systemd; the platform hears why and stops asking.
+                        let report = trigger_host_reboot(
+                            "Remote reboot confirmed by workspace owner",
+                            &state_dir,
+                            boot_id.as_deref(),
+                            recorder.as_ref(),
+                        );
+                        client.set_reboot_report(Some(report));
                         consecutive_reboot_commands = 0;
                     }
                 } else if !response.reboot {
                     consecutive_reboot_commands = 0;
+                    reboot_refusal_logged = false;
                 }
 
                 // Check for available update
@@ -619,6 +736,9 @@ fn run_agent_with_shutdown_inner(
                                 "Update to v{} staged successfully. Restarting for update...",
                                 update_info.latest_version
                             );
+                            if let Some(recorder) = &recorder {
+                                recorder.record_stop(flight_recorder::ring::FLAG_EXIT_UPDATE);
+                            }
                             // Exit cleanly - ExecStopPost will swap the binary,
                             // refresh the service file, and restart us.
                             std::process::exit(0);
@@ -663,6 +783,19 @@ fn run_agent_with_shutdown_inner(
                             // Continue with old config - it still works
                         }
                     }
+                }
+
+                // After an outage the platform asks what the flight recorder
+                // saw. Answered once per window, at most three tries each;
+                // never allowed to cost more than this cycle's request.
+                if let Some(request) = response.history_request {
+                    answer_history_request(
+                        &client,
+                        &config,
+                        &state_dir,
+                        request,
+                        &mut history_answers,
+                    );
                 }
 
                 // Monitoring-only: do not execute dashboard-triggered commands.
@@ -1175,6 +1308,109 @@ fn trigger_self_uninstall(reason: &str) {
     std::process::exit(0);
 }
 
+/// Which `history_request` the agent last dealt with, and how often it tried.
+#[derive(Default)]
+struct HistoryAnswers {
+    last: Option<heartbeat::HistoryRequest>,
+    attempts: u32,
+    done: bool,
+}
+
+const HISTORY_UPLOAD_ATTEMPTS: u32 = 3;
+
+/// Send the flight recorder's records for the window the platform asked
+/// about. Best-effort: a failure is logged and retried on the next heartbeat
+/// that repeats the request, three times in all.
+fn answer_history_request(
+    client: &ApiClient,
+    config: &AgentConfig,
+    state_dir: &std::path::Path,
+    request: heartbeat::HistoryRequest,
+    answers: &mut HistoryAnswers,
+) {
+    if answers.last != Some(request) {
+        *answers = HistoryAnswers {
+            last: Some(request),
+            ..HistoryAnswers::default()
+        };
+    }
+    if answers.done || answers.attempts >= HISTORY_UPLOAD_ATTEMPTS {
+        return;
+    }
+    answers.attempts += 1;
+
+    use flight_recorder::upload;
+    let all = flight_recorder::ring::read(&flight_recorder::ring_path(state_dir));
+    let records = upload::records_for(
+        &all,
+        request.since,
+        request.until,
+        upload::MetricToggles {
+            cpu: config.metrics.cpu,
+            memory: config.metrics.memory,
+            disk: config.metrics.disk,
+            load: config.metrics.load,
+        },
+    );
+    let count = records.len();
+    let body = upload::encode(&records);
+    let bytes = body.len();
+    match client.upload_history(body) {
+        Ok(()) => {
+            answers.done = true;
+            info!(
+                "Sent flight-recorder history for {}..{}: {count} records, {bytes} bytes",
+                request.since, request.until
+            );
+            send_postmortem(client, state_dir);
+        }
+        Err(e) => warn!(
+            "Flight-recorder history upload failed (attempt {}/{}): {e}",
+            answers.attempts, HISTORY_UPLOAD_ATTEMPTS
+        ),
+    }
+}
+
+/// Send the previous boot's last words, when the opt-in collector left
+/// some, right after the history that explains the outage. Forgotten once
+/// the platform has answered (accepted or not); kept for the next outage
+/// only when the platform could not be reached.
+fn send_postmortem(client: &ApiClient, state_dir: &std::path::Path) {
+    let Some((_boot, text)) = features::postmortem::read_pending(state_dir) else {
+        return;
+    };
+    match client.upload_postmortem(text) {
+        Ok(()) | Err(ApiError::HttpError { .. }) => {
+            features::postmortem::clear_pending(state_dir);
+            info!("Sent the previous boot's last warnings with the outage report");
+        }
+        Err(e) => warn!("Post-mortem upload failed: {e}"),
+    }
+}
+
+/// Records the clean stop when the daemon loop ends because of SIGTERM or
+/// SIGINT: waits for the sampler to finish its current record so the stop is
+/// the last one, then writes it.
+struct StopRecordGuard {
+    recorder: Option<flight_recorder::Recorder>,
+    sampler: Option<thread::JoinHandle<()>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for StopRecordGuard {
+    fn drop(&mut self) {
+        if !self.stop.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Some(sampler) = self.sampler.take() {
+            let _ = sampler.join();
+        }
+        if let Some(recorder) = &self.recorder {
+            recorder.record_stop(0);
+        }
+    }
+}
+
 /// Returns true when the installed systemd unit includes a *non-blocking*
 /// reboot ExecStopPost branch. Without `--no-block`, `systemctl reboot` from
 /// ExecStopPost deadlocks (waits for this unit to finish deactivating).
@@ -1199,10 +1435,15 @@ fn installed_unit_supports_reboot() -> bool {
 
 /// Trigger a host reboot via the systemd ExecStopPost root hook.
 ///
-/// Returns `true` when the marker was written and the process is about to exit.
-/// Returns `false` when the installed unit is stale or the marker could not be
-/// written — the caller must keep the agent running.
-fn trigger_host_reboot(reason: &str) -> bool {
+/// Does not return when the marker was written: the process exits for the
+/// hook. Returns the report for the platform when the reboot could not be
+/// handed over (stale unit, marker write failure); the caller keeps running.
+fn trigger_host_reboot(
+    reason: &str,
+    state_dir: &std::path::Path,
+    boot_id: Option<&str>,
+    recorder: Option<&flight_recorder::Recorder>,
+) -> RebootReport {
     error!("REBOOT: {}", reason);
 
     if !installed_unit_supports_reboot() {
@@ -1212,7 +1453,16 @@ fn trigger_host_reboot(reason: &str) -> bool {
              Run: sudo connlog-agent refresh-service --restart \
              (or update the agent so ExecStopPost refreshes the unit)."
         );
-        return false;
+        return RebootReport::new(
+            RebootState::RefusedUnit,
+            "installed systemd unit has no reboot hook; run: sudo connlog-agent refresh-service --restart",
+        );
+    }
+
+    // Written first, so the next start can tell a reboot from a hook that ran
+    // and did nothing. Losing it costs the report, not the reboot.
+    if !remote_reboot::record_attempt(state_dir, boot_id) {
+        warn!("REBOOT: Could not record the attempt; its outcome will not be reported");
     }
 
     match std::fs::write(platform::REBOOT_MARKER, reason) {
@@ -1221,6 +1471,9 @@ fn trigger_host_reboot(reason: &str) -> bool {
                 "REBOOT: Marker written to {}. Exiting — ExecStopPost will reboot the host.",
                 platform::REBOOT_MARKER
             );
+            if let Some(recorder) = recorder {
+                recorder.record_stop(flight_recorder::ring::FLAG_EXIT_REBOOT);
+            }
             // Exit with 0 so systemd Restart=on-failure does not restart us
             // before ExecStopPost runs `systemctl reboot`.
             std::process::exit(0);
@@ -1230,7 +1483,13 @@ fn trigger_host_reboot(reason: &str) -> bool {
                 "REBOOT: Could not write reboot marker: {}. Continuing without reboot.",
                 e
             );
-            false
+            // No reboot is coming: the attempt record must not be read as one
+            // on the next start.
+            remote_reboot::clear_attempt(state_dir);
+            RebootReport::new(
+                RebootState::Failed,
+                format!("could not write the reboot marker: {e}"),
+            )
         }
     }
 }
@@ -1243,6 +1502,7 @@ struct HeartbeatResult {
     reboot: bool,
     update: Option<heartbeat::UpdateInfo>,
     quick_actions: Vec<features::quick_actions::QuickActionRequest>,
+    history_request: Option<heartbeat::HistoryRequest>,
 }
 
 fn send_heartbeat(
@@ -1411,6 +1671,7 @@ fn send_heartbeat(
         reboot: response.reboot,
         update: response.update,
         quick_actions: response.quick_actions,
+        history_request: response.history_request,
     })
 }
 
@@ -1426,6 +1687,60 @@ mod jitter_tests {
         jittered, jittered_duration, next_heartbeat_sleep, QuickActionPollState,
         HEARTBEAT_JITTER_PCT, QUICK_ACTION_POLL_JITTER_PCT,
     };
+
+    /// The agent's half of `packages/agent-protocol/fixtures/heartbeat-schedule.json`.
+    /// The platform's half is `packages/agent-protocol/src/__tests__/schedule.test.ts`.
+    /// `include_str!` reaches outside the crate only in tests, as
+    /// `http::shared_fixtures` does.
+    #[test]
+    fn heartbeat_schedule_matches_the_shared_fixture() {
+        use crate::heartbeat::{
+            HEARTBEAT_EARLIEST_GAP_PERMILLE, HEARTBEAT_MAX_INTERVAL_SECS,
+            HEARTBEAT_MIN_INTERVAL_SECS,
+        };
+
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../packages/agent-protocol/fixtures/heartbeat-schedule.json"
+        ))
+        .expect("schedule fixture must be JSON");
+        let field = |name: &str| fixture[name].as_u64().expect(name);
+
+        assert_eq!(HEARTBEAT_MIN_INTERVAL_SECS, field("minIntervalSecs"));
+        assert_eq!(HEARTBEAT_MAX_INTERVAL_SECS, field("maxIntervalSecs"));
+        assert_eq!(HEARTBEAT_JITTER_PCT, field("jitterPct"));
+        assert_eq!(
+            HEARTBEAT_EARLIEST_GAP_PERMILLE,
+            field("earliestGapPermille")
+        );
+
+        let examples = fixture["examples"].as_array().expect("examples");
+        assert!(!examples.is_empty());
+        for example in examples {
+            let interval = example["intervalSecs"].as_u64().unwrap();
+            let earliest_ms = example["earliestGapMs"].as_u64().unwrap();
+            let latest_secs = example["latestGapSecs"].as_u64().unwrap();
+
+            // A cycle that used the whole interval sleeps only the floor.
+            let floor = next_heartbeat_sleep(interval, std::time::Duration::from_secs(interval));
+            assert_eq!(
+                floor.as_millis(),
+                u128::from(earliest_ms),
+                "{interval}s floor"
+            );
+
+            // The most jitter `jittered` can add lands exactly on the bound.
+            let span = (interval * HEARTBEAT_JITTER_PCT) / 100;
+            assert_eq!(interval + span, latest_secs, "{interval}s latest gap");
+            for _ in 0..20 {
+                let gap = jittered(interval);
+                assert!(
+                    (interval..=latest_secs).contains(&gap),
+                    "{gap} for {interval}s"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
 
     #[test]
     fn jittered_zero_stays_zero() {

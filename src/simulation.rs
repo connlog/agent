@@ -341,6 +341,139 @@ fn heartbeat_omits_hostname_but_sends_os_arch_when_not_opted_in() {
     assert_eq!(req.header("X-Arch"), Some("x86_64"));
 }
 
+/// `X-Boot-Id` goes out whenever the kernel's boot id is readable (always on
+/// a Linux CI runner); `X-Remote-Reboot` only once the daemon has set it, so
+/// a diagnostic command never reports a setting it did not read.
+#[test]
+fn heartbeat_sends_boot_id_and_remote_reboot_setting() {
+    let body =
+        br#"{"ok":true,"server_time":"2026-04-30T00:00:00Z","expected_interval_seconds":60}"#
+            .to_vec();
+
+    let (base, rx) = one_shot_server("200 OK", body.clone());
+    let client = ApiClient::new(base, "test-token".into()).expect("ApiClient::new");
+    client.send_heartbeat(&make_payload(), None).expect("ok");
+    let req = recv_request(&rx);
+    let boot_id = req.header("X-Boot-Id").expect("X-Boot-Id on Linux");
+    assert_eq!(
+        crate::identity::parse_boot_id(boot_id).as_deref(),
+        Some(boot_id)
+    );
+    assert_eq!(req.header("X-Remote-Reboot"), None);
+
+    for (allowed, sent) in [(true, "allowed"), (false, "disabled")] {
+        let (base, rx) = one_shot_server("200 OK", body.clone());
+        let mut client = ApiClient::new(base, "test-token".into()).expect("ApiClient::new");
+        client.set_remote_reboot_allowed(allowed);
+        client.send_heartbeat(&make_payload(), None).expect("ok");
+        assert_eq!(recv_request(&rx).header("X-Remote-Reboot"), Some(sent));
+    }
+}
+
+/// `X-Host-Settings` carries on/off values only, and only once the daemon
+/// has set them.
+#[test]
+fn heartbeat_sends_host_settings_once_set() {
+    let body =
+        br#"{"ok":true,"server_time":"2026-04-30T00:00:00Z","expected_interval_seconds":60}"#
+            .to_vec();
+
+    let (base, rx) = one_shot_server("200 OK", body.clone());
+    let client = ApiClient::new(base, "test-token".into()).expect("ApiClient::new");
+    client.send_heartbeat(&make_payload(), None).expect("ok");
+    assert_eq!(recv_request(&rx).header("X-Host-Settings"), None);
+
+    let (base, rx) = one_shot_server("200 OK", body);
+    let mut client = ApiClient::new(base, "test-token".into()).expect("ApiClient::new");
+    client.set_host_settings(crate::http::HostSettings {
+        bmc: true,
+        hostname: false,
+        postmortem: true,
+    });
+    client.send_heartbeat(&make_payload(), None).expect("ok");
+    assert_eq!(
+        recv_request(&rx).header("X-Host-Settings"),
+        Some("bmc=on,hostname=off,postmortem=on")
+    );
+}
+
+#[test]
+fn heartbeat_carries_the_reboot_report_until_cleared() {
+    use crate::features::remote_reboot::{RebootReport, RebootState};
+    let body =
+        br#"{"ok":true,"server_time":"2026-04-30T00:00:00Z","expected_interval_seconds":60}"#
+            .to_vec();
+
+    let (base, rx) = one_shot_server("200 OK", body.clone());
+    let client = ApiClient::new(base, "test-token".into()).expect("ApiClient::new");
+    client.set_reboot_report(Some(RebootReport::new(
+        RebootState::Failed,
+        "host did not reboot",
+    )));
+    client.send_heartbeat(&make_payload(), None).expect("ok");
+    let req = recv_request(&rx);
+    assert_eq!(req.header("X-Reboot-State"), Some("failed"));
+    assert_eq!(req.header("X-Reboot-Message"), Some("host did not reboot"));
+
+    let (base, rx) = one_shot_server("200 OK", body);
+    let client = ApiClient::new(base, "test-token".into()).expect("ApiClient::new");
+    client.set_reboot_report(None);
+    client.send_heartbeat(&make_payload(), None).expect("ok");
+    let req = recv_request(&rx);
+    assert_eq!(req.header("X-Reboot-State"), None);
+    assert_eq!(req.header("X-Reboot-Message"), None);
+}
+
+#[test]
+fn history_upload_posts_the_encoded_records_to_the_control_plane() {
+    use crate::features::flight_recorder::upload::{self, WireRecord};
+    let (base, rx) = one_shot_server("200 OK", br#"{"ok":true}"#.to_vec());
+    let client = ApiClient::new(base, "test-token".into()).expect("ApiClient::new");
+    let records = [WireRecord {
+        fields: [1; upload::FIELDS],
+    }];
+    let body = upload::encode(&records);
+
+    client.upload_history(body.clone()).expect("upload ok");
+
+    let req = recv_request(&rx);
+    assert_eq!(req.method, "POST");
+    assert_eq!(req.path, "/api/agents/history");
+    assert_eq!(req.header("Content-Type"), Some(upload::CONTENT_TYPE));
+    assert_eq!(req.header("Authorization"), Some("Bearer test-token"));
+    assert!(req.header("X-Machine-Id").is_some());
+    assert_eq!(req.body, body);
+}
+
+#[test]
+fn postmortem_upload_posts_plain_text() {
+    let (base, rx) = one_shot_server("200 OK", br#"{"ok":true}"#.to_vec());
+    let client = ApiClient::new(base, "test-token".into()).expect("ApiClient::new");
+    client
+        .upload_postmortem("kernel: Out of memory\n".into())
+        .expect("upload ok");
+    let req = recv_request(&rx);
+    assert_eq!(req.path, "/api/agents/postmortem");
+    assert_eq!(
+        req.header("Content-Type"),
+        Some("text/plain; charset=utf-8")
+    );
+    assert_eq!(req.body, b"kernel: Out of memory\n");
+}
+
+#[test]
+fn heartbeat_parses_a_history_request() {
+    let body = br#"{"ok":true,"server_time":"2026-09-23T00:00:00Z","expected_interval_seconds":60,"history_request":{"since":1790000000,"until":1790000600}}"#.to_vec();
+    let (base, _rx) = one_shot_server("200 OK", body);
+    let client = ApiClient::new(base, "test-token".into()).expect("ApiClient::new");
+    let resp = client.send_heartbeat(&make_payload(), None).expect("ok");
+    let request = resp.history_request.expect("history_request");
+    assert_eq!(
+        (request.since, request.until),
+        (1_790_000_000, 1_790_000_600)
+    );
+}
+
 #[test]
 fn heartbeat_200_with_uninstall_flag() {
     let body = br#"{"ok":true,"server_time":"t","expected_interval_seconds":60,"uninstall":true}"#
@@ -641,8 +774,8 @@ fn fetch_config_parses_and_clamp_keeps_it_sane() {
     // against a buggy / malicious config payload.
     cfg.clamp();
     assert!(
-        cfg.heartbeat_interval_secs >= 10,
-        "clamp must enforce >= 10s heartbeat (got {})",
+        cfg.heartbeat_interval_secs >= crate::heartbeat::HEARTBEAT_MIN_INTERVAL_SECS,
+        "clamp must enforce the heartbeat floor (got {})",
         cfg.heartbeat_interval_secs
     );
     assert!(

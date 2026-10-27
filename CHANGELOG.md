@@ -6,6 +6,74 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 [`VERSIONING.md`](./VERSIONING.md) for the full policy. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.20.0] — 2026-10-26
+
+### Added
+
+- **An interactive menu.** `sudo connlog-agent` with no arguments, in a
+  terminal, opens arrow-key menus: service state and last heartbeat, on/off
+  toggles for remote reboot, hostname sharing and crash reports (the same
+  code as the `config` commands), check config, a test heartbeat, heartbeat
+  diagnostics, and uninstall behind a typed confirmation. Without root it
+  shows the status and offers to reopen with `sudo`. A bare command without
+  a terminal, under systemd (`INVOCATION_ID`) or with `CONNLOG_TOKEN` set
+  still runs the daemon, and every argument keeps its meaning. Adds the
+  `dialoguer` crate (default features off).
+- **`config disable-hostname`** turns hostname sharing off again.
+- **Remote reboot is off unless the host allows it.** Only
+  `CONNLOG_ALLOW_REMOTE_REBOOT=true` in the root-only `/etc/connlog/agent.conf`
+  (`config enable-remote-reboot`, or `install --enable-remote-reboot`) lets the
+  dashboard reboot a host. Without it, after this update, the agent refuses
+  every reboot request and reports the refusal, and the root-side hook
+  re-checks the same file and reboots only on an explicit true.
+  `config disable-remote-reboot` and `install --disable-remote-reboot` record
+  an explicit refusal. A reinstall keeps the host's existing choice unless the
+  install command makes a new one. **This changes behaviour for every host
+  installed before this release:** remote reboots and scheduled reboots stop
+  until `sudo connlog-agent config enable-remote-reboot` is run on the host.
+- **Remote reboots report their outcome.** The agent records the attempt
+  before exiting for it and, on the next start, reports `completed` (new boot)
+  or `failed` (same boot); refusals are reported too (`X-Reboot-State`).
+- **`X-Host-Settings`** on every heartbeat: whether BMC polling, hostname
+  sharing and crash reports are turned on in `agent.conf`, as on/off values
+  only (`bmc=on,hostname=off,postmortem=off`). The file itself never leaves
+  the host. The console shows them in a server's settings drawer.
+- **`X-Boot-Id`** on every heartbeat, so the platform sees reboots exactly,
+  including ones nobody requested; **`X-Remote-Reboot`** with the host setting.
+- **The flight recorder.** One record a minute (CPU, memory, disk, load, OOM
+  kills, pressure) in a fixed 92 KB ring at `/var/lib/connlog/flight.ring`,
+  written through network outages, with start and stop records.
+  `connlog-agent diagnostics history` reads it back and says what happened:
+  clean, unclean or requested reboots, agent restarts, updates and kills, and
+  stretches when ConnLog was unreachable.
+- **The platform learns why.** When a heartbeat carries `history_request`
+  after an outage, the agent sends the recorder's records for that window
+  (`POST /api/agents/history`, a compact delta format: about 13 KB for a day)
+  and the dashboard shows the cause: network outage, clean or requested
+  reboot, crash or power loss, agent restart, update or kill.
+
+- **Last words, opt-in.** With `CONNLOG_SHARE_POSTMORTEM=true`
+  (`config enable-postmortem`), a root `ExecStartPre` step saves the previous
+  boot's last journal and kernel warnings after an unclean shutdown (redacted,
+  at most 8 KB), and the agent sends them with the outage report. Off by
+  default.
+
+### Fixed
+
+- **The reboot hook never strands the agent.** When neither `systemctl reboot`
+  nor the `systemd-run` fallback works, or the host refuses, the hook starts
+  the agent again instead of leaving it stopped.
+- **A stop is a stop.** SIGTERM/SIGINT end the loop cleanly (exit 0) instead of
+  killing the process mid-request.
+
+### Security
+
+- **rustls 0.23.36 → 0.23.45** (RUSTSEC-2026-0285). Rustls accepted TLS 1.3
+  handshake messages at the wrong encryption level when they shared a record
+  with a key-changing message. The transcript stays authenticated, so this is
+  not a handshake takeover, but the agent now rejects such a peer as RFC 8446
+  requires.
+
 ## [1.19.0] — 2026-09-02
 
 Security hardening release. Every item below came out of a full read-only
@@ -229,8 +297,7 @@ audit of the agent, the installer and the release pipeline.
     positive-only (+0..10% instead of ±10%) for the same reason.
 
 - **Copyright holder corrected.** The MIT `LICENSE` and the README previously
-  named an unrelated, unverified entity ("IA Solutions B.V.") as the copyright
-  holder. There is no record establishing that entity as the owner of ConnLog or
+  named an unrelated entity as the copyright holder. There is no record establishing that entity as the owner of ConnLog or
   this code, so it has been replaced with the project's canonical identity,
   `ConnLog`, matching the ConnLog platform's published legal identity. The
   registered legal entity name is still pending configuration on the platform
@@ -921,6 +988,7 @@ considered stable; breaking changes from this point on require a major bump.
 
 - Last pre-1.0 release. See git history for prior changes.
 
+[1.20.0]: https://github.com/connlog/agent/compare/v1.19.0...v1.20.0
 [1.19.0]: https://github.com/connlog/agent/compare/v1.18.0...v1.19.0
 [1.18.0]: https://github.com/connlog/agent/compare/v1.17.1...v1.18.0
 [1.17.1]: https://github.com/connlog/agent/compare/v1.17.0...v1.17.1

@@ -19,9 +19,8 @@ dist/
 # Signing keys (never commit these)
 signing_key.hex
 
-# AI assistant scratch (private, never commit)
-CLAUDE.md
-AGENTS.md
+# AI assistant scratch (private, never commit). CLAUDE.md and AGENTS.md here
+# are symlinks into law-and-order/ at the repository root.
 .claude/
 .cursor/
 .aider*

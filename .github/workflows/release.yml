@@ -201,15 +201,20 @@ jobs:
             RAW_BINS="$RAW_BINS $bin"
           done
 
+          # The dependencies' licences require their notices to travel with
+          # the binary; the file is regenerated with Cargo.lock (RELEASING.md).
+          NOTICES=THIRD-PARTY-LICENSES.md
+          test -s "$NOTICES" || { echo "::error::$NOTICES is missing"; exit 1; }
+
           if gh release view "$VERSION" >/dev/null 2>&1; then
             echo "Release $VERSION already exists, uploading assets..."
             # shellcheck disable=SC2086
-            gh release upload "$VERSION" $RAW_BINS artifacts/*/*.tar.gz artifacts/*/*.sha256 artifacts/*/*.sig --clobber
+            gh release upload "$VERSION" $RAW_BINS artifacts/*/*.tar.gz artifacts/*/*.sha256 artifacts/*/*.sig "$NOTICES" --clobber
           else
             # shellcheck disable=SC2086
             gh release create "$VERSION" \
               --title "ConnLog Agent ${VERSION}" \
               --notes "$NOTES" \
               --latest \
-              $RAW_BINS artifacts/*/*.tar.gz artifacts/*/*.sha256 artifacts/*/*.sig
+              $RAW_BINS artifacts/*/*.tar.gz artifacts/*/*.sha256 artifacts/*/*.sig "$NOTICES"
           fi

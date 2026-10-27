@@ -56,6 +56,8 @@ CONNLOG_TOKEN=<TOKEN> connlog-agent register
 | `CONNLOG_TOKEN`                   | Agent auth token (`agent_...`), alternative to `--token`                                                                                                                            |
 | `CONNLOG_PLATFORM_URL`            | Override the control-plane URL (defaults to `https://connlog.com`); mainly for self-hosted deployments                                                                              |
 | `CONNLOG_EXPOSE_SYSTEM_INFO`      | Set to `true` to opt in to sending hostname with heartbeats (off by default). Prefer `sudo connlog-agent config enable-hostname`, which creates `/etc/connlog/agent.conf` if needed and restarts the service. |
+| `CONNLOG_ALLOW_REMOTE_REBOOT`     | `true` to let the dashboard reboot this host; unset or anything else refuses (the default). Prefer `sudo connlog-agent config enable-remote-reboot`, or `install --enable-remote-reboot`. The root-side hook checks the same root-only file, so neither the platform nor the running agent can turn it on. |
+| `CONNLOG_SHARE_POSTMORTEM`        | `true` to send, after the host went down without a clean stop, the previous boot's last journal and kernel warnings with the outage report: redacted, at most 8 KB, needs a persistent journal. Off by default. Prefer `sudo connlog-agent config enable-postmortem`. |
 | `CONNLOG_ALLOWED_ENDPOINT_DOMAINS`| Comma-separated extra domains the agent will trust for heartbeat **endpoint assignments** (see below), in addition to `connlog.com`; only relevant for self-hosted/regional setups |
 | `CONNLOG_BMC_ENDPOINT`            | Optional. The Redfish endpoint of this machine's BMC (iDRAC, iLO, OpenBMC), e.g. `https://10.0.0.120`. With the username and password below, the agent polls it for hardware health (drives, volumes, controllers, fans, PSUs, temperatures) and reports it to ConnLog. Also set by `install --bmc-endpoint ...`. |
 | `CONNLOG_BMC_USERNAME`, `CONNLOG_BMC_PASSWORD` | BMC credentials. Stored in `/etc/connlog/agent.conf` (0600 root), sent only to the configured BMC origin, never to ConnLog. |
@@ -63,6 +65,17 @@ CONNLOG_TOKEN=<TOKEN> connlog-agent register
 | `CONNLOG_BMC_INSECURE_TLS`        | `true` to accept the BMC's self-signed certificate. Applies to the BMC connection only, never to ConnLog traffic.                                                                  |
 
 ## Management
+
+Run `sudo connlog-agent` with no arguments in a terminal for an interactive menu: arrow keys to
+move, Enter to choose, Esc or Ctrl-C to leave. It shows the service state and the last accepted
+heartbeat, turns remote reboot, hostname sharing and crash reports on or off (through the same
+code as the `config` commands below, so the agent restarts to apply each change), checks the
+config, sends a test heartbeat, shows heartbeat diagnostics and uninstalls behind a typed
+confirmation. It never shows the token or the BMC password. Without `sudo` it shows the status and
+offers to reopen itself with `sudo`. The menu opens only for a bare command typed into a
+terminal: with any argument, without a terminal, under systemd (`INVOCATION_ID`) or with
+`CONNLOG_TOKEN` set, `connlog-agent` does exactly what it did before, so the service still starts
+the daemon. Every command below keeps working for scripts.
 
 ```bash
 # Check service status
@@ -76,8 +89,17 @@ journalctl -u connlog-agent -f
 # Refresh the installed systemd unit from the current binary
 sudo connlog-agent refresh-service --restart
 
-# Share this machine's hostname with ConnLog (creates /etc/connlog/agent.conf if needed)
+# Share this machine's hostname with ConnLog (creates /etc/connlog/agent.conf if needed), and stop
 sudo connlog-agent config enable-hostname
+sudo connlog-agent config disable-hostname
+
+# Send the previous boot's last warnings after a crash (opt-in; and off again)
+sudo connlog-agent config enable-postmortem
+sudo connlog-agent config disable-postmortem
+
+# Let the dashboard reboot this machine (off by default), and refuse it again
+sudo connlog-agent config enable-remote-reboot
+sudo connlog-agent config disable-remote-reboot
 
 # Uninstall (stops the service; removes the config, local diagnostics and the binary)
 sudo connlog-agent uninstall
@@ -102,6 +124,23 @@ connlog-agent diagnostics service
 
 The older top-level commands `connlog-agent check-config` and
 `connlog-agent test-heartbeat` still work for existing scripts.
+
+### The flight recorder
+
+The agent keeps the last 24 hours of this host on the host: one record a
+minute (CPU, memory, disk, load, OOM kills, CPU/memory/IO pressure) in a
+fixed 92 KB file, `/var/lib/connlog/flight.ring`, written whether or not ConnLog
+is reachable. It never grows; the oldest record is simply overwritten. After an
+outage it answers the question the dashboard alone cannot: did the host crash,
+reboot cleanly, get rebooted on request, or stay up while the network was down?
+
+```bash
+connlog-agent diagnostics history                 # what happened, and the latest records
+connlog-agent diagnostics history --since 2h --limit 120
+connlog-agent diagnostics history --format json
+```
+
+It reads only the local file: no root, no network, no token.
 
 ### Heartbeat delivery diagnostics
 
@@ -324,8 +363,12 @@ arbitrary shell commands or command arguments.
 
 ConnLog does **not** remotely execute arbitrary commands. Host reboot can be
 requested from the dashboard and is confirmed on three consecutive heartbeats
-before systemd reboots the machine. Local `connlog-agent action` tooling may
-still exist on disk; the platform will not trigger it.
+before systemd reboots the machine; the agent then tells the platform whether
+the host came back on a new boot, did not reboot, or refused. A host refuses
+every request unless its root-only `agent.conf` sets
+`CONNLOG_ALLOW_REMOTE_REBOOT=true`. Local
+`connlog-agent action` tooling may still exist on disk; the platform will not
+trigger it.
 
 ### Collected metrics
 
@@ -422,6 +465,11 @@ Windows support is planned after the Linux agent reaches production stability.
 
 The MIT license terms in [`LICENSE`](LICENSE) are authoritative; the line above
 is a convenience reference only.
+
+The release binary statically links third-party crates whose licences require
+their notices to travel with it: [`THIRD-PARTY-LICENSES.md`](THIRD-PARTY-LICENSES.md).
+Regenerate it with `scripts/third-party-licenses.sh` after any `Cargo.lock`
+change.
 
 ## Ownership and contact
 

@@ -19,6 +19,10 @@ Type=simple
 User=connlog-agent
 Group=connlog-agent
 EnvironmentFile=/etc/connlog/agent.conf
+# Opt-in last words (CONNLOG_SHARE_POSTMORTEM): after an unclean previous
+# boot, root saves that boot's last warnings for the outage report. `-` so a
+# failure never keeps the agent from starting; a no-op unless opted in.
+ExecStartPre=-+/usr/local/bin/connlog-agent collect-postmortem
 ExecStart=/usr/local/bin/connlog-agent
 Restart=on-failure
 RestartSec=10
@@ -113,14 +117,32 @@ elif [ -f /run/connlog/.uninstall_requested ]; then \
     rm -f /usr/local/bin/connlog-agent /usr/local/bin/connlog-agent.old /usr/local/bin/connlog-agent.new; \
     echo "ConnLog: Agent fully uninstalled."; \
 elif [ -f /run/connlog/.reboot_requested ]; then \
-    echo "ConnLog: Reboot marker detected, scheduling host reboot..."; \
     rm -f /run/connlog/.reboot_requested; \
-    # MUST use --no-block: a synchronous `systemctl reboot` waits for every
-    # unit (including this one) to finish deactivating, but we are still
-    # inside ExecStopPost — that deadlocks and the host never reboots.
-    if ! systemctl reboot --no-block; then \
-        echo "ConnLog: systemctl reboot --no-block failed; falling back to systemd-run"; \
-        systemd-run --collect --on-active=2s /bin/systemctl reboot --no-block; \
+    # The marker is writable by the service account, so root re-reads the
+    # host's own setting from the root-only agent.conf (last assignment wins,
+    # as for EnvironmentFile). Only an explicit true reboots: a missing file,
+    # a missing line or any other value refuses. `$$` is a literal `$` for
+    # systemd; quotes and spaces are dropped by keeping only alphanumerics.
+    # No line here may start with `;` (so no `case`): systemd reads that as a
+    # comment and drops it.
+    allow=$$(grep -E "^[[:space:]]*CONNLOG_ALLOW_REMOTE_REBOOT=" /etc/connlog/agent.conf 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -dc "[:alnum:]" | tr "[:upper:]" "[:lower:]"); \
+    if ! echo "$$allow" | grep -qxE "true|1|yes|on|y|t"; then \
+        echo "ConnLog: Remote reboot is off on this host (CONNLOG_ALLOW_REMOTE_REBOOT is not true); not rebooting."; \
+        systemctl start --no-block connlog-agent; \
+    else \
+        echo "ConnLog: Reboot marker detected, scheduling host reboot..."; \
+        # MUST use --no-block: a synchronous `systemctl reboot` waits for every
+        # unit (including this one) to finish deactivating, but we are still
+        # inside ExecStopPost — that deadlocks and the host never reboots.
+        if ! systemctl reboot --no-block; then \
+            echo "ConnLog: systemctl reboot --no-block failed; falling back to systemd-run"; \
+            # Neither worked: bring the agent back so the host is not left
+            # silent. It finds itself on the same boot and reports the failure.
+            if ! systemd-run --collect --on-active=2s /bin/systemctl reboot --no-block; then \
+                echo "ConnLog: Could not schedule a reboot; starting the agent again."; \
+                systemctl start --no-block connlog-agent; \
+            fi; \
+        fi; \
     fi; \
 fi'
 
@@ -132,6 +154,7 @@ pub fn install(
     token: &str,
     bmc: Option<&crate::features::bmc::BmcConfig>,
     expose_system_info: bool,
+    remote_reboot: Option<bool>,
 ) -> Result<()> {
     // Check if running as root
     if !is_root() {
@@ -152,14 +175,26 @@ pub fn install(
     // Create config directory
     create_config_dir()?;
 
+    // A reinstall keeps the host's existing remote-reboot choice unless this
+    // install makes a new one; with neither, the line is left out (off).
+    let remote_reboot = remote_reboot.or_else(existing_conf_remote_reboot);
+
     // Write config file with token (+ BMC settings if provided)
-    write_config(token, &platform_url, bmc, expose_system_info)?;
+    write_config(token, &platform_url, bmc, expose_system_info, remote_reboot)?;
     if bmc.is_some() {
         println!("  BMC hardware-health polling configured (iDRAC / iLO / OpenBMC)");
     }
 
     if expose_system_info {
         println!("  Hostname sharing enabled (CONNLOG_EXPOSE_SYSTEM_INFO=true)");
+    }
+
+    if remote_reboot == Some(true) {
+        println!("  Remote reboot allowed (CONNLOG_ALLOW_REMOTE_REBOOT=true)");
+    } else {
+        println!(
+            "  Remote reboot off (to allow it: sudo connlog-agent config enable-remote-reboot)"
+        );
     }
 
     // Copy binary to /usr/local/bin
@@ -504,6 +539,7 @@ fn write_config(
     platform_url: &str,
     bmc: Option<&crate::features::bmc::BmcConfig>,
     expose_system_info: bool,
+    remote_reboot: Option<bool>,
 ) -> Result<()> {
     validate_env_value("CONNLOG_TOKEN", token)?;
     validate_env_value("CONNLOG_PLATFORM_URL", platform_url)?;
@@ -521,6 +557,10 @@ fn write_config(
 
     if expose_system_info {
         config.push_str("CONNLOG_EXPOSE_SYSTEM_INFO=\"true\"\n");
+    }
+
+    if let Some(allowed) = remote_reboot {
+        config.push_str(&format!("CONNLOG_ALLOW_REMOTE_REBOOT=\"{allowed}\"\n"));
     }
 
     // Persist BMC hardware-health settings so the installed systemd service
@@ -544,9 +584,99 @@ fn write_config(
     Ok(())
 }
 
-/// Create `/etc/connlog/agent.conf` if missing, set hostname sharing on, and
-/// restart the service so systemd reloads the EnvironmentFile.
-pub fn enable_hostname_sharing() -> Result<()> {
+/// Create `/etc/connlog/agent.conf` if missing, turn hostname sharing on or
+/// off, and restart the service so systemd reloads the EnvironmentFile.
+pub fn set_hostname_sharing(enabled: bool) -> Result<()> {
+    set_agent_conf_value(
+        "CONNLOG_EXPOSE_SYSTEM_INFO",
+        if enabled { "true" } else { "false" },
+    )
+}
+
+/// Share (or stop sharing) the previous boot's last warnings, then restart.
+pub fn set_postmortem_sharing(enabled: bool) -> Result<()> {
+    set_agent_conf_value(
+        "CONNLOG_SHARE_POSTMORTEM",
+        if enabled { "true" } else { "false" },
+    )
+}
+
+/// Allow or refuse remote reboot from the dashboard, then restart the service.
+pub fn set_remote_reboot(allowed: bool) -> Result<()> {
+    set_agent_conf_value(
+        "CONNLOG_ALLOW_REMOTE_REBOOT",
+        if allowed { "true" } else { "false" },
+    )
+}
+
+const AGENT_CONF_PATH: &str = "/etc/connlog/agent.conf";
+
+/// The explicit remote-reboot choice in the installed `agent.conf`, if any.
+/// Unreadable or missing means no choice (off).
+fn existing_conf_remote_reboot() -> Option<bool> {
+    read_agent_conf().and_then(|conf| conf_remote_reboot(&conf))
+}
+
+/// The reading the systemd hook's `grep` makes of the same file (see
+/// `SYSTEMD_SERVICE`): the last assignment wins, as it does for systemd.
+/// `Some(true)` only for a value the hook reboots on, `Some(false)` for an
+/// explicit refusal, `None` when there is no line or the value is neither
+/// (the hook refuses those too).
+fn conf_remote_reboot(conf: &str) -> Option<bool> {
+    conf_bool(conf, "CONNLOG_ALLOW_REMOTE_REBOOT")
+}
+
+/// Whether this host's `agent.conf` lets the dashboard reboot it, as the
+/// agent and the root hook read it: only an explicit true.
+pub fn conf_allows_remote_reboot(conf: &str) -> bool {
+    conf_remote_reboot(conf) == Some(true)
+}
+
+/// The installed `agent.conf`, when this process may read it (root only).
+pub fn read_agent_conf() -> Option<String> {
+    fs::read_to_string(AGENT_CONF_PATH).ok()
+}
+
+/// `key`'s value in an EnvironmentFile body: the last assignment wins, as
+/// for systemd; surrounding quotes are removed and backslash escapes (as
+/// `escape_env_value` writes them) undone.
+pub fn conf_value(conf: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    let raw = conf
+        .lines()
+        .rev()
+        .find_map(|line| line.trim().strip_prefix(prefix.as_str()))?
+        .trim();
+    let inner = raw
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(raw);
+    let mut value = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        value.push(if c == '\\' {
+            chars.next().unwrap_or(c)
+        } else {
+            c
+        });
+    }
+    Some(value)
+}
+
+/// `key` read as clap's boolish parser reads it; `None` when unset or not a
+/// boolean.
+pub fn conf_bool(conf: &str, key: &str) -> Option<bool> {
+    match conf_value(conf, key)?.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" | "y" | "t" => Some(true),
+        "false" | "0" | "no" | "off" | "n" | "f" => Some(false),
+        _ => None,
+    }
+}
+
+/// Create `/etc/connlog/agent.conf` if missing, upsert `key`, and restart the
+/// service so systemd reloads the EnvironmentFile. Token, URL and BMC keys are
+/// left as they are.
+fn set_agent_conf_value(key: &str, value: &str) -> Result<()> {
     if !is_root() {
         anyhow::bail!("This command requires root. Please run with sudo.");
     }
@@ -562,13 +692,13 @@ pub fn enable_hostname_sharing() -> Result<()> {
     } else {
         fs::read_to_string(path).context("Failed to read /etc/connlog/agent.conf")?
     };
-    let next = upsert_env_line(&existing, "CONNLOG_EXPOSE_SYSTEM_INFO", "true");
+    let next = upsert_env_line(&existing, key, value);
     write_agent_conf(&next)?;
 
     if created {
         println!("  Created /etc/connlog/agent.conf (600 root:root)");
     }
-    println!("  Set CONNLOG_EXPOSE_SYSTEM_INFO=true");
+    println!("  Set {key}={value}");
 
     restart_agent_service()
 }
@@ -807,6 +937,75 @@ mod tests {
     }
 
     #[test]
+    fn conf_value_reads_the_last_assignment_and_undoes_escapes() {
+        let conf = concat!(
+            "CONNLOG_TOKEN=\"agent_first\"\n",
+            "  CONNLOG_TOKEN=\"agent_second\"  \n",
+            "CONNLOG_PLATFORM_URL=https://x\n",
+        );
+        assert_eq!(
+            conf_value(conf, "CONNLOG_TOKEN").as_deref(),
+            Some("agent_second")
+        );
+        assert_eq!(
+            conf_value(conf, "CONNLOG_PLATFORM_URL").as_deref(),
+            Some("https://x")
+        );
+        assert_eq!(conf_value(conf, "CONNLOG_EXPOSE_SYSTEM_INFO"), None);
+        // What the writer escapes comes back as it was.
+        let secret = "p\"$`\\w";
+        let written = upsert_env_line("", "CONNLOG_BMC_PASSWORD", secret);
+        assert_eq!(
+            conf_value(&written, "CONNLOG_BMC_PASSWORD").as_deref(),
+            Some(secret)
+        );
+    }
+
+    #[test]
+    fn conf_bool_reads_like_clap() {
+        for (value, expected) in [
+            ("true", Some(true)),
+            ("\"YES\"", Some(true)),
+            ("1", Some(true)),
+            ("off", Some(false)),
+            ("\"0\"", Some(false)),
+            ("maybe", None),
+        ] {
+            let conf = format!("CONNLOG_SHARE_POSTMORTEM={value}\n");
+            assert_eq!(
+                conf_bool(&conf, "CONNLOG_SHARE_POSTMORTEM"),
+                expected,
+                "{value}"
+            );
+        }
+        assert_eq!(conf_bool("", "CONNLOG_SHARE_POSTMORTEM"), None);
+    }
+
+    #[test]
+    fn conf_remote_reboot_reading() {
+        for (conf, expected) in [
+            ("", None),
+            ("CONNLOG_TOKEN=\"t\"\n", None),
+            ("CONNLOG_ALLOW_REMOTE_REBOOT=\"false\"\n", Some(false)),
+            ("CONNLOG_ALLOW_REMOTE_REBOOT=0\n", Some(false)),
+            ("CONNLOG_ALLOW_REMOTE_REBOOT=\"true\"\n", Some(true)),
+            ("  CONNLOG_ALLOW_REMOTE_REBOOT=\"YES\"  \n", Some(true)),
+            ("CONNLOG_ALLOW_REMOTE_REBOOT=maybe\n", None),
+            // The last assignment wins, as for systemd's EnvironmentFile.
+            (
+                "CONNLOG_ALLOW_REMOTE_REBOOT=false\nCONNLOG_ALLOW_REMOTE_REBOOT=true\n",
+                Some(true),
+            ),
+            (
+                "CONNLOG_ALLOW_REMOTE_REBOOT=true\nCONNLOG_ALLOW_REMOTE_REBOOT=\"false\"\n",
+                Some(false),
+            ),
+        ] {
+            assert_eq!(conf_remote_reboot(conf), expected, "{conf:?}");
+        }
+    }
+
+    #[test]
     fn upsert_creates_file_body_when_empty() {
         assert_eq!(
             upsert_env_line("", "CONNLOG_EXPOSE_SYSTEM_INFO", "true"),
@@ -846,11 +1045,193 @@ mod tests {
         assert!(next.contains("CONNLOG_TOKEN=\"t\""));
     }
 
+    // ── The ExecStopPost hook, run ───────────────────────────────
+    //
+    // String checks cannot say whether the hook reboots, refuses or brings
+    // the agent back. These run the script bash would receive, against a
+    // scratch /run/connlog and /etc/connlog, with `systemctl` and
+    // `systemd-run` stubbed to record their arguments.
+
+    /// The ExecStopPost script as bash receives it: systemd joins continuation
+    /// lines (the backslash becomes a space), skips comment lines inside
+    /// them (`#` and `;` alike, which is why the hook has no `case ... ;;`),
+    /// and turns `$$` into `$`.
+    fn exec_stop_post_script() -> String {
+        const PREFIX: &str = "ExecStopPost=+/bin/bash -c '";
+        let start = SYSTEMD_SERVICE.find(PREFIX).expect("ExecStopPost hook");
+        let mut joined = String::new();
+        for line in SYSTEMD_SERVICE[start..].lines() {
+            let trimmed = line.trim_start();
+            if !joined.is_empty() && (trimmed.starts_with('#') || trimmed.starts_with(';')) {
+                continue;
+            }
+            match line.strip_suffix('\\') {
+                Some(head) => {
+                    joined.push_str(head);
+                    joined.push(' ');
+                }
+                None => {
+                    joined.push_str(line);
+                    break;
+                }
+            }
+        }
+        let script = joined
+            .strip_prefix(PREFIX)
+            .and_then(|rest| rest.strip_suffix('\''))
+            .expect("one single-quoted bash -c argument");
+        assert!(
+            !script.contains('\''),
+            "a quote would end the argument early"
+        );
+        assert!(
+            !script.contains('\\'),
+            "systemd unescapes backslashes; bash must see what the unit says"
+        );
+        assert!(
+            !script.replace("%%", "").contains('%'),
+            "a bare % is a systemd specifier"
+        );
+        script.replace("$$", "$")
+    }
+
+    struct HookRun {
+        calls: Vec<String>,
+        marker_left: bool,
+    }
+
+    fn run_reboot_hook(conf: Option<&str>, reboot_exit: u8, systemd_run_exit: u8) -> HookRun {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static RUN: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "connlog-hook-{}-{}",
+            std::process::id(),
+            RUN.fetch_add(1, Ordering::SeqCst)
+        ));
+        let (run, etc, bin) = (root.join("run"), root.join("etc"), root.join("bin"));
+        for dir in [&run, &etc, &bin] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(run.join(".reboot_requested"), "test").unwrap();
+        if let Some(conf) = conf {
+            fs::write(etc.join("agent.conf"), conf).unwrap();
+        }
+        let calls = root.join("calls");
+        for (stub, exit) in [
+            ("systemctl", reboot_exit),
+            ("systemd-run", systemd_run_exit),
+        ] {
+            let body = format!(
+                "#!/bin/sh\necho \"{stub} $*\" >> {calls}\nif [ \"{stub}\" = systemd-run ] || [ \"$1\" = reboot ]; then exit {exit}; fi\n",
+                calls = calls.display()
+            );
+            let path = bin.join(stub);
+            fs::write(&path, body).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let script = exec_stop_post_script()
+            .replace("/run/connlog", &run.display().to_string())
+            .replace("/etc/connlog", &etc.display().to_string());
+        let status = Command::new("/bin/bash")
+            .arg("-c")
+            .arg(&script)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .status()
+            .expect("run hook");
+        assert!(status.success(), "hook exited {status}");
+
+        let result = HookRun {
+            calls: fs::read_to_string(&calls)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect(),
+            marker_left: run.join(".reboot_requested").exists(),
+        };
+        let _ = fs::remove_dir_all(&root);
+        result
+    }
+
+    const ALLOWS_REBOOT: &str = "CONNLOG_ALLOW_REMOTE_REBOOT=\"true\"\n";
+
+    #[test]
+    fn reboot_hook_reboots_only_when_the_host_allows_it() {
+        for conf in [
+            ALLOWS_REBOOT,
+            "CONNLOG_ALLOW_REMOTE_REBOOT=1\n",
+            "  CONNLOG_ALLOW_REMOTE_REBOOT=\"YES\"  \n",
+            "CONNLOG_ALLOW_REMOTE_REBOOT=on\n",
+            // The last assignment wins.
+            "CONNLOG_ALLOW_REMOTE_REBOOT=false\nCONNLOG_ALLOW_REMOTE_REBOOT=true\n",
+        ] {
+            let run = run_reboot_hook(Some(conf), 0, 0);
+            assert_eq!(run.calls, ["systemctl reboot --no-block"], "{conf:?}");
+            assert!(!run.marker_left);
+            assert_eq!(
+                conf_remote_reboot(conf),
+                Some(true),
+                "the agent and the hook must read {conf:?} the same way"
+            );
+        }
+    }
+
+    #[test]
+    fn reboot_hook_refuses_unless_the_host_allows_it() {
+        for conf in [
+            None,
+            Some("CONNLOG_TOKEN=\"t\"\n"),
+            Some("CONNLOG_ALLOW_REMOTE_REBOOT=\"false\"\n"),
+            Some("CONNLOG_ALLOW_REMOTE_REBOOT=0\n"),
+            Some("  CONNLOG_ALLOW_REMOTE_REBOOT=\"FALSE\"  \n"),
+            Some("CONNLOG_ALLOW_REMOTE_REBOOT=maybe\n"),
+            Some("CONNLOG_ALLOW_REMOTE_REBOOT=\n"),
+            Some("CONNLOG_ALLOW_REMOTE_REBOOT=true\nCONNLOG_ALLOW_REMOTE_REBOOT=\"false\"\n"),
+        ] {
+            let run = run_reboot_hook(conf, 0, 0);
+            assert_eq!(
+                run.calls,
+                ["systemctl start --no-block connlog-agent"],
+                "{conf:?}"
+            );
+            assert!(!run.marker_left);
+            assert_ne!(
+                conf.and_then(conf_remote_reboot),
+                Some(true),
+                "the agent and the hook must read {conf:?} the same way"
+            );
+        }
+    }
+
+    #[test]
+    fn reboot_hook_falls_back_then_brings_the_agent_back() {
+        let run = run_reboot_hook(Some(ALLOWS_REBOOT), 1, 0);
+        assert_eq!(run.calls.len(), 2, "{:?}", run.calls);
+        assert!(run.calls[1].starts_with("systemd-run --collect --on-active=2s"));
+
+        let run = run_reboot_hook(Some(ALLOWS_REBOOT), 1, 1);
+        assert_eq!(run.calls.len(), 3, "{:?}", run.calls);
+        assert_eq!(run.calls[2], "systemctl start --no-block connlog-agent");
+    }
+
     // ── SYSTEMD_SERVICE invariants ──────────────────────────────
     //
     // The systemd unit is a string blob. These tests pin the security and
     // self-update properties that, if broken, would silently leave production
     // agents unable to update or expose them to privilege escalation.
+
+    #[test]
+    fn systemd_unit_collects_last_words_as_root_without_blocking_start() {
+        let line = SYSTEMD_SERVICE
+            .lines()
+            .find(|l| l.starts_with("ExecStartPre="))
+            .expect("ExecStartPre");
+        // `-`: a failure never blocks the start. `+`: root, for the journal.
+        assert_eq!(
+            line,
+            "ExecStartPre=-+/usr/local/bin/connlog-agent collect-postmortem"
+        );
+    }
 
     #[test]
     fn systemd_unit_runs_as_unprivileged_user() {

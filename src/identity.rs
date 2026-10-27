@@ -72,9 +72,40 @@ fn nibble(n: u8) -> char {
     }
 }
 
+/// The kernel's id for the current boot: a random UUID, new on every boot.
+///
+/// Sent as `X-Boot-Id` so the platform knows exactly when the host rebooted
+/// (a changed id) rather than inferring it from uptime. It identifies a boot,
+/// not a machine, so it is sent raw. `None` when unreadable or malformed.
+pub fn boot_id() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    let raw = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    #[cfg(not(target_os = "linux"))]
+    let raw = String::new();
+    parse_boot_id(&raw)
+}
+
+/// Normalise a boot id to lowercase 8-4-4-4-12 hex, or `None`.
+pub(crate) fn parse_boot_id(raw: &str) -> Option<String> {
+    let value = raw.trim().to_ascii_lowercase();
+    let well_formed = value.len() == 36
+        && value.char_indices().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
+        });
+    well_formed.then_some(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boot_id_of_this_host_is_well_formed_when_readable() {
+        if let Some(id) = boot_id() {
+            assert_eq!(parse_boot_id(&id).as_deref(), Some(id.as_str()));
+        }
+    }
 
     #[test]
     fn hash_is_64_hex_chars_when_available() {
