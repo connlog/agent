@@ -2,9 +2,10 @@
 //! the thread that keeps the platform's copy of the inventory current.
 //!
 //! Everything here is off unless the root-only `/etc/connlog/agent.conf`
-//! says `CONNLOG_NETWORK_MAP=true` (guarantee 1); the platform cannot turn it
-//! on, and a host with it off sends no inventory, runs no probes and says so
-//! in the `X-Network-Map` header. The site name and the extra ports are
+//! sets a discovery ceiling of `peers` or above (`features::discovery`; an
+//! older `CONNLOG_NETWORK_MAP=true` reads as `peers`), guarantee 1; the
+//! platform cannot turn it on, and a host with it off sends no inventory,
+//! runs no probes and says so in the `X-Network-Map` header. The site name and the extra ports are
 //! checked here: `install` and `config` refuse a bad value, the daemon warns
 //! once and carries on as if it were absent.
 //!
@@ -12,6 +13,8 @@
 //! heartbeat loop only ever hands it a message that cannot block: nothing
 //! the map does can delay or fail a heartbeat (guarantee 5).
 
+use std::collections::HashSet;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -20,8 +23,10 @@ use std::time::{Duration, Instant};
 use log::{info, warn};
 
 use crate::config::Config;
+use crate::features::discovery::{conf_ceiling, DiscoveryLevel, Granted, CONF_DISCOVERY};
 use crate::features::network_inventory::{self, Inventory};
 use crate::features::reachability::{self, ProbeRequest, Prober, SystemProber};
+use crate::features::sweep::{self, Asker, SweepRequest, SystemAsker};
 use crate::http::{ApiClient, ApiError};
 
 /// `X-Network-Map` on every heartbeat the daemon sends.
@@ -43,8 +48,8 @@ pub const MAX_EXTRA_PORTS: usize = 16;
 /// What the daemon runs with.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NetworkMapSettings {
-    /// CONNLOG_NETWORK_MAP: only an explicit true.
-    pub enabled: bool,
+    /// The host's discovery ceiling: the map runs at `peers` and above.
+    pub discovery: DiscoveryLevel,
     /// CONNLOG_NETWORK_SITE, when valid.
     pub site: Option<String>,
     /// CONNLOG_NETWORK_MAP_PORTS, when valid: sorted, no duplicates.
@@ -72,7 +77,7 @@ impl NetworkMapSettings {
             }
         };
         Self {
-            enabled: config.network_map_enabled(),
+            discovery: config.discovery_ceiling(),
             site,
             extra_ports,
             probe_public: config.probe_public == Some(true),
@@ -80,11 +85,18 @@ impl NetworkMapSettings {
     }
 }
 
-/// What `install` and `config enable-network-map` write. `None` leaves the
-/// host's existing line as it is (a reinstall keeps the host's choice).
+impl NetworkMapSettings {
+    /// Whether the host takes part in the map.
+    pub fn enabled(&self) -> bool {
+        self.discovery.network_map()
+    }
+}
+
+/// What `install` and `config` write. `None` leaves the host's existing line
+/// as it is (a reinstall keeps the host's choice).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ConfChoice {
-    pub enabled: Option<bool>,
+    pub discovery: Option<DiscoveryLevel>,
     pub site: Option<String>,
     pub ports: Option<Vec<u16>>,
     pub probe_public: Option<bool>,
@@ -99,8 +111,11 @@ impl ConfChoice {
             .map_err(|e| anyhow::anyhow!("--network-site: {e}"))?;
         let ports = parse_ports(config.network_map_ports.as_deref())
             .map_err(|e| anyhow::anyhow!("--network-map-ports: {e}"))?;
+        let discovery = config
+            .requested_discovery()
+            .map_err(|e| anyhow::anyhow!("--discovery: {e}"))?;
         Ok(Self {
-            enabled: config.requested_network_map(),
+            discovery,
             site,
             ports: (!ports.is_empty()).then_some(ports),
             probe_public: config.probe_public,
@@ -116,9 +131,11 @@ impl ConfChoice {
         };
         let value = |key: &str| crate::install::conf_value(conf, key);
         Self {
-            enabled: self
-                .enabled
-                .or_else(|| crate::install::conf_bool(conf, CONF_NETWORK_MAP)),
+            discovery: self.discovery.or_else(|| {
+                let set = crate::install::conf_value(conf, CONF_DISCOVERY).is_some()
+                    || crate::install::conf_bool(conf, CONF_NETWORK_MAP).is_some();
+                set.then(|| conf_ceiling(conf))
+            }),
             site: self.site.or_else(|| {
                 parse_site(value(CONF_NETWORK_SITE).as_deref())
                     .ok()
@@ -135,11 +152,14 @@ impl ConfChoice {
         }
     }
 
-    /// The agent.conf lines this choice writes, keys in a fixed order.
+    /// The agent.conf lines this choice writes, keys in a fixed order. A
+    /// level is written with the CONNLOG_NETWORK_MAP it implies, so the file
+    /// never says one thing in one line and another in the next.
     pub fn conf_lines(&self) -> Vec<(&'static str, String)> {
         let mut lines = Vec::new();
-        if let Some(enabled) = self.enabled {
-            lines.push((CONF_NETWORK_MAP, enabled.to_string()));
+        if let Some(level) = self.discovery {
+            lines.push((CONF_DISCOVERY, level.as_str().to_string()));
+            lines.push((CONF_NETWORK_MAP, level.network_map().to_string()));
         }
         if let Some(site) = &self.site {
             lines.push((CONF_NETWORK_SITE, site.clone()));
@@ -311,23 +331,61 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     out
 }
 
+/// What the inventory is read with: the level (the lower of the host's
+/// ceiling and what the console allows), and, when the platform takes
+/// observed connections (T11.1), the peers it named, all the peers level
+/// may send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ask {
+    pub level: DiscoveryLevel,
+    pub connections: Option<HashSet<IpAddr>>,
+}
+
+/// What the heartbeat answers asked for, beyond the level: whether the
+/// platform takes connections, and the peers its latest probe request named.
+#[derive(Debug, Default)]
+struct Asked {
+    connections: bool,
+    peers: HashSet<IpAddr>,
+}
+
 /// Where the inventory comes from: the host, or a fixed one in tests.
-pub type InventorySource = Arc<dyn Fn() -> Inventory + Send + Sync>;
+pub type InventorySource = Arc<dyn Fn(&Ask) -> Inventory + Send + Sync>;
 
 /// What the map reads and probes with: the host itself, or stand-ins.
 #[derive(Clone)]
 pub struct Sources {
     pub inventory: InventorySource,
     pub prober: Arc<dyn Prober>,
+    /// The multicast questions of a sweep (T12.1).
+    pub asker: Arc<dyn Asker + Send>,
 }
 
 impl Sources {
-    pub fn system(settings: &NetworkMapSettings) -> Self {
+    /// `base_url` is the platform's, the far end of the path traced at
+    /// `passive` (T8.4).
+    pub fn system(settings: &NetworkMapSettings, base_url: &str) -> Self {
         let site = settings.site.clone();
         let ports = settings.extra_ports.clone();
+        let base_url = base_url.to_string();
+        let cache = std::sync::Mutex::new(crate::features::trace::TraceCache::default());
         Self {
-            inventory: Arc::new(move || network_inventory::collect(site.clone(), &ports)),
+            inventory: Arc::new(move |ask: &Ask| {
+                let internet = || crate::features::trace::platform_address(&base_url);
+                let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+                network_inventory::collect(
+                    site.clone(),
+                    &ports,
+                    ask.level,
+                    Some(network_inventory::PathSource {
+                        cache: &mut cache,
+                        internet: &internet,
+                    }),
+                    ask.connections.as_ref(),
+                )
+            }),
             prober: Arc::new(SystemProber),
+            asker: Arc::new(SystemAsker),
         }
     }
 }
@@ -344,14 +402,36 @@ pub struct NetworkMap {
 
 struct Running {
     inventory: Option<mpsc::Sender<()>>,
-    probes: Option<ProbeLane>,
+    /// What the console allows, from the heartbeat answers.
+    granted: Granted,
+    asked: Arc<std::sync::Mutex<Asked>>,
+    probes: Option<Lane<ProbeRequest>>,
+    sweeps: Option<Lane<SweepRequest>>,
     started: bool,
 }
 
-/// The probe thread's inbox, and whether it is busy with a request.
-struct ProbeLane {
-    requests: mpsc::Sender<ProbeRequest>,
+/// A worker thread's inbox, and whether it is busy with a request.
+struct Lane<T> {
+    requests: mpsc::Sender<T>,
     busy: Arc<AtomicBool>,
+}
+
+impl<T> Lane<T> {
+    /// Hand a request over unless one is still running; then it is dropped.
+    fn offer(&self, request: T, what: &str, id: &str) {
+        if self
+            .busy
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            info!("Dropping {what} {id}: the previous one is still running");
+            return;
+        }
+        if self.requests.send(request).is_err() {
+            // The thread is gone; nothing will clear the flag but this.
+            self.busy.store(false, Ordering::SeqCst);
+        }
+    }
 }
 
 impl NetworkMap {
@@ -363,7 +443,7 @@ impl NetworkMap {
         token: String,
         stop: Arc<AtomicBool>,
     ) -> Self {
-        let sources = Sources::system(settings);
+        let sources = Sources::system(settings, &base_url);
         Self::start_with(settings, base_url, token, stop, sources)
     }
 
@@ -374,16 +454,21 @@ impl NetworkMap {
         stop: Arc<AtomicBool>,
         sources: Sources,
     ) -> Self {
-        if !settings.enabled {
+        if !settings.enabled() {
             return Self { running: None };
         }
 
         let (tx, rx) = mpsc::channel();
-        let (url, key, halt, source) = (
+        let granted = Granted::default();
+        let asked = Arc::new(std::sync::Mutex::new(Asked::default()));
+        let (url, key, halt, source, ceiling, allowed, wanted) = (
             base_url.clone(),
             token.clone(),
             Arc::clone(&stop),
             sources.inventory,
+            settings.discovery,
+            granted.clone(),
+            Arc::clone(&asked),
         );
         let inventory = thread::Builder::new()
             .name("network-inventory".into())
@@ -395,7 +480,7 @@ impl NetworkMap {
                         return;
                     }
                 };
-                inventory_loop(&client, &rx, &halt, &source);
+                inventory_loop(&client, &rx, &halt, &source, ceiling, &allowed, &wanted);
             })
             .map_err(|e| warn!("Network map inventory is off: could not start its thread ({e})"))
             .ok()
@@ -403,23 +488,88 @@ impl NetworkMap {
 
         let (tx, rx) = mpsc::channel();
         let busy = Arc::new(AtomicBool::new(false));
-        let (flag, prober, allow_public) =
-            (Arc::clone(&busy), sources.prober, settings.probe_public);
+        let (flag, prober, allow_public, url, key, halt) = (
+            Arc::clone(&busy),
+            Arc::clone(&sources.prober),
+            settings.probe_public,
+            base_url.clone(),
+            token.clone(),
+            Arc::clone(&stop),
+        );
         let probes = thread::Builder::new()
             .name("network-probes".into())
             .spawn(move || {
-                let client = match ApiClient::new(base_url, token) {
+                let client = match ApiClient::new(url, key) {
                     Ok(client) => client,
                     Err(e) => {
                         warn!("Network map probes are off: no HTTP client ({e})");
                         return;
                     }
                 };
-                probe_loop(&client, &rx, &stop, &flag, prober.as_ref(), allow_public);
+                probe_loop(&client, &rx, &halt, &flag, prober.as_ref(), allow_public);
             })
             .map_err(|e| warn!("Network map probes are off: could not start their thread ({e})"))
             .ok()
-            .map(|_| ProbeLane { requests: tx, busy });
+            .map(|_| Lane { requests: tx, busy });
+
+        // Sweeps (T12.1): their own thread, so a sweep never holds a probe up.
+        let (tx, rx) = mpsc::channel();
+        let busy = Arc::new(AtomicBool::new(false));
+        let (flag, prober, asker, ceiling, allowed, url, key, halt) = (
+            Arc::clone(&busy),
+            Arc::clone(&sources.prober),
+            Arc::clone(&sources.asker),
+            settings.discovery,
+            granted.clone(),
+            base_url,
+            token,
+            stop,
+        );
+        let sweeps = thread::Builder::new()
+            .name("network-sweeps".into())
+            .spawn(move || {
+                let client = match ApiClient::new(url, key) {
+                    Ok(client) => client,
+                    Err(e) => {
+                        warn!("Sweeps are off: no HTTP client ({e})");
+                        return;
+                    }
+                };
+                while let Ok(request) = rx.recv() {
+                    if halt.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let level = ceiling.min(allowed.get());
+                    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        sweep::run(
+                            &request,
+                            level,
+                            &sweep::own_addresses(),
+                            prober.as_ref(),
+                            asker.as_ref(),
+                        )
+                    }));
+                    match ran {
+                        Ok(results) => send_results(
+                            &client,
+                            sweep::SWEEPS_PATH,
+                            sweep::CONTENT_TYPE,
+                            &results.to_json(),
+                            &format!(
+                                "sweep results for {}: {} found",
+                                results.id,
+                                results.found.len()
+                            ),
+                            &halt,
+                        ),
+                        Err(_) => warn!("Running sweep {} panicked; dropped", request.id),
+                    }
+                    flag.store(false, Ordering::SeqCst);
+                }
+            })
+            .map_err(|e| warn!("Sweeps are off: could not start their thread ({e})"))
+            .ok()
+            .map(|_| Lane { requests: tx, busy });
 
         if allow_public {
             info!("Network map probes may reach public addresses (CONNLOG_PROBE_PUBLIC=true)");
@@ -427,7 +577,10 @@ impl NetworkMap {
         Self {
             running: Some(Running {
                 inventory,
+                granted,
+                asked,
                 probes,
+                sweeps,
                 started: false,
             }),
         }
@@ -442,35 +595,44 @@ impl NetworkMap {
     /// the inventory (the agent is known to the platform by then),
     /// `inventory_request` asks for a fresh one, and a `probe_request` is
     /// handed to the probe thread unless one is still running, in which case
-    /// it is dropped. Never blocks; does nothing with the flag off.
-    pub fn on_heartbeat(&mut self, inventory_request: bool, probe_request: Option<ProbeRequest>) {
+    /// it is dropped. `discovery` is what the console allows now; a change
+    /// reads the inventory again at once, so a level turned down stops
+    /// sending what it allowed on this heartbeat, not in 15 minutes. Never
+    /// blocks; does nothing with the flag off.
+    pub fn on_heartbeat(
+        &mut self,
+        inventory_request: bool,
+        probe_request: Option<ProbeRequest>,
+        sweep_request: Option<SweepRequest>,
+        discovery: Option<DiscoveryLevel>,
+        connections: bool,
+    ) {
         let Some(running) = self.running.as_mut() else {
             return;
         };
+        let mut changed = running.granted.set(discovery);
+        {
+            let mut asked = running.asked.lock().unwrap_or_else(|e| e.into_inner());
+            changed |= asked.connections != connections;
+            asked.connections = connections;
+            if let Some(request) = probe_request.as_ref().filter(|r| !r.peers.is_empty()) {
+                asked.peers = request.peers.iter().copied().collect();
+            }
+        }
         if let Some(inventory) = &running.inventory {
-            if !running.started || inventory_request {
+            if !running.started || inventory_request || changed {
                 let _ = inventory.send(());
             }
         }
         running.started = true;
 
-        let (Some(request), Some(lane)) = (probe_request, &running.probes) else {
-            return;
-        };
-        if lane
-            .busy
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            info!(
-                "Dropping probe request {}: the previous one is still running",
-                request.id
-            );
-            return;
+        if let (Some(request), Some(lane)) = (probe_request, &running.probes) {
+            let id = request.id.clone();
+            lane.offer(request, "probe request", &id);
         }
-        if lane.requests.send(request).is_err() {
-            // The thread is gone; nothing will clear the flag but this.
-            lane.busy.store(false, Ordering::SeqCst);
+        if let (Some(request), Some(lane)) = (sweep_request, &running.sweeps) {
+            let id = request.id.clone();
+            lane.offer(request, "sweep", &id);
         }
     }
 }
@@ -494,45 +656,57 @@ fn probe_loop(
             reachability::run(&request, allow_public, prober)
         }));
         match ran {
-            Ok(results) => {
-                let body = results.to_json();
-                for attempt in 1..=2 {
-                    let result = client.upload_network(
-                        reachability::PROBES_PATH,
-                        reachability::CONTENT_TYPE,
-                        body.clone(),
-                    );
-                    let retry = attempt == 1 && UploadOutcome::of(&result) == UploadOutcome::Failed;
-                    match result {
-                        Ok(accepted) => {
-                            info!(
-                                "Sent probe results for {}: {} results, {}",
-                                results.id,
-                                results.results.len(),
-                                if accepted { "accepted" } else { "not accepted" }
-                            );
-                            break;
-                        }
-                        Err(e) if retry => {
-                            warn!(
-                                "Probe results upload for {} failed, trying once more: {e}",
-                                results.id
-                            );
-                            if stop.load(Ordering::SeqCst) {
-                                return;
-                            }
-                            thread::sleep(PROBE_UPLOAD_RETRY_DELAY);
-                        }
-                        Err(e) => {
-                            warn!("Probe results upload for {} failed: {e}", results.id);
-                            break;
-                        }
-                    }
-                }
-            }
+            Ok(results) => send_results(
+                client,
+                reachability::PROBES_PATH,
+                reachability::CONTENT_TYPE,
+                &results.to_json(),
+                &format!(
+                    "probe results for {}: {} results",
+                    results.id,
+                    results.results.len()
+                ),
+                stop,
+            ),
             Err(_) => warn!("Running probe request {} panicked; dropped", request.id),
         }
         busy.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Results sent once: a delivery failure is tried once more, an answer
+/// from the platform, whatever it is, is final. `what` names them in the log.
+fn send_results(
+    client: &ApiClient,
+    path: &str,
+    content_type: &'static str,
+    body: &[u8],
+    what: &str,
+    stop: &AtomicBool,
+) {
+    for attempt in 1..=2 {
+        let result = client.upload_network(path, content_type, body.to_vec());
+        let retry = attempt == 1 && UploadOutcome::of(&result) == UploadOutcome::Failed;
+        match result {
+            Ok(accepted) => {
+                info!(
+                    "Sent {what}, {}",
+                    if accepted { "accepted" } else { "not accepted" }
+                );
+                return;
+            }
+            Err(e) if retry => {
+                warn!("Upload of {what} failed, trying once more: {e}");
+                if stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                thread::sleep(PROBE_UPLOAD_RETRY_DELAY);
+            }
+            Err(e) => {
+                warn!("Upload of {what} failed: {e}");
+                return;
+            }
+        }
     }
 }
 
@@ -544,6 +718,9 @@ fn inventory_loop(
     wake: &mpsc::Receiver<()>,
     stop: &AtomicBool,
     source: &InventorySource,
+    ceiling: DiscoveryLevel,
+    granted: &Granted,
+    asked: &std::sync::Mutex<Asked>,
 ) {
     if wake.recv().is_err() {
         return;
@@ -556,7 +733,14 @@ fn inventory_loop(
             return;
         }
         let mut wait = INVENTORY_INTERVAL;
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| source())) {
+        let ask = {
+            let asked = asked.lock().unwrap_or_else(|e| e.into_inner());
+            Ask {
+                level: ceiling.min(granted.get()),
+                connections: asked.connections.then(|| asked.peers.clone()),
+            }
+        };
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| source(&ask))) {
             Ok(inventory) => {
                 let body = inventory.to_json();
                 let hash = sha256(&body);
@@ -681,7 +865,7 @@ mod tests {
             "0,99999",
         ]);
         let settings = NetworkMapSettings::from_config(&cfg);
-        assert!(settings.enabled);
+        assert!(settings.enabled());
         assert_eq!(settings.site, None);
         assert!(settings.extra_ports.is_empty());
         assert!(!settings.probe_public);
@@ -710,6 +894,7 @@ mod tests {
         assert_eq!(
             choice.conf_lines(),
             vec![
+                (CONF_DISCOVERY, "peers".to_string()),
                 (CONF_NETWORK_MAP, "true".to_string()),
                 (CONF_NETWORK_SITE, "hq".to_string()),
                 (CONF_NETWORK_MAP_PORTS, "443,8443".to_string()),
@@ -724,7 +909,7 @@ mod tests {
         assert_eq!(
             kept,
             ConfChoice {
-                enabled: Some(true),
+                discovery: Some(DiscoveryLevel::Peers),
                 site: Some("dc-1".into()),
                 ports: Some(vec![443]),
                 probe_public: Some(false),
@@ -736,7 +921,7 @@ mod tests {
         }
         .or_existing(Some(conf));
         assert_eq!(changed.site.as_deref(), Some("hq"));
-        assert_eq!(changed.enabled, Some(true));
+        assert_eq!(changed.discovery, Some(DiscoveryLevel::Peers));
 
         let broken = ConfChoice::default().or_existing(Some(
             "CONNLOG_NETWORK_SITE=\"Head Office\"\nCONNLOG_NETWORK_MAP_PORTS=\"0\"\n",
@@ -838,7 +1023,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
         );
         assert!(!map.is_running());
-        map.on_heartbeat(true, None);
+        map.on_heartbeat(true, None, None, None, false);
     }
 
     #[test]
@@ -855,8 +1040,74 @@ mod tests {
                 value,
             ]);
             let settings = NetworkMapSettings::from_config(&cfg);
-            assert_eq!(settings.enabled, on, "{value}");
+            assert_eq!(settings.enabled(), on, "{value}");
             assert_eq!(settings.probe_public, on, "{value}");
         }
+    }
+
+    #[test]
+    fn a_discovery_level_sets_the_map_and_wins_over_the_older_flag() {
+        for (args, on) in [
+            (&["--discovery", "peers"][..], true),
+            (&["--discovery", "active"][..], true),
+            (&["--discovery", "off", "--network-map", "true"][..], false),
+            // A level that does not read leaves the older flag in charge.
+            (&["--discovery", "lots", "--network-map", "true"][..], true),
+            (&["--discovery", "lots"][..], false),
+        ] {
+            let cfg =
+                Config::parse_from(std::iter::once("connlog-agent").chain(args.iter().copied()));
+            assert_eq!(
+                NetworkMapSettings::from_config(&cfg).enabled(),
+                on,
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn install_writes_the_level_it_is_given_and_refuses_one_that_does_not_read() {
+        let parse = |args: &[&str]| {
+            ConfChoice::from_config(&Config::parse_from(
+                std::iter::once("connlog-agent").chain(args.iter().copied()),
+            ))
+        };
+        assert!(parse(&["install", "--discovery", "everything"]).is_err());
+        let lines = |args: &[&str]| parse(args).unwrap().conf_lines();
+        assert_eq!(
+            lines(&["install", "--discovery", "passive"]),
+            vec![
+                (CONF_DISCOVERY, "passive".to_string()),
+                (CONF_NETWORK_MAP, "true".to_string()),
+            ]
+        );
+        assert_eq!(
+            lines(&["install", "--discovery", "off"]),
+            vec![
+                (CONF_DISCOVERY, "off".to_string()),
+                (CONF_NETWORK_MAP, "false".to_string()),
+            ]
+        );
+        // --enable-network-map raises to peers, never lowers.
+        assert_eq!(
+            parse(&["install", "--discovery", "active", "--enable-network-map"])
+                .unwrap()
+                .discovery,
+            Some(DiscoveryLevel::Active)
+        );
+        assert_eq!(
+            parse(&["install", "--discovery", "off", "--enable-network-map"])
+                .unwrap()
+                .discovery,
+            Some(DiscoveryLevel::Peers)
+        );
+    }
+
+    #[test]
+    fn a_reinstall_keeps_the_hosts_level() {
+        let kept = ConfChoice::default().or_existing(Some("CONNLOG_DISCOVERY=\"passive\"\n"));
+        assert_eq!(kept.discovery, Some(DiscoveryLevel::Passive));
+        let none = ConfChoice::default().or_existing(Some("CONNLOG_TOKEN=\"agent_x\"\n"));
+        assert_eq!(none.discovery, None);
     }
 }

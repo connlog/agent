@@ -6,9 +6,12 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::endpoint_assignment::EndpointAssignmentResponse;
+use crate::features::checks::{CHECKS_DISABLED, CHECKS_ENABLED, CHECKS_HEADER};
+use crate::features::discovery::{DiscoveryLevel, DISCOVERY_HEADER};
 use crate::features::heartbeat_telemetry::{
     new_request_id, ErrorCategory, EventBuilder, EventType, HeartbeatTelemetry, HB_LOG_TARGET,
 };
+use crate::features::integrations::{COLLECTOR_DISABLED, COLLECTOR_ENABLED, COLLECTOR_HEADER};
 use crate::features::network_map::{NETWORK_MAP_DISABLED, NETWORK_MAP_ENABLED, NETWORK_MAP_HEADER};
 use crate::features::quick_actions::{
     QuickActionRequest, QuickActionResultPayload, QuickActionsManifestPayload,
@@ -33,6 +36,9 @@ pub const REMOTE_REBOOT_DISABLED: &str = "disabled";
 /// The host-side settings in agent.conf, as on/off values only
 /// (`HostSettings`). Remote reboot keeps its own header.
 pub const HOST_SETTINGS_HEADER: &str = "X-Host-Settings";
+/// How the agent was installed, and so how it is updated
+/// (`platform::Packaging`): `systemd` or `docker`.
+pub const PACKAGING_HEADER: &str = "X-Packaging";
 
 /// What this host's root-only agent.conf turns on, reported so the console
 /// can show it. Never the file itself: it holds the token and the BMC
@@ -156,8 +162,15 @@ pub struct ApiClient {
     remote_reboot_allowed: Option<bool>,
     /// `None` until the daemon says, for the same reason.
     host_settings: Option<HostSettings>,
-    /// CONNLOG_NETWORK_MAP (`X-Network-Map`); `None` until the daemon says.
-    network_map_enabled: Option<bool>,
+    /// The discovery ceiling (`X-Discovery`, and `X-Network-Map` for the
+    /// consoles that read only that); `None` until the daemon says.
+    discovery: Option<DiscoveryLevel>,
+    /// CONNLOG_CHECKS (`X-Checks`); `None` until the daemon says.
+    checks_enabled: Option<bool>,
+    /// CONNLOG_COLLECTOR (`X-Collector`); `None` until the daemon says.
+    collector_enabled: Option<bool>,
+    /// `X-Packaging`; `None` until the daemon says.
+    packaging: Option<crate::platform::Packaging>,
     /// What became of the last reboot request, sent until a heartbeat is
     /// accepted (`features::remote_reboot`).
     reboot_report: Mutex<Option<RebootReport>>,
@@ -273,7 +286,10 @@ impl ApiClient {
             boot_id: crate::identity::boot_id(),
             remote_reboot_allowed: None,
             host_settings: None,
-            network_map_enabled: None,
+            discovery: None,
+            checks_enabled: None,
+            collector_enabled: None,
+            packaging: None,
             reboot_report: Mutex::new(None),
             heartbeat_url: Mutex::new(heartbeat_url),
             telemetry: None,
@@ -298,10 +314,28 @@ impl ApiClient {
         self.host_settings = Some(settings);
     }
 
-    /// Report whether this host takes part in the network map on every
-    /// heartbeat (`X-Network-Map`).
-    pub fn set_network_map_enabled(&mut self, enabled: bool) {
-        self.network_map_enabled = Some(enabled);
+    /// Report the host's discovery ceiling on every heartbeat
+    /// (`X-Discovery`), and whether that puts it in the network map
+    /// (`X-Network-Map`).
+    /// Report whether this host runs the checks ConnLog assigns, on every
+    /// heartbeat (`X-Checks`).
+    pub fn set_checks_enabled(&mut self, enabled: bool) {
+        self.checks_enabled = Some(enabled);
+    }
+
+    /// Whether this host is a collector, said on every heartbeat (`X-Collector`).
+    pub fn set_collector_enabled(&mut self, enabled: bool) {
+        self.collector_enabled = Some(enabled);
+    }
+
+    /// How this agent is installed and updated, said on every heartbeat
+    /// (`X-Packaging`), so the console offers a new image, not an update.
+    pub fn set_packaging(&mut self, packaging: crate::platform::Packaging) {
+        self.packaging = Some(packaging);
+    }
+
+    pub fn set_discovery(&mut self, level: DiscoveryLevel) {
+        self.discovery = Some(level);
     }
 
     /// Queue (or, with `None`, clear) the reboot report for the next heartbeats.
@@ -524,10 +558,40 @@ impl ApiClient {
             );
         }
 
-        if let Some(enabled) = self.network_map_enabled {
+        if let Some(enabled) = self.checks_enabled {
+            headers.insert(
+                CHECKS_HEADER,
+                HeaderValue::from_static(if enabled {
+                    CHECKS_ENABLED
+                } else {
+                    CHECKS_DISABLED
+                }),
+            );
+        }
+
+        if let Some(enabled) = self.collector_enabled {
+            headers.insert(
+                COLLECTOR_HEADER,
+                HeaderValue::from_static(if enabled {
+                    COLLECTOR_ENABLED
+                } else {
+                    COLLECTOR_DISABLED
+                }),
+            );
+        }
+
+        if let Some(packaging) = self.packaging {
+            headers.insert(
+                PACKAGING_HEADER,
+                HeaderValue::from_static(packaging.as_str()),
+            );
+        }
+
+        if let Some(level) = self.discovery {
+            headers.insert(DISCOVERY_HEADER, HeaderValue::from_static(level.as_str()));
             headers.insert(
                 NETWORK_MAP_HEADER,
-                HeaderValue::from_static(if enabled {
+                HeaderValue::from_static(if level.network_map() {
                     NETWORK_MAP_ENABLED
                 } else {
                     NETWORK_MAP_DISABLED
@@ -1761,6 +1825,61 @@ mod shared_fixtures {
                 json["inventory_request"].as_bool().unwrap_or(false),
                 "{description}"
             );
+            assert_eq!(
+                resp.discovery.map(|level| level.as_str()),
+                json["discovery"].as_str(),
+                "{description}"
+            );
+            assert_eq!(
+                resp.connections,
+                json["connections"].as_bool().unwrap_or(false),
+                "{description}"
+            );
+            assert_eq!(
+                resp.integrations,
+                json["integrations"].as_bool().unwrap_or(false),
+                "{description}"
+            );
+            assert_eq!(
+                resp.device_names,
+                json["device_names"].as_bool().unwrap_or(false),
+                "{description}"
+            );
+            assert_eq!(
+                resp.sweep_request.as_ref().map(|r| r.subnet()),
+                json["sweep_request"]["subnet"].as_str().map(String::from),
+                "{description}"
+            );
+            assert_eq!(
+                resp.probe_request
+                    .as_ref()
+                    .map(|p| p.peers.iter().map(ToString::to_string).collect::<Vec<_>>())
+                    .unwrap_or_default(),
+                json["probe_request"]["peers"]
+                    .as_array()
+                    .map(|p| p
+                        .iter()
+                        .map(|a| a.as_str().unwrap().to_string())
+                        .collect::<Vec<_>>())
+                    .unwrap_or_default(),
+                "{description}"
+            );
+            assert_eq!(
+                resp.check_request.as_ref().map(|r| (
+                    r.id.clone(),
+                    r.checks.iter().map(|c| c.id.clone()).collect::<Vec<_>>()
+                )),
+                json["check_request"].as_object().map(|r| (
+                    r["id"].as_str().unwrap().to_string(),
+                    r["checks"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|c| c["id"].as_str().unwrap().to_string())
+                        .collect::<Vec<_>>()
+                )),
+                "{description}"
+            );
             let probes =
                 |id: &str, targets: Vec<(String, Vec<u64>, bool)>| (id.to_string(), targets);
             assert_eq!(
@@ -1846,6 +1965,19 @@ mod shared_fixtures {
             }
             .header_value()
         }
+        const PACKAGINGS: [&str; 3] = {
+            let all = crate::platform::Packaging::ALL;
+            [all[0].as_str(), all[1].as_str(), all[2].as_str()]
+        };
+        const DISCOVERY_LEVELS: [&str; 4] = {
+            let all = super::DiscoveryLevel::ALL;
+            [
+                all[0].as_str(),
+                all[1].as_str(),
+                all[2].as_str(),
+                all[3].as_str(),
+            ]
+        };
         let sent: Vec<(&str, Sent)> = vec![
             (
                 super::BOOT_ID_HEADER,
@@ -1861,10 +1993,20 @@ mod shared_fixtures {
                 super::NETWORK_MAP_HEADER,
                 Sent::OneOf(&[super::NETWORK_MAP_ENABLED, super::NETWORK_MAP_DISABLED]),
             ),
+            (super::DISCOVERY_HEADER, Sent::OneOf(&DISCOVERY_LEVELS)),
+            (
+                super::CHECKS_HEADER,
+                Sent::OneOf(&[super::CHECKS_ENABLED, super::CHECKS_DISABLED]),
+            ),
+            (
+                super::COLLECTOR_HEADER,
+                Sent::OneOf(&[super::COLLECTOR_ENABLED, super::COLLECTOR_DISABLED]),
+            ),
             (
                 super::REBOOT_MESSAGE_HEADER,
                 Sent::Parsed(crate::features::remote_reboot::sanitize_message),
             ),
+            (super::PACKAGING_HEADER, Sent::OneOf(&PACKAGINGS)),
         ];
 
         let all = fixtures(HEADERS);

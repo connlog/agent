@@ -45,7 +45,9 @@ reports another version; check it yourself anyway (step 4).
 
 ## Prerequisites
 
-- All changes you want to ship are merged into `canary` via PR with CI green.
+- All changes you want to ship are merged into `canary` via PR, with `pnpm agent:check` passing.
+  The release workflow in `connlog/agent` runs the checks again (fmt, clippy, tests, the size
+  budget, the signing-key refusal, cargo deny, FreeBSD) and builds nothing if one fails.
 - You can approve the `release` environment on `connlog/agent` (signing).
 - The `agent-mirror` environment on `connlog/platform` holds
   `AGENT_MIRROR_TOKEN` (docs/migration/PLAN.md G.1, item 6).
@@ -81,7 +83,7 @@ On a branch from `canary`:
 
 Commit as `chore(agent): release vX.Y.Z`, run `pnpm agent:check` and the
 release build (`./target/release/connlog-agent --version` must print X.Y.Z),
-open the pull request and merge it when CI is green. A feature PR may carry
+open the pull request and merge it. A feature PR may carry
 the bump itself.
 
 ### 3. Ship the platform side first

@@ -440,10 +440,11 @@ fn heartbeat_sends_host_settings_once_set() {
     );
 }
 
-/// `X-Network-Map` carries the host's CONNLOG_NETWORK_MAP, and only once the
-/// daemon has set it.
+/// `X-Discovery` carries the host's discovery ceiling and `X-Network-Map`
+/// whether that puts it in the map, and only once the daemon has set it.
 #[test]
-fn heartbeat_sends_the_network_map_setting_once_set() {
+fn heartbeat_sends_the_discovery_ceiling_once_set() {
+    use crate::features::discovery::DiscoveryLevel;
     let body =
         br#"{"ok":true,"server_time":"2026-04-30T00:00:00Z","expected_interval_seconds":60}"#
             .to_vec();
@@ -451,14 +452,23 @@ fn heartbeat_sends_the_network_map_setting_once_set() {
     let (base, rx) = one_shot_server("200 OK", body.clone());
     let client = ApiClient::new(base, "test-token".into()).expect("ApiClient::new");
     client.send_heartbeat(&make_payload(), None).expect("ok");
-    assert_eq!(recv_request(&rx).header("X-Network-Map"), None);
+    let request = recv_request(&rx);
+    assert_eq!(request.header("X-Network-Map"), None);
+    assert_eq!(request.header("X-Discovery"), None);
 
-    for (enabled, sent) in [(true, "enabled"), (false, "disabled")] {
+    for (level, map) in [
+        (DiscoveryLevel::Off, "disabled"),
+        (DiscoveryLevel::Peers, "enabled"),
+        (DiscoveryLevel::Passive, "enabled"),
+        (DiscoveryLevel::Active, "enabled"),
+    ] {
         let (base, rx) = one_shot_server("200 OK", body.clone());
         let mut client = ApiClient::new(base, "test-token".into()).expect("ApiClient::new");
-        client.set_network_map_enabled(enabled);
+        client.set_discovery(level);
         client.send_heartbeat(&make_payload(), None).expect("ok");
-        assert_eq!(recv_request(&rx).header("X-Network-Map"), Some(sent));
+        let request = recv_request(&rx);
+        assert_eq!(request.header("X-Network-Map"), Some(map));
+        assert_eq!(request.header("X-Discovery"), Some(level.as_str()));
     }
 }
 
@@ -1088,8 +1098,9 @@ const ACCEPTED: &[u8] = br#"{"ok":true,"data":{"accepted":true}}"#;
 /// The map's sources for a test: a fixed inventory, and real probes.
 fn fixed_sources() -> crate::features::network_map::Sources {
     crate::features::network_map::Sources {
-        inventory: std::sync::Arc::new(fixed_inventory),
+        inventory: std::sync::Arc::new(|_: &crate::features::network_map::Ask| fixed_inventory()),
         prober: std::sync::Arc::new(crate::features::reachability::SystemProber),
+        asker: std::sync::Arc::new(crate::features::sweep::SystemAsker),
     }
 }
 
@@ -1103,6 +1114,7 @@ fn fixed_inventory() -> crate::features::network_inventory::Inventory {
                 loopback: false,
                 ip: "10.0.10.5".parse().unwrap(),
                 prefix_length: 24,
+                vlan: None,
             }],
             &[("0.0.0.0".parse().unwrap(), 22)],
             None,
@@ -1119,7 +1131,7 @@ fn an_opted_in_host_sends_its_inventory_after_the_first_heartbeat() {
     use crate::features::network_map::{NetworkMap, NetworkMapSettings};
     let (base, rx) = routing_server(vec![("/api/agents/inventory", "200 OK", ACCEPTED.to_vec())]);
     let settings = NetworkMapSettings {
-        enabled: true,
+        discovery: crate::features::discovery::DiscoveryLevel::Peers,
         ..NetworkMapSettings::default()
     };
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1135,7 +1147,7 @@ fn an_opted_in_host_sends_its_inventory_after_the_first_heartbeat() {
         "nothing before the first accepted heartbeat"
     );
 
-    map.on_heartbeat(false, None);
+    map.on_heartbeat(false, None, None, None, false);
     let req = recv_request(&rx);
     assert_eq!(req.method, "POST");
     assert_eq!(req.path, "/api/agents/inventory");
@@ -1159,9 +1171,125 @@ fn an_opted_in_host_sends_its_inventory_after_the_first_heartbeat() {
     );
 
     // Later heartbeats without a request send nothing more.
-    map.on_heartbeat(false, None);
+    map.on_heartbeat(false, None, None, None, false);
     assert!(drain_requests(&rx, Duration::from_millis(300)).is_empty());
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// T8.2: the inventory is read at the lower of the host's ceiling and what
+/// the console allows, and a change of either reads it again at once. A
+/// console asking for more than the host allows gets the host's ceiling.
+#[test]
+fn the_inventory_is_read_at_the_lower_of_ceiling_and_console() {
+    use crate::features::discovery::DiscoveryLevel;
+    use crate::features::network_map::{NetworkMap, NetworkMapSettings, Sources};
+    use std::sync::{Arc, Mutex};
+
+    for (ceiling, answers, read) in [
+        (
+            DiscoveryLevel::Passive,
+            vec![
+                None,
+                Some(DiscoveryLevel::Passive),
+                Some(DiscoveryLevel::Peers),
+            ],
+            vec![
+                DiscoveryLevel::Peers,
+                DiscoveryLevel::Passive,
+                DiscoveryLevel::Peers,
+            ],
+        ),
+        (
+            DiscoveryLevel::Peers,
+            vec![None, Some(DiscoveryLevel::Active)],
+            vec![DiscoveryLevel::Peers],
+        ),
+    ] {
+        let (base, rx) =
+            routing_server(vec![("/api/agents/inventory", "200 OK", ACCEPTED.to_vec())]);
+        let levels = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&levels);
+        let sources = Sources {
+            inventory: Arc::new(move |ask: &crate::features::network_map::Ask| {
+                seen.lock().unwrap().push(ask.level);
+                fixed_inventory()
+            }),
+            ..fixed_sources()
+        };
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut map = NetworkMap::start_with(
+            &NetworkMapSettings {
+                discovery: ceiling,
+                ..NetworkMapSettings::default()
+            },
+            base,
+            "test-token".into(),
+            stop.clone(),
+            sources,
+        );
+        for answer in answers {
+            map.on_heartbeat(false, None, None, answer, false);
+            let _ = drain_requests(&rx, Duration::from_millis(300));
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut got = levels.lock().unwrap().clone();
+        got.dedup();
+        assert_eq!(got, read, "ceiling {ceiling:?}");
+    }
+}
+
+/// T11.1: connections are read only while the platform asks for them, and
+/// with the peers its latest probe request named.
+#[test]
+fn connections_are_read_only_when_the_platform_asks() {
+    use crate::features::discovery::DiscoveryLevel;
+    use crate::features::network_map::{Ask, NetworkMap, NetworkMapSettings, Sources};
+    use crate::features::reachability::ProbeRequest;
+    use std::sync::{Arc, Mutex};
+
+    let (base, rx) = routing_server(vec![
+        ("/api/agents/inventory", "200 OK", ACCEPTED.to_vec()),
+        ("/api/agents/probes", "200 OK", ACCEPTED.to_vec()),
+    ]);
+    let asks = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&asks);
+    let sources = Sources {
+        inventory: Arc::new(move |ask: &Ask| {
+            seen.lock().unwrap().push(ask.connections.clone());
+            fixed_inventory()
+        }),
+        ..fixed_sources()
+    };
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut map = NetworkMap::start_with(
+        &NetworkMapSettings {
+            discovery: DiscoveryLevel::Peers,
+            ..NetworkMapSettings::default()
+        },
+        base,
+        "test-token".into(),
+        stop.clone(),
+        sources,
+    );
+    map.on_heartbeat(false, None, None, None, false);
+    let _ = drain_requests(&rx, Duration::from_millis(300));
+    let request = ProbeRequest::from_json(&serde_json::json!({
+        "id": "prb_1",
+        "targets": [],
+        "peers": ["10.0.10.7", "10.0.10.9"]
+    }));
+    map.on_heartbeat(false, request, None, None, true);
+    let _ = drain_requests(&rx, Duration::from_millis(300));
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let got = asks.lock().unwrap().clone();
+    assert_eq!(got.first(), Some(&None), "not asked: none read");
+    let named: std::collections::HashSet<std::net::IpAddr> =
+        ["10.0.10.7".parse().unwrap(), "10.0.10.9".parse().unwrap()].into();
+    assert_eq!(
+        got.last(),
+        Some(&Some(named)),
+        "asked: with the peers named"
+    );
 }
 
 /// Guarantee 1: with the flag off, no heartbeat answer makes the agent send
@@ -1177,8 +1305,8 @@ fn a_host_that_has_not_opted_in_sends_no_inventory() {
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         fixed_sources(),
     );
-    map.on_heartbeat(true, None);
-    map.on_heartbeat(true, None);
+    map.on_heartbeat(true, None, None, None, false);
+    map.on_heartbeat(true, None, None, None, false);
     assert!(drain_requests(&rx, Duration::from_millis(500)).is_empty());
 }
 
@@ -1230,7 +1358,7 @@ fn network_map_settings(
     probe_public: bool,
 ) -> crate::features::network_map::NetworkMapSettings {
     crate::features::network_map::NetworkMapSettings {
-        enabled,
+        discovery: crate::features::discovery::DiscoveryLevel::from_network_map(Some(enabled)),
         probe_public,
         ..Default::default()
     }
@@ -1281,7 +1409,13 @@ fn a_heartbeat_with_a_probe_request_yields_exactly_one_results_upload() {
         stop.clone(),
         fixed_sources(),
     );
-    map.on_heartbeat(resp.inventory_request, resp.probe_request);
+    map.on_heartbeat(
+        resp.inventory_request,
+        resp.probe_request,
+        None,
+        None,
+        false,
+    );
 
     let uploads = probe_uploads(&drain_requests(&rx, Duration::from_millis(1500)));
     assert_eq!(uploads.len(), 1, "exactly one results upload");
@@ -1319,7 +1453,7 @@ fn a_public_target_is_reported_skipped_and_never_touched() {
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         fixed_sources(),
     );
-    map.on_heartbeat(false, request);
+    map.on_heartbeat(false, request, None, None, false);
 
     let uploads = probe_uploads(&drain_requests(&rx, Duration::from_millis(1000)));
     assert_eq!(uploads.len(), 1);
@@ -1364,17 +1498,20 @@ fn a_probe_request_arriving_while_one_runs_is_dropped() {
         "test-token".into(),
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         Sources {
-            inventory: std::sync::Arc::new(fixed_inventory),
+            inventory: std::sync::Arc::new(|_: &crate::features::network_map::Ask| {
+                fixed_inventory()
+            }),
             prober: std::sync::Arc::new(Slow),
+            asker: std::sync::Arc::new(crate::features::sweep::SystemAsker),
         },
     );
-    map.on_heartbeat(false, request("prb_first"));
-    map.on_heartbeat(false, request("prb_dropped"));
+    map.on_heartbeat(false, request("prb_first"), None, None, false);
+    map.on_heartbeat(false, request("prb_dropped"), None, None, false);
     let uploads = probe_uploads(&drain_requests(&rx, Duration::from_millis(1000)));
     assert_eq!(uploads.len(), 1);
     assert_eq!(uploads[0]["id"], "prb_first");
 
-    map.on_heartbeat(false, request("prb_next"));
+    map.on_heartbeat(false, request("prb_next"), None, None, false);
     let uploads = probe_uploads(&drain_requests(&rx, Duration::from_millis(1000)));
     assert_eq!(uploads.len(), 1);
     assert_eq!(uploads[0]["id"], "prb_next");
@@ -1413,7 +1550,13 @@ fn with_the_flag_off_nothing_is_probed_or_uploaded() {
         fixed_sources(),
     );
     for _ in 0..3 {
-        map.on_heartbeat(resp.inventory_request, resp.probe_request.clone());
+        map.on_heartbeat(
+            resp.inventory_request,
+            resp.probe_request.clone(),
+            None,
+            None,
+            false,
+        );
     }
     assert!(drain_requests(&rx, Duration::from_millis(1500)).is_empty());
     assert_eq!(connections_seen(&target), 0);
@@ -1445,4 +1588,84 @@ fn heartbeat_reads_probe_request_leniently() {
             "{field}"
         );
     }
+}
+
+/// T12.1: a host below `active` (here, at `peers` by its own conf) answers a
+/// sweep request with `not-active` and sends nothing on the network: the
+/// prober and the multicast asker would panic if asked.
+#[test]
+fn a_sweep_below_active_is_refused_without_a_packet() {
+    struct Silent;
+    impl crate::features::reachability::Prober for Silent {
+        fn tcp(
+            &self,
+            _: std::net::SocketAddr,
+            _: Duration,
+        ) -> crate::features::reachability::Probe {
+            panic!("no handshake below active")
+        }
+        fn echo(&self, _: std::net::IpAddr, _: Duration) -> crate::features::reachability::Probe {
+            panic!("no echo below active")
+        }
+    }
+    impl crate::features::sweep::Asker for Silent {
+        fn ask(
+            &self,
+            _: std::net::Ipv4Addr,
+            _: std::net::SocketAddrV4,
+            _: &[u8],
+            _: Duration,
+        ) -> Vec<(std::net::Ipv4Addr, Vec<u8>)> {
+            panic!("no multicast below active")
+        }
+        fn answered_arp(&self) -> Vec<std::net::Ipv4Addr> {
+            panic!("nothing read below active")
+        }
+    }
+    use crate::features::network_map::{NetworkMap, Sources};
+    let (base, rx) = routing_server(vec![
+        ("/api/agents/sweeps", "200 OK", ACCEPTED.to_vec()),
+        ("/api/agents/inventory", "200 OK", ACCEPTED.to_vec()),
+    ]);
+    let mut map = NetworkMap::start_with(
+        &network_map_settings(true, false),
+        base,
+        "test-token".into(),
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        Sources {
+            inventory: std::sync::Arc::new(|_: &crate::features::network_map::Ask| {
+                fixed_inventory()
+            }),
+            prober: std::sync::Arc::new(Silent),
+            asker: std::sync::Arc::new(Silent),
+        },
+    );
+    let request = crate::features::sweep::SweepRequest::from_json(&serde_json::json!({
+        "id": "swp_sim", "subnet": "10.0.20.0/24", "ports": [22, 443], "mdns": true, "ssdp": true
+    }));
+    map.on_heartbeat(
+        false,
+        None,
+        request,
+        Some(crate::features::discovery::DiscoveryLevel::Active),
+        false,
+    );
+    let sent: Vec<serde_json::Value> = drain_requests(&rx, Duration::from_millis(1000))
+        .iter()
+        .filter(|r| r.path == "/api/agents/sweeps")
+        .map(|r| {
+            assert_eq!(
+                r.header("Content-Type"),
+                Some("application/vnd.connlog.sweeps.v1+json")
+            );
+            serde_json::from_slice(&r.body).expect("results are JSON")
+        })
+        .collect();
+    assert_eq!(
+        sent,
+        [serde_json::json!({
+            "version": 1, "id": "swp_sim", "subnet": "10.0.20.0/24",
+            "refused": "not-active", "found": []
+        })]
+    );
 }

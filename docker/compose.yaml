@@ -1,0 +1,32 @@
+# The ConnLog agent on a host that runs Docker (docs/topology/PLAN.md, T13.1).
+#
+#   CONNLOG_TOKEN=<your token> docker compose up -d
+#
+# The token comes from the server's page in ConnLog. Every setting is an
+# environment variable with the name agent.conf uses on a systemd install;
+# change one here and run `docker compose up -d` again. A new image is the
+# update: `docker compose pull && docker compose up -d`.
+services:
+  connlog-agent:
+    image: ghcr.io/connlog/agent:1
+    restart: unless-stopped
+    # The host's network: its addresses, neighbours, connections and
+    # listening ports are what the agent reports, not the container's.
+    network_mode: host
+    environment:
+      CONNLOG_TOKEN: ${CONNLOG_TOKEN:?set CONNLOG_TOKEN to the token from ConnLog}
+      # Map this network from here (off, peers, passive or active); the
+      # console chooses at or below it.
+      CONNLOG_DISCOVERY: ${CONNLOG_DISCOVERY:-off}
+    volumes:
+      # The host's root, read-only: its disks and its machine id.
+      - /:/host:ro,rslave
+      - connlog-state:/var/lib/connlog
+      - connlog-integrations:/etc/connlog/integrations.d
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+volumes:
+  connlog-state:
+  connlog-integrations:

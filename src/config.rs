@@ -1,6 +1,8 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::fmt;
 
+use crate::features::discovery::{parse_discovery, DiscoveryLevel, CONF_DISCOVERY};
+
 #[derive(Parser)]
 #[command(name = "connlog-agent")]
 #[command(about = "ConnLog monitoring agent")]
@@ -152,10 +154,60 @@ pub struct Config {
     )]
     pub network_map: Option<bool>,
 
-    /// With `install`: write CONNLOG_NETWORK_MAP=true, so this host takes
-    /// part in the network map (its workspace must turn the map on too).
+    /// With `install`: write CONNLOG_DISCOVERY=peers (at least), so this host
+    /// takes part in the network map (its workspace must turn the map on too).
     #[arg(long = "enable-network-map", global = true)]
     pub enable_network_map: bool,
+
+    /// With `install`: map this host's network from here, the one question
+    /// the installer asks (T13.4): write CONNLOG_DISCOVERY=active. ConnLog's
+    /// console still chooses at or below it, and the workspace's "Map
+    /// networks automatically" decides whether it does so by itself.
+    #[arg(long = "map-network", global = true)]
+    pub map_network: bool,
+
+    /// Whether this host runs the checks ConnLog assigns (CONNLOG_CHECKS):
+    /// ping, TCP, HTTP(S) and DNS checks of devices without an agent. Off
+    /// unless set to true.
+    #[arg(
+        long = "checks",
+        env = "CONNLOG_CHECKS",
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new(),
+        global = true,
+        hide = true
+    )]
+    pub checks: Option<bool>,
+
+    /// With `install`: write CONNLOG_CHECKS=true, so this host runs the
+    /// checks ConnLog assigns.
+    #[arg(long = "enable-checks", global = true)]
+    pub enable_checks: bool,
+
+    /// Whether this host is a collector (CONNLOG_COLLECTOR): it reads the
+    /// integrations in /etc/connlog/integrations.d and reports them. Off
+    /// unless set to true.
+    #[arg(
+        long = "collector",
+        env = "CONNLOG_COLLECTOR",
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new(),
+        global = true,
+        hide = true
+    )]
+    pub collector: Option<bool>,
+
+    /// How much this host may find out about its network (CONNLOG_DISCOVERY):
+    /// off, peers (the network map), passive or active. The ceiling the
+    /// console chooses under; read as text and checked by
+    /// `features::discovery`, like the site and ports.
+    #[arg(
+        long = "discovery",
+        env = "CONNLOG_DISCOVERY",
+        global = true,
+        value_name = "LEVEL"
+    )]
+    pub discovery: Option<String>,
 
     /// Network map site name (CONNLOG_NETWORK_SITE): hosts with the same name
     /// are drawn as one site. Lowercase letters, digits, `.`, `_`, `-`; at
@@ -290,6 +342,16 @@ pub enum AgentCommand {
         command: ActionCommand,
     },
 
+    /// Integrations this host reads as a collector (Proxmox VE)
+    #[command(
+        long_about = "Manage the integrations this host reads as a collector.\n\nEach one is a file in /etc/connlog/integrations.d, readable by root and the agent's service account only. Its secret is read from standard input, never from the command line, and never leaves this host.",
+        after_help = "Examples:\n  sudo connlog-agent integration add pve --url https://pve.lan:8006 --token-id connlog@pve!collector\n  sudo connlog-agent integration list\n  sudo connlog-agent integration test pve\n  sudo connlog-agent integration remove pve"
+    )]
+    Integration {
+        #[command(subcommand)]
+        command: IntegrationCommand,
+    },
+
     /// Diagnostic tools
     Diagnostics {
         #[command(subcommand)]
@@ -360,15 +422,93 @@ pub enum LocalConfigCommand {
 
     /// Take part in the network map
     #[command(
-        long_about = "Set CONNLOG_NETWORK_MAP=true in /etc/connlog/agent.conf and restart the agent service.\n\nThe agent then sends this host's interface addresses (with prefix length), the TCP port numbers listening on a non-loopback address, its default gateway and the gateway's MAC address, every 15 minutes when they change; and it runs the reachability probes ConnLog asks for: TCP handshakes (never a payload) and ICMP echoes to other opted-in hosts in the same workspace, at most 32 addresses and 8 ports per request, 4 at a time, private addresses only unless CONNLOG_PROBE_PUBLIC=true. No process names, users, interface names or connections leave the host. Off by default; the workspace must turn the map on as well.\n\nWith --network-site or --network-map-ports, those are written too.\n\nExamples:\n  sudo connlog-agent config enable-network-map\n  sudo connlog-agent config enable-network-map --network-site hq --network-map-ports 443,8443"
+        long_about = "Set CONNLOG_DISCOVERY=peers in /etc/connlog/agent.conf (a higher level stays as it is) and restart the agent service.\n\nThe agent then sends this host's interface addresses (with prefix length), the TCP port numbers listening on a non-loopback address, its default gateway and the gateway's MAC address, every 15 minutes when they change; and it runs the reachability probes ConnLog asks for: TCP handshakes (never a payload) and ICMP echoes to other opted-in hosts in the same workspace, at most 32 addresses and 8 ports per request, 4 at a time, private addresses only unless CONNLOG_PROBE_PUBLIC=true. No process names, users, interface names or connections leave the host. Off by default; a workspace admin can still turn the map off for the whole workspace.\n\nWith --network-site or --network-map-ports, those are written too.\n\nExamples:\n  sudo connlog-agent config enable-network-map\n  sudo connlog-agent config enable-network-map --network-site hq --network-map-ports 443,8443"
     )]
     EnableNetworkMap,
 
+    /// Map this host's network from here: the highest discovery level
+    #[command(
+        long_about = "Set CONNLOG_DISCOVERY=active in /etc/connlog/agent.conf and restart the agent service: what `set-discovery active` does, and what the installer asks with \"Map this network from here?\".\n\nThe host may then take part in the network map, read what it already knows about its network, and sweep the subnets it is on when ConnLog asks (see set-discovery). The level is a ceiling: ConnLog's console chooses at or below it, by hand or, with the workspace's \"Map networks automatically\" on, by itself; one host per subnet sweeps.\n\nExample:\n  sudo connlog-agent config map-network"
+    )]
+    MapNetwork,
+
     /// Stop taking part in the network map (the default)
     #[command(
-        long_about = "Set CONNLOG_NETWORK_MAP=false in /etc/connlog/agent.conf and restart the agent service.\n\nThe agent then sends no inventory, runs no probes, and tells ConnLog so; ConnLog stops offering this host as a target.\n\nExample:\n  sudo connlog-agent config disable-network-map"
+        long_about = "Set CONNLOG_DISCOVERY=off in /etc/connlog/agent.conf and restart the agent service.\n\nThe agent then sends no inventory, runs no probes, and tells ConnLog so; ConnLog stops offering this host as a target.\n\nExample:\n  sudo connlog-agent config disable-network-map"
     )]
     DisableNetworkMap,
+
+    /// Run the checks ConnLog assigns: ping, TCP, HTTP(S) and DNS
+    #[command(
+        long_about = "Set CONNLOG_CHECKS=true in /etc/connlog/agent.conf and restart the agent service.\n\nThe agent then runs the checks ConnLog assigns to it, for devices that have no agent: a ping (three echoes), a TCP connect, an HTTP(S) GET (its status, its time to the first byte and the certificate's days left; never a byte of the body), a DNS query to a given resolver. At most 16 at a time, 10 seconds each, each target at most once a minute. Public targets always; a private one only when this host's discovery level is passive or above. Off by default.\n\nExample:\n  sudo connlog-agent config enable-checks"
+    )]
+    EnableChecks,
+
+    /// Stop running checks (the default)
+    DisableChecks,
+
+    /// Make this host a collector, reading the integrations set up on it
+    #[command(
+        long_about = "Set CONNLOG_COLLECTOR=true in /etc/connlog/agent.conf and restart the agent service.\n\nThe agent then reads the integrations in /etc/connlog/integrations.d (see `connlog-agent integration`) every five minutes while ConnLog asks for them, and reports what they read: for Proxmox VE, its nodes, bridges, guests, their interfaces' MAC addresses, bridges and VLAN tags. Credentials stay on this host; a report never carries one. Off by default. `integration add` turns it on too.\n\nExample:\n  sudo connlog-agent config enable-collector"
+    )]
+    EnableCollector,
+
+    /// Stop reading integrations (the default)
+    DisableCollector,
+
+    /// Set how much this host may find out about its network
+    #[command(
+        long_about = "Set CONNLOG_DISCOVERY in /etc/connlog/agent.conf and restart the agent service.\n\nThe level is a ceiling: ConnLog's console chooses at or below it for this host, and can never raise it.\n\n  off      nothing (the default)\n  peers    the network map: see enable-network-map\n  passive  peers, and what the host already knows about its network: the VLAN id of each address on a VLAN interface, its neighbour table (private addresses, their MAC and state, at most 1,024), and its path out (a trace of at most 16 hops towards its gateway and ConnLog, every 6 hours, over the ping socket the probes use); never an interface's name, never a device's name\n  active   passive, and sweeps of the host's own subnets the console lists: an IPv4 subnet this host is on, a /22 at most, 64 addresses a second, an echo and handshakes to at most 8 well-known ports per address (never a byte of payload), one mDNS question and one SSDP search; what answered, its open ports and what it announces (never an mDNS name, never a UUID)\n\nThe host runs at the lower of this and what the console allows for it.\n\nExamples:\n  sudo connlog-agent config set-discovery peers\n  sudo connlog-agent config set-discovery off"
+    )]
+    SetDiscovery {
+        #[arg(value_enum)]
+        level: DiscoveryLevel,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum IntegrationCommand {
+    /// Add a Proxmox VE, OPNsense or SNMP integration (or replace one of the same name)
+    #[command(
+        long_about = "Add an integration, test it, and make this host a collector.\n\nProxmox VE (the default kind): create the token first, under Datacenter → Permissions → API Tokens, for a user with the PVEAuditor role on /, privilege separation off (or give the token PVEAuditor itself). Pass its id as --token-id.\n\nOPNsense (--kind opnsense): create a user that is not an administrator, in a group with only these pages: Status: Interfaces overview, System: Gateways, and the lease page of the DHCP server it runs (Services: Kea DHCP, Services: Dnsmasq DNS/DHCP, or Status: DHCP leases for the ISC plugin). Create an API key for that user (System → Access → Users) and pass the key as --key.\n\nA switch or router over SNMP (--kind snmp, --url snmp://host[:port]): v2c with a read-only community (--snmp-version 2c), or, better, v3 with a read-only user (--snmp-version 3 --user …), SHA-256 or SHA authentication (--auth) and AES-128 privacy (--no-privacy for authNoPriv). MD5 and DES are not offered: they are broken. It reads the interfaces, VLANs, LLDP neighbours and bridge table; give the community or user a view of no more.\n\nThe secrets (token secret, API secret, community, v3 passwords) are read from standard input, one per line, never from the command line.\n\nA device's own certificate is usually self-signed: the command shows its SHA-256 fingerprint and asks before trusting it, or takes it from --fingerprint. With a certificate a public authority signed, pass --system-trust instead.\n\nExamples:\n  sudo connlog-agent integration add pve --url https://pve.lan:8006 --token-id connlog@pve!collector\n  echo \"$SECRET\" | sudo connlog-agent integration add lab --url https://10.0.20.2:8006 --token-id connlog@pve!collector --fingerprint AB:CD:…\n  sudo connlog-agent integration add fw --kind opnsense --url https://10.0.0.1 --key w86XNZob…\n  sudo connlog-agent integration add core --kind snmp --url snmp://10.0.0.2 --snmp-version 3 --user connlog"
+    )]
+    Add {
+        /// A short name: a-z, 0-9 and -, at most 32
+        name: String,
+        /// What it is: proxmox, opnsense or snmp
+        #[arg(long, default_value = "proxmox", value_parser = ["proxmox", "opnsense", "snmp"])]
+        kind: String,
+        /// The address: https://host:8006 for Proxmox, https://host for OPNsense, snmp://host[:port]
+        #[arg(long)]
+        url: String,
+        /// Proxmox: the token's id, user@realm!tokenname. OPNsense: the API key (--key)
+        #[arg(long = "token-id", alias = "key")]
+        token_id: Option<String>,
+        /// SNMP: 2c or 3
+        #[arg(long = "snmp-version", value_parser = ["2c", "3"])]
+        snmp_version: Option<String>,
+        /// SNMP v3: the user
+        #[arg(long)]
+        user: Option<String>,
+        /// SNMP v3: sha256 or sha
+        #[arg(long, default_value = "sha256", value_parser = ["sha256", "sha"])]
+        auth: String,
+        /// SNMP v3: authentication without privacy (authNoPriv)
+        #[arg(long = "no-privacy")]
+        no_privacy: bool,
+        /// The certificate's SHA-256 fingerprint, to trust it without asking
+        #[arg(long, conflicts_with = "system_trust")]
+        fingerprint: Option<String>,
+        /// Trust the certificate as any website's, by a public authority
+        #[arg(long = "system-trust")]
+        system_trust: bool,
+    },
+    /// List the integrations on this host, never their secrets
+    List,
+    /// Read one now and say what it found, or why not
+    Test { name: String },
+    /// Remove one
+    Remove { name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
@@ -625,6 +765,11 @@ impl fmt::Debug for Config {
             .field("disable_remote_reboot", &self.disable_remote_reboot)
             .field("network_map", &self.network_map)
             .field("enable_network_map", &self.enable_network_map)
+            .field("map_network", &self.map_network)
+            .field("discovery", &self.discovery)
+            .field("checks", &self.checks)
+            .field("enable_checks", &self.enable_checks)
+            .field("collector", &self.collector)
             .field("network_site", &self.network_site)
             .field("network_map_ports", &self.network_map_ports)
             .field("probe_public", &self.probe_public)
@@ -652,21 +797,61 @@ impl Config {
         }
     }
 
-    /// Whether the running agent takes part in the network map: only an
-    /// explicit true.
-    pub fn network_map_enabled(&self) -> bool {
-        self.network_map == Some(true)
+    /// Whether the running agent runs checks: only an explicit true.
+    pub fn checks_enabled(&self) -> bool {
+        self.checks == Some(true)
     }
 
-    /// The network map choice this `install` makes, if it makes one:
-    /// `--enable-network-map`, then an explicit CONNLOG_NETWORK_MAP. `None`
-    /// keeps whatever the host's agent.conf already says.
-    pub fn requested_network_map(&self) -> Option<bool> {
-        if self.enable_network_map {
+    /// Whether the running agent is a collector: only an explicit true.
+    pub fn collector_enabled(&self) -> bool {
+        self.collector == Some(true)
+    }
+
+    /// The checks choice this `install` makes, if it makes one:
+    /// `--enable-checks`, then an explicit CONNLOG_CHECKS. `None` keeps
+    /// whatever the host's agent.conf already says.
+    pub fn requested_checks(&self) -> Option<bool> {
+        if self.enable_checks {
             Some(true)
         } else {
-            self.network_map
+            self.checks
         }
+    }
+
+    /// The running agent's discovery ceiling: CONNLOG_DISCOVERY, else
+    /// CONNLOG_NETWORK_MAP=true as peers, else off. A level that does not
+    /// read is warned about and left out, so a typo in the file never stops
+    /// the agent, nor raises its level.
+    pub fn discovery_ceiling(&self) -> DiscoveryLevel {
+        match parse_discovery(self.discovery.as_deref()) {
+            Ok(Some(level)) => level,
+            Ok(None) => DiscoveryLevel::from_network_map(self.network_map),
+            Err(e) => {
+                log::warn!("Ignoring {CONF_DISCOVERY}: {e}");
+                DiscoveryLevel::from_network_map(self.network_map)
+            }
+        }
+    }
+
+    /// The discovery choice this `install` makes, if it makes one:
+    /// `--discovery` (or CONNLOG_DISCOVERY), else CONNLOG_NETWORK_MAP as
+    /// peers or off; `--enable-network-map` raises either to at least peers,
+    /// and `--map-network` to active.
+    /// `None` keeps whatever the host's agent.conf already says; a level that
+    /// does not read is an error, and nothing is written.
+    pub fn requested_discovery(&self) -> Result<Option<DiscoveryLevel>, String> {
+        let chosen = parse_discovery(self.discovery.as_deref())?.or(self
+            .network_map
+            .map(|flag| DiscoveryLevel::from_network_map(Some(flag))));
+        Ok(if self.map_network {
+            Some(DiscoveryLevel::Active)
+        } else if self.enable_network_map {
+            Some(chosen.map_or(DiscoveryLevel::Peers, |level| {
+                level.max(DiscoveryLevel::Peers)
+            }))
+        } else {
+            chosen
+        })
     }
 
     pub fn get_platform_url(&self) -> Option<String> {
@@ -996,6 +1181,7 @@ mod tests {
     fn config_network_map_subcommands_parse() {
         for (arg, command) in [
             ("enable-network-map", LocalConfigCommand::EnableNetworkMap),
+            ("map-network", LocalConfigCommand::MapNetwork),
             ("disable-network-map", LocalConfigCommand::DisableNetworkMap),
         ] {
             let cfg = Config::parse_from(["connlog-agent", "config", arg]);
@@ -1012,21 +1198,39 @@ mod tests {
         ]);
         assert_eq!(cfg.network_site.as_deref(), Some("hq"));
         assert_eq!(cfg.network_map_ports.as_deref(), Some("443,8443"));
+
+        let cfg = Config::parse_from(["connlog-agent", "config", "set-discovery", "passive"]);
+        assert_eq!(
+            cfg.command,
+            Some(AgentCommand::Config {
+                command: LocalConfigCommand::SetDiscovery {
+                    level: DiscoveryLevel::Passive
+                }
+            })
+        );
+        assert!(
+            Config::try_parse_from(["connlog-agent", "config", "set-discovery", "all"]).is_err()
+        );
     }
 
     #[test]
-    fn network_map_is_off_unless_set_to_true() {
+    fn discovery_is_off_unless_set() {
         let cfg = Config::parse_from(["connlog-agent"]);
         assert_eq!(cfg.network_map, None);
-        assert!(!cfg.network_map_enabled());
-        for (value, on) in [
-            ("true", true),
-            ("yes", true),
-            ("false", false),
-            ("0", false),
+        assert_eq!(cfg.discovery_ceiling(), DiscoveryLevel::Off);
+        for (args, level) in [
+            (&["--network-map", "true"][..], DiscoveryLevel::Peers),
+            (&["--network-map", "yes"][..], DiscoveryLevel::Peers),
+            (&["--network-map", "0"][..], DiscoveryLevel::Off),
+            (&["--discovery", "passive"][..], DiscoveryLevel::Passive),
+            (
+                &["--discovery", "off", "--network-map", "true"][..],
+                DiscoveryLevel::Off,
+            ),
         ] {
-            let cfg = Config::parse_from(["connlog-agent", "--network-map", value]);
-            assert_eq!(cfg.network_map_enabled(), on, "{value}");
+            let cfg =
+                Config::parse_from(std::iter::once("connlog-agent").chain(args.iter().copied()));
+            assert_eq!(cfg.discovery_ceiling(), level, "{args:?}");
         }
     }
 
@@ -1034,17 +1238,36 @@ mod tests {
     fn install_network_map_choice() {
         for (args, requested) in [
             (&["install"][..], None),
-            (&["install", "--enable-network-map"][..], Some(true)),
-            (&["install", "--network-map", "false"][..], Some(false)),
+            (
+                &["install", "--enable-network-map"][..],
+                Some(DiscoveryLevel::Peers),
+            ),
+            (
+                &["install", "--network-map", "false"][..],
+                Some(DiscoveryLevel::Off),
+            ),
             (
                 &["install", "--network-map", "false", "--enable-network-map"][..],
-                Some(true),
+                Some(DiscoveryLevel::Peers),
+            ),
+            (
+                &["install", "--discovery", "active"][..],
+                Some(DiscoveryLevel::Active),
+            ),
+            // The installer's one question (T13.4): active, whatever else.
+            (
+                &["--map-network", "install"][..],
+                Some(DiscoveryLevel::Active),
+            ),
+            (
+                &["install", "--discovery", "off", "--map-network"][..],
+                Some(DiscoveryLevel::Active),
             ),
         ] {
             let cfg =
                 Config::parse_from(std::iter::once("connlog-agent").chain(args.iter().copied()));
             assert_eq!(cfg.command, Some(AgentCommand::Install), "{args:?}");
-            assert_eq!(cfg.requested_network_map(), requested, "{args:?}");
+            assert_eq!(cfg.requested_discovery(), Ok(requested), "{args:?}");
         }
         let cfg = Config::parse_from([
             "connlog-agent",

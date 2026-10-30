@@ -310,62 +310,16 @@ impl MetricsCollector {
             let mut used = 0u64;
             let mut seen: HashSet<String> = HashSet::new();
 
+            let host_root = crate::platform::host_root();
             for disk in self.disks.list() {
                 let fs = disk.file_system().to_string_lossy().to_lowercase();
-                // Skip pseudo / virtual / overlay filesystems that don't
-                // represent real storage capacity.
-                if matches!(
-                    fs.as_str(),
-                    "tmpfs"
-                        | "devtmpfs"
-                        | "overlay"
-                        | "overlayfs"
-                        | "squashfs"
-                        | "proc"
-                        | "sysfs"
-                        | "cgroup"
-                        | "cgroup2"
-                        | "debugfs"
-                        | "tracefs"
-                        | "fusectl"
-                        | "ramfs"
-                        | "mqueue"
-                        | "pstore"
-                        | "autofs"
-                        | "binfmt_misc"
-                        | "configfs"
-                        | "hugetlbfs"
-                        | "nsfs"
-                        | "rpc_pipefs"
-                        | "selinuxfs"
-                        | "securityfs"
-                        | "bpf"
-                        | "iso9660"
-                        | "efivarfs"
-                ) {
-                    continue;
-                }
-
-                let name = disk.name().to_string_lossy().to_string();
                 let mount = disk.mount_point().to_string_lossy().to_string();
-
-                // Skip snap loop mounts on Linux — they're packaged apps, not
-                // user storage, and inflate totals dramatically.
-                #[cfg(target_os = "linux")]
-                if mount.starts_with("/snap/") || mount.starts_with("/var/snap/") {
-                    continue;
-                }
-                // Skip docker/overlay/container scratch dirs that occasionally
-                // show up as named devices.
-                #[cfg(unix)]
-                if mount.starts_with("/var/lib/docker/")
-                    || mount.starts_with("/var/lib/containers/")
-                    || mount.starts_with("/run/")
-                {
+                if !counts_as_storage(&fs, &mount, host_root.as_deref()) {
                     continue;
                 }
                 // Dedupe by device name (e.g. /dev/nvme0n1p2). Same physical
                 // device mounted at multiple paths = count only once.
+                let name = disk.name().to_string_lossy().to_string();
                 let dedupe_key = if name.is_empty() { mount.clone() } else { name };
                 if !seen.insert(dedupe_key) {
                     continue;
@@ -410,6 +364,61 @@ impl MetricsCollector {
     }
 }
 
+/// Whether a mount is storage the host's disk numbers count: not a pseudo,
+/// virtual or overlay filesystem, not a snap's loop mount, not a
+/// container's scratch. With the host's root mounted elsewhere (the Docker
+/// image, T13.1) only what is under it counts, judged by where it is on the
+/// host: the container's own `/`, `/etc/hosts` and the rest are not the
+/// host's disks.
+fn counts_as_storage(fs: &str, mount: &str, host_root: Option<&std::path::Path>) -> bool {
+    if matches!(
+        fs,
+        "tmpfs"
+            | "devtmpfs"
+            | "overlay"
+            | "overlayfs"
+            | "squashfs"
+            | "proc"
+            | "sysfs"
+            | "cgroup"
+            | "cgroup2"
+            | "debugfs"
+            | "tracefs"
+            | "fusectl"
+            | "ramfs"
+            | "mqueue"
+            | "pstore"
+            | "autofs"
+            | "binfmt_misc"
+            | "configfs"
+            | "hugetlbfs"
+            | "nsfs"
+            | "rpc_pipefs"
+            | "selinuxfs"
+            | "securityfs"
+            | "bpf"
+            | "iso9660"
+            | "efivarfs"
+    ) {
+        return false;
+    }
+    let on_host = match host_root {
+        None => std::borrow::Cow::Borrowed(mount),
+        Some(root) => match std::path::Path::new(mount).strip_prefix(root) {
+            Ok(rest) => std::borrow::Cow::Owned(format!("/{}", rest.to_string_lossy())),
+            Err(_) => return false,
+        },
+    };
+    // Snap loop mounts are packaged apps, not user storage, and inflate
+    // totals dramatically; docker/overlay/container scratch dirs
+    // occasionally show up as named devices.
+    !(on_host.starts_with("/snap/")
+        || on_host.starts_with("/var/snap/")
+        || on_host.starts_with("/var/lib/docker/")
+        || on_host.starts_with("/var/lib/containers/")
+        || on_host.starts_with("/run/"))
+}
+
 /// Read the 1-minute load average. On Linux we read `/proc/loadavg` directly
 /// because the sysinfo wrapper has been observed to silently return 0.0 on
 /// some hosts (likely a static-state caching quirk in older `procfs` parses).
@@ -448,6 +457,33 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_is_real_filesystems_on_the_host() {
+        assert!(counts_as_storage("ext4", "/", None));
+        assert!(counts_as_storage("xfs", "/srv", None));
+        assert!(!counts_as_storage("overlay", "/", None));
+        assert!(!counts_as_storage("ext4", "/snap/core/1", None));
+        assert!(!counts_as_storage(
+            "ext4",
+            "/var/lib/docker/volumes/x",
+            None
+        ));
+
+        // In the image: the host's mounts under /host, judged as the host
+        // sees them; the container's own bind mounts are not the host's.
+        let root = Some(std::path::Path::new("/host"));
+        assert!(counts_as_storage("ext4", "/host", root));
+        assert!(counts_as_storage("ext4", "/host/srv/data", root));
+        assert!(!counts_as_storage("ext4", "/etc/hosts", root));
+        assert!(!counts_as_storage("ext4", "/hostile", root));
+        assert!(!counts_as_storage(
+            "ext4",
+            "/host/var/lib/docker/overlay2/a/merged",
+            root
+        ));
+        assert!(!counts_as_storage("ext4", "/host/run/user/1000", root));
+    }
 
     #[test]
     fn collect_returns_ok_under_normal_conditions() {

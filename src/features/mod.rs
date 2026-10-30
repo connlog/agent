@@ -10,13 +10,23 @@
 
 pub mod action_cli;
 pub mod bmc;
+pub mod checks;
+pub mod connections;
+pub mod discovery;
 pub mod flight_recorder;
 pub mod heartbeat_telemetry;
+pub mod integrations;
 pub mod menu;
 pub mod metrics;
+pub mod neighbours;
+pub mod netlink;
 pub mod network_inventory;
 pub mod network_map;
 pub mod postmortem;
 pub mod quick_actions;
 pub mod reachability;
 pub mod remote_reboot;
+pub mod routing;
+pub mod sweep;
+pub mod trace;
+pub mod vlan;

@@ -1,0 +1,55 @@
+#!/bin/sh
+#
+# PROVIDE: connlog_agent
+# REQUIRE: NETWORKING DAEMON
+# KEYWORD: shutdown
+#
+# The ConnLog agent on FreeBSD: OPNsense, pfSense or plain FreeBSD
+# (docs/topology/PLAN.md, T13.5d). Turn it on in /etc/rc.conf.d/connlog_agent
+# (install.sh writes it):
+#
+#   connlog_agent_enable="YES"
+#   connlog_agent_user="connlog"   # the default: unprivileged, no ping
+#   connlog_agent_user="root"      # adds ping (raw ICMP sockets)
+#
+# Its settings, the token among them, are in /usr/local/etc/connlog/agent.conf
+# (root:connlog 0640): one NAME=value per line, the names agent.conf uses on
+# Linux (CONNLOG_TOKEN, CONNLOG_DISCOVERY, ...), no quotes. Read, never run:
+# only lines naming a CONNLOG_ variable are taken, and nothing is evaluated.
+
+. /etc/rc.subr
+
+name="connlog_agent"
+rcvar="connlog_agent_enable"
+
+load_rc_config $name
+
+: ${connlog_agent_enable:="NO"}
+: ${connlog_agent_user:="connlog"}
+: ${connlog_agent_conf:="/usr/local/etc/connlog/agent.conf"}
+
+pidfile="/var/run/${name}.pid"
+procname="/usr/sbin/daemon"
+command="/usr/sbin/daemon"
+# -r restarts it if it dies, -P is the supervisor's pid (what stop signals),
+# -u drops to the agent's user, -T tags its log lines in syslog.
+command_args="-c -r -P ${pidfile} -u ${connlog_agent_user} -T ${name} /usr/local/bin/connlog-agent"
+start_precmd="connlog_agent_prestart"
+
+connlog_agent_prestart()
+{
+	if [ ! -r "${connlog_agent_conf}" ]; then
+		err 1 "${connlog_agent_conf} is missing: run install.sh, or write CONNLOG_TOKEN=... there"
+	fi
+	while IFS='=' read -r key value; do
+		case "${key}" in
+		CONNLOG_[A-Z0-9_]*) export "${key}=${value}" ;;
+		esac
+	done < "${connlog_agent_conf}"
+	# Where it runs, whatever the file says: a package is updated by a new
+	# package, never by the agent itself.
+	export CONNLOG_PACKAGING=freebsd
+	export CONNLOG_STATE_DIR=/var/db/connlog
+}
+
+run_rc_command "$1"

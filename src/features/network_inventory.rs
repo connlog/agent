@@ -1,8 +1,12 @@
 //! The network map's inventory (docs/topology/PLAN.md, guarantee 4): this
 //! host's interface addresses with their prefix length, the TCP port numbers
 //! listening on a non-loopback address, the default gateway and its MAC, plus
-//! the site name and extra ports from agent.conf. Nothing else: no process
-//! names, users, interface names, UDP or remote peers.
+//! the site name and extra ports from agent.conf; at the `passive` level, the
+//! VLAN id of an address on a VLAN interface (T8.2, `features::vlan`) and
+//! the private neighbours the kernel already knows (T8.3,
+//! `features::neighbours`).
+//! Nothing else: no process names, users, interface names, UDP or remote
+//! peers.
 //!
 //! Read with `getifaddrs` and from `/proc/net/{tcp,tcp6,route,arp}`, no new
 //! crate. Every parser here takes the text it reads, so the tests drive them
@@ -14,6 +18,8 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use serde::Serialize;
+
+use crate::features::discovery::DiscoveryLevel;
 
 pub const CONTENT_TYPE: &str = "application/vnd.connlog.inventory.v1+json";
 pub const FORMAT_VERSION: u8 = 1;
@@ -39,6 +45,16 @@ pub struct Inventory {
     pub gateway: Option<Gateway>,
     pub site: Option<String>,
     pub extra_ports: Vec<u16>,
+    /// Only at `passive`; left out of the upload when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub neighbours: Vec<crate::features::neighbours::Neighbour>,
+    /// The path out (T8.4): only at `passive`, and only where the host
+    /// allows the ping socket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<crate::features::trace::Path>,
+    /// Observed connections (T11.1): only when the platform asks for them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub connections: Vec<crate::features::connections::Connection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -46,6 +62,9 @@ pub struct Inventory {
 pub struct InventoryAddress {
     pub address: String,
     pub prefix_length: u8,
+    /// The 802.1Q id of the VLAN interface it is on; only at `passive`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vlan: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -70,6 +89,8 @@ pub struct InterfaceAddress {
     pub loopback: bool,
     pub ip: IpAddr,
     pub prefix_length: u8,
+    /// The interface's VLAN id, when it is a VLAN and the level allows it.
+    pub vlan: Option<u16>,
 }
 
 impl Inventory {
@@ -96,6 +117,9 @@ impl Inventory {
             }),
             site,
             extra_ports,
+            neighbours: Vec::new(),
+            path: None,
+            connections: Vec::new(),
         }
     }
 
@@ -105,17 +129,53 @@ impl Inventory {
     }
 }
 
-/// Read this host's inventory now. Every source degrades to "nothing":
-/// an unreadable file is an empty list, never an error.
-pub fn collect(site: Option<String>, extra_ports: &[u16]) -> Inventory {
+/// What the passive level adds to the inventory: the path out, traced when
+/// due, towards the gateway and the platform.
+pub struct PathSource<'a> {
+    pub cache: &'a mut crate::features::trace::TraceCache,
+    pub internet: &'a dyn Fn() -> Option<Ipv4Addr>,
+}
+
+/// Read this host's inventory now, at `level` (the lower of the host's
+/// ceiling and what the console allows). Every source degrades to
+/// "nothing": an unreadable file is an empty list, never an error.
+pub fn collect(
+    site: Option<String>,
+    extra_ports: &[u16],
+    level: DiscoveryLevel,
+    path: Option<PathSource<'_>>,
+    connections: Option<&std::collections::HashSet<IpAddr>>,
+) -> Inventory {
     let read = |path: &str| std::fs::read_to_string(path).unwrap_or_default();
     let mut sockets = parse_tcp_listeners(&read("/proc/net/tcp"));
     sockets.extend(parse_tcp_listeners(&read("/proc/net/tcp6")));
-    let gateway = parse_default_gateway(&read("/proc/net/route")).map(|(ip, _iface)| {
-        let mac = parse_arp_mac(&read("/proc/net/arp"), ip);
-        (ip, mac)
-    });
-    Inventory::build(&interface_addresses(), &sockets, gateway, site, extra_ports)
+    let gateway = default_gateway();
+    let gateway_ip = gateway.as_ref().map(|(ip, _)| *ip);
+    let mut interfaces = interface_addresses();
+    if level >= DiscoveryLevel::Passive {
+        let vlans = crate::features::vlan::link_vlans();
+        for address in &mut interfaces {
+            address.vlan = vlans.get(&address.interface).copied();
+        }
+    }
+    let mut inventory = Inventory::build(&interfaces, &sockets, gateway, site, extra_ports);
+    // Only when the platform asked; `named` is all the peers level allows.
+    if let Some(named) = connections {
+        let listening = inventory.tcp_listeners.iter().map(|l| l.port).collect();
+        inventory.connections = crate::features::connections::collect(&listening, level, named);
+    }
+    if level >= DiscoveryLevel::Passive {
+        inventory.neighbours = crate::features::neighbours::neighbours();
+        if let Some(source) = path {
+            inventory.path = source.cache.path(
+                gateway_ip,
+                source.internet,
+                &crate::features::trace::SystemHopper,
+                std::time::Instant::now(),
+            );
+        }
+    }
+    inventory
 }
 
 pub fn is_virtual_interface(name: &str) -> bool {
@@ -136,7 +196,7 @@ fn is_plain_ipv6_text(ip: &IpAddr) -> bool {
 
 /// The addresses another host could reach this one on.
 pub fn select_addresses(interfaces: &[InterfaceAddress]) -> Vec<InventoryAddress> {
-    let mut kept: Vec<(IpAddr, u8)> = interfaces
+    let mut kept: Vec<(IpAddr, u8, Option<u16>)> = interfaces
         .iter()
         .filter(|a| a.up && !a.loopback && !is_virtual_interface(&a.interface))
         .filter(|a| match a.ip {
@@ -149,16 +209,17 @@ pub fn select_addresses(interfaces: &[InterfaceAddress]) -> Vec<InventoryAddress
                     && a.prefix_length <= 128
             }
         })
-        .map(|a| (a.ip, a.prefix_length))
+        .map(|a| (a.ip, a.prefix_length, a.vlan))
         .collect();
     // IPv4 before IPv6 (`IpAddr`'s order), then numerically.
     kept.sort_unstable();
-    kept.dedup_by_key(|(ip, _)| *ip);
+    kept.dedup_by_key(|(ip, _, _)| *ip);
     kept.truncate(MAX_ADDRESSES);
     kept.into_iter()
-        .map(|(ip, prefix_length)| InventoryAddress {
+        .map(|(ip, prefix_length, vlan)| InventoryAddress {
             address: ip.to_string(),
             prefix_length,
+            vlan,
         })
         .collect()
 }
@@ -200,7 +261,7 @@ pub fn select_listeners(sockets: &[(IpAddr, u16)]) -> Vec<Listener> {
 
 /// `/proc/net/tcp` and `/proc/net/tcp6` hex addresses: the address's bytes
 /// in network order, printed as host-order 32-bit words.
-fn parse_proc_ip(hex: &str) -> Option<IpAddr> {
+pub fn parse_proc_ip(hex: &str) -> Option<IpAddr> {
     let word = |chunk: &str| u32::from_str_radix(chunk, 16).ok().map(u32::to_ne_bytes);
     match hex.len() {
         8 => Some(IpAddr::V4(Ipv4Addr::from(word(hex)?))),
@@ -235,11 +296,14 @@ pub fn parse_tcp_listeners(text: &str) -> Vec<(IpAddr, u16)> {
         .collect()
 }
 
+#[cfg_attr(target_os = "freebsd", allow(dead_code))] // FreeBSD reads the routing table
 const RTF_UP: u32 = 0x0001;
+#[cfg_attr(target_os = "freebsd", allow(dead_code))] // FreeBSD reads the routing table
 const RTF_GATEWAY: u32 = 0x0002;
 
 /// The IPv4 default route's next hop from `/proc/net/route`, lowest metric
 /// first, and its interface. Routes through container bridges are left out.
+#[cfg_attr(target_os = "freebsd", allow(dead_code))] // FreeBSD reads the routing table
 pub fn parse_default_gateway(text: &str) -> Option<(Ipv4Addr, String)> {
     text.lines()
         .skip(1)
@@ -273,6 +337,7 @@ pub fn parse_default_gateway(text: &str) -> Option<(Ipv4Addr, String)> {
 
 /// `ip`'s MAC from `/proc/net/arp`, lowercase; `None` when it is not there,
 /// not complete yet (all zeros) or not a MAC.
+#[cfg_attr(target_os = "freebsd", allow(dead_code))] // FreeBSD reads the routing table
 pub fn parse_arp_mac(text: &str, ip: Ipv4Addr) -> Option<String> {
     let wanted = ip.to_string();
     text.lines().skip(1).find_map(|line| {
@@ -294,8 +359,35 @@ fn prefix_of(mask: &[u8]) -> u8 {
     mask.iter().map(|b| b.count_ones() as u8).sum()
 }
 
+/// The IPv4 default gateway and its MAC, where the ARP table has it.
+#[cfg(not(target_os = "freebsd"))]
+fn default_gateway() -> Option<(Ipv4Addr, Option<String>)> {
+    let read = |path: &str| std::fs::read_to_string(path).unwrap_or_default();
+    parse_default_gateway(&read("/proc/net/route")).map(|(ip, _iface)| {
+        let mac = parse_arp_mac(&read("/proc/net/arp"), ip);
+        (ip, mac)
+    })
+}
+
+/// The IPv4 default gateway and its MAC: on FreeBSD (a firewall, T13.5b)
+/// from the routing table and the ARP table.
+#[cfg(target_os = "freebsd")]
+fn default_gateway() -> Option<(Ipv4Addr, Option<String>)> {
+    let ip = crate::features::routing::default_route()?;
+    let mac = crate::features::routing::neighbour_entries()
+        .into_iter()
+        .find(|(address, _, _)| *address == IpAddr::V4(ip))
+        .map(|(_, mac, _)| {
+            mac.iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(":")
+        });
+    Some((ip, mac))
+}
+
 /// Every interface address with its netmask, from `getifaddrs`.
-fn interface_addresses() -> Vec<InterfaceAddress> {
+pub fn interface_addresses() -> Vec<InterfaceAddress> {
     let mut out = Vec::new();
     let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: getifaddrs writes a list it owns into `head`; it is read only
@@ -346,6 +438,7 @@ fn interface_addresses() -> Vec<InterfaceAddress> {
                 loopback: flags & libc::IFF_LOOPBACK as u32 != 0,
                 ip,
                 prefix_length,
+                vlan: None,
             });
         }
     }
@@ -404,6 +497,7 @@ docker0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0
             loopback: name == "lo",
             ip: ip.parse().unwrap(),
             prefix_length: prefix,
+            vlan: None,
         }
     }
 
@@ -587,11 +681,17 @@ docker0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0
             .unwrap()
             .iter()
             .map(|a| {
-                iface(
-                    "eth0",
-                    a["address"].as_str().unwrap(),
-                    a["prefixLength"].as_u64().unwrap() as u8,
-                )
+                // An address with a VLAN id is on that VLAN's interface.
+                let vlan = a["vlan"].as_u64().map(|v| v as u16);
+                let name = vlan.map_or("eth0".to_string(), |v| format!("eth0.{v}"));
+                InterfaceAddress {
+                    vlan,
+                    ..iface(
+                        &name,
+                        a["address"].as_str().unwrap(),
+                        a["prefixLength"].as_u64().unwrap() as u8,
+                    )
+                }
             })
             // Reversed, plus what must be dropped: the result does not depend
             // on the order the kernel lists them in.
@@ -629,7 +729,53 @@ docker0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0
             .iter()
             .map(|p| p.as_u64().unwrap() as u16)
             .collect();
-        Inventory::build(&interfaces, &sockets, gateway, site, &ports)
+        let mut inventory = Inventory::build(&interfaces, &sockets, gateway, site, &ports);
+        inventory.neighbours = upload["neighbours"]
+            .as_array()
+            .map(|list| {
+                list.iter()
+                    .map(|n| crate::features::neighbours::Neighbour {
+                        address: n["address"].as_str().unwrap().to_string(),
+                        mac: n["mac"].as_str().unwrap().to_string(),
+                        state: match n["state"].as_str().unwrap() {
+                            "reachable" => "reachable",
+                            "permanent" => "permanent",
+                            _ => "stale",
+                        },
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let trace = |t: &Value| {
+            t.as_object().map(|t| crate::features::trace::Trace {
+                hops: t["hops"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|h| h.as_str().map(str::to_string))
+                    .collect(),
+                reached: t["reached"].as_bool().unwrap(),
+            })
+        };
+        inventory.connections = upload["connections"]
+            .as_array()
+            .map(|list| {
+                list.iter()
+                    .map(|c| crate::features::connections::Connection {
+                        peer: c["peer"].as_str().unwrap().to_string(),
+                        port: c["port"].as_u64().unwrap() as u16,
+                        direction: if c["direction"] == "in" { "in" } else { "out" },
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        inventory.path = upload["path"]
+            .as_object()
+            .map(|p| crate::features::trace::Path {
+                gateway: trace(&p["gateway"]),
+                internet: trace(&p["internet"]),
+            });
+        inventory
     }
 
     /// The agent's half of `inventory-uploads.json`: from the inputs each
@@ -652,7 +798,13 @@ docker0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0
 
     #[test]
     fn this_host_collects_without_error() {
-        let inventory = collect(Some("hq".into()), &[8443]);
+        let inventory = collect(
+            Some("hq".into()),
+            &[8443],
+            DiscoveryLevel::Passive,
+            None,
+            None,
+        );
         assert_eq!(inventory.version, 1);
         assert!(inventory.addresses.len() <= MAX_ADDRESSES);
         assert!(inventory

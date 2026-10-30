@@ -74,12 +74,62 @@ pub struct HeartbeatResponse {
     /// unless the host opted in.
     #[serde(default, deserialize_with = "lenient_probe_request")]
     pub probe_request: Option<crate::features::reachability::ProbeRequest>,
+    /// A subnet to sweep (T12.1), run only at `active`. Read leniently: a
+    /// malformed one is none.
+    #[serde(default, deserialize_with = "lenient_sweep_request")]
+    pub sweep_request: Option<crate::features::sweep::SweepRequest>,
+    /// The discovery level the console allows this host now; the agent
+    /// collects the lower of this and its own ceiling. Read leniently: a
+    /// value that is not a level is none, which is peers.
+    #[serde(default, deserialize_with = "lenient_discovery")]
+    pub discovery: Option<crate::features::discovery::DiscoveryLevel>,
+    /// Checks to run once and report (`POST /api/agents/checks`), already
+    /// cut to the agent's caps. Read leniently: a request the agent cannot
+    /// use is no request. Ignored unless CONNLOG_CHECKS is on.
+    #[serde(default, deserialize_with = "lenient_check_request")]
+    pub check_request: Option<crate::features::checks::CheckRequest>,
+    /// The platform takes this host's observed connections (T11.1). Read
+    /// leniently: only JSON `true` asks.
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub connections: bool,
+    /// The platform takes this collector's integration reports (Phase 10).
+    /// Read leniently: only JSON `true` asks.
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub integrations: bool,
+    /// The workspace collects device names (T10.2): a firewall's lease
+    /// hostnames are read and sent. Read leniently: only JSON `true` asks.
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub device_names: bool,
+}
+
+fn lenient_check_request<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::features::checks::CheckRequest>, D::Error> {
+    Ok(crate::features::checks::CheckRequest::from_json(
+        &serde_json::Value::deserialize(deserializer)?,
+    ))
+}
+
+fn lenient_discovery<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::features::discovery::DiscoveryLevel>, D::Error> {
+    Ok(serde_json::Value::deserialize(deserializer)?
+        .as_str()
+        .and_then(crate::features::discovery::DiscoveryLevel::parse))
 }
 
 fn lenient_probe_request<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<crate::features::reachability::ProbeRequest>, D::Error> {
     Ok(crate::features::reachability::ProbeRequest::from_json(
+        &serde_json::Value::deserialize(deserializer)?,
+    ))
+}
+
+fn lenient_sweep_request<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::features::sweep::SweepRequest>, D::Error> {
+    Ok(crate::features::sweep::SweepRequest::from_json(
         &serde_json::Value::deserialize(deserializer)?,
     ))
 }

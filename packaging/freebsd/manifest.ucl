@@ -1,0 +1,19 @@
+name: connlog-agent
+version: "@VERSION@"
+origin: net-mgmt/connlog-agent
+comment: "ConnLog monitoring agent: the host's health and, where allowed, its network"
+desc: <<EOD
+The ConnLog agent for FreeBSD, OPNsense and pfSense. It reports this host's
+health to ConnLog and, where its settings allow, what the host knows about
+its network: its interfaces, VLANs, ARP and NDP tables and its gateway, and
+sweeps of its own subnets. Settings: /usr/local/etc/connlog/agent.conf.
+EOD
+maintainer: "support@connlog.com"
+www: "https://connlog.com"
+prefix: /usr/local
+# Any FreeBSD on amd64: the binary needs only the base system's libc, whose
+# symbols are versioned, so one build runs on OPNsense's 14 and pfSense's 15.
+abi: "FreeBSD:*:amd64"
+licenselogic: single
+licenses: [MIT]
+categories: [net-mgmt]

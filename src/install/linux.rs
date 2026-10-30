@@ -155,6 +155,7 @@ pub fn install(
     bmc: Option<&crate::features::bmc::BmcConfig>,
     expose_system_info: bool,
     remote_reboot: Option<bool>,
+    checks: Option<bool>,
     network_map: &crate::features::network_map::ConfChoice,
 ) -> Result<()> {
     // Check if running as root
@@ -179,6 +180,10 @@ pub fn install(
     // A reinstall keeps the host's existing remote-reboot choice unless this
     // install makes a new one; with neither, the line is left out (off).
     let remote_reboot = remote_reboot.or_else(existing_conf_remote_reboot);
+    // The same for checks.
+    let checks = checks.or_else(|| {
+        read_agent_conf().and_then(|conf| conf_bool(&conf, crate::features::checks::CONF_CHECKS))
+    });
     // The same for the network map: its flag, site, ports and public probes.
     let network_map = network_map
         .clone()
@@ -191,6 +196,7 @@ pub fn install(
         bmc,
         expose_system_info,
         remote_reboot,
+        checks,
         &network_map,
     )?;
     if bmc.is_some() {
@@ -209,8 +215,18 @@ pub fn install(
         );
     }
 
-    if network_map.enabled == Some(true) {
-        println!("  Network map on (CONNLOG_NETWORK_MAP=true)");
+    if checks == Some(true) {
+        println!("  Checks on (CONNLOG_CHECKS=true)");
+    } else {
+        println!("  Checks off (to run them: sudo connlog-agent config enable-checks)");
+    }
+
+    let discovery = network_map.discovery.unwrap_or_default();
+    if discovery.network_map() {
+        println!(
+            "  Network map on (CONNLOG_DISCOVERY={})",
+            discovery.as_str()
+        );
         if let Some(site) = &network_map.site {
             println!("    site: {site}");
         }
@@ -221,7 +237,9 @@ pub fn install(
             );
         }
     } else {
-        println!("  Network map off (to join it: sudo connlog-agent config enable-network-map)");
+        println!(
+            "  Network map off (to map this network from here: sudo connlog-agent config map-network)"
+        );
     }
 
     // Copy binary to /usr/local/bin
@@ -567,6 +585,7 @@ fn write_config(
     bmc: Option<&crate::features::bmc::BmcConfig>,
     expose_system_info: bool,
     remote_reboot: Option<bool>,
+    checks: Option<bool>,
     network_map: &crate::features::network_map::ConfChoice,
 ) -> Result<()> {
     validate_env_value("CONNLOG_TOKEN", token)?;
@@ -589,6 +608,13 @@ fn write_config(
 
     if let Some(allowed) = remote_reboot {
         config.push_str(&format!("CONNLOG_ALLOW_REMOTE_REBOOT=\"{allowed}\"\n"));
+    }
+
+    if let Some(enabled) = checks {
+        config.push_str(&format!(
+            "{}=\"{enabled}\"\n",
+            crate::features::checks::CONF_CHECKS
+        ));
     }
 
     // Validated by `ConfChoice` (site and port characters are a closed set),
@@ -635,6 +661,73 @@ pub fn set_postmortem_sharing(enabled: bool) -> Result<()> {
     )
 }
 
+/// Run (or stop running) the checks ConnLog assigns, then restart.
+pub fn set_checks(enabled: bool) -> Result<()> {
+    set_agent_conf_value(
+        crate::features::checks::CONF_CHECKS,
+        if enabled { "true" } else { "false" },
+    )
+}
+
+/// Make this host a collector, or stop it being one, then restart the service.
+pub fn set_collector(enabled: bool) -> Result<()> {
+    set_agent_conf_value(
+        crate::features::integrations::CONF_COLLECTOR,
+        if enabled { "true" } else { "false" },
+    )
+}
+
+/// Write an integration's file: `root:connlog-agent`, 0640, in a directory
+/// of the same ownership, 0750, so root and the service account read it and
+/// no other user does (T10.0). Written beside it and renamed into place, so
+/// the agent never reads half a file.
+pub fn write_integration_file(dir: &Path, name: &str, contents: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::create_dir_all(dir).with_context(|| format!("Failed to create {}", dir.display()))?;
+    restrict(dir, 0o750)?;
+    let path = dir.join(format!("{name}.conf"));
+    let tmp = dir.join(format!(".{name}.conf.new"));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)
+        .with_context(|| format!("Failed to write {}", tmp.display()))?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
+    restrict(&tmp, 0o640)?;
+    fs::rename(&tmp, &path).with_context(|| format!("Failed to write {}", path.display()))?;
+    Ok(())
+}
+
+/// `root:connlog-agent` and `mode`. In the Docker image the agent's own
+/// unprivileged user writes and reads them and there is no service
+/// account's group: its owner and `mode` without the group's bits.
+fn restrict(path: &Path, mode: u32) -> Result<()> {
+    if crate::platform::Packaging::current() == crate::platform::Packaging::Docker {
+        return fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o700))
+            .with_context(|| format!("Failed to set {} permissions", path.display()));
+    }
+    // The service account's group: the FreeBSD package names it `connlog`.
+    let group = if cfg!(target_os = "freebsd") {
+        crate::install::freebsd::SERVICE_GROUP
+    } else {
+        "connlog-agent"
+    };
+    let status = system_command("chown")
+        .arg(format!("root:{group}"))
+        .arg(path)
+        .status()
+        .with_context(|| format!("Failed to set {} ownership", path.display()))?;
+    if !status.success() {
+        anyhow::bail!("Failed to set {} ownership", path.display());
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .with_context(|| format!("Failed to set {} permissions", path.display()))
+}
+
 /// Allow or refuse remote reboot from the dashboard, then restart the service.
 pub fn set_remote_reboot(allowed: bool) -> Result<()> {
     set_agent_conf_value(
@@ -643,8 +736,9 @@ pub fn set_remote_reboot(allowed: bool) -> Result<()> {
     )
 }
 
-/// Join (with any site or ports the command gave) or leave the network map,
-/// then restart the service. Leaving keeps the site and ports for next time.
+/// Set the discovery level (joining or leaving the network map, with any
+/// site or ports the command gave), then restart the service. Leaving keeps
+/// the site and ports for next time.
 pub fn set_network_map(choice: &crate::features::network_map::ConfChoice) -> Result<()> {
     let lines = choice.conf_lines();
     let pairs: Vec<(&str, &str)> = lines.iter().map(|(k, v)| (*k, v.as_str())).collect();

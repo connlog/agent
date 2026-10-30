@@ -49,6 +49,48 @@ CONNLOG_TOKEN=<TOKEN> connlog-agent register
 
 `--token <TOKEN>` is accepted too, but a command-line argument is readable by every user on the host; prefer the environment variable.
 
+### Run in Docker
+
+On a host that runs Docker (a NAS, a Raspberry Pi, a home server), the image
+`ghcr.io/connlog/agent` holds the same signed static binary and nothing else
+(`docker/Dockerfile`; `docker/compose.yaml` is the reference setup):
+
+```bash
+CONNLOG_TOKEN=<TOKEN> docker compose -f docker/compose.yaml up -d
+```
+
+It runs with the host's network, so the addresses, neighbours, connections
+and listening ports it reports are the host's, and the host's root mounted
+read-only at `/host` (`CONNLOG_HOST_ROOT`), so its disks and machine id are
+too. Unprivileged, with no capabilities and a read-only root filesystem, as
+the systemd unit runs it. Settings are the environment variables below; the
+`install`, `config` and `update` commands refuse to run in the container
+(`CONNLOG_PACKAGING=docker`, which the image sets). It never updates itself
+and never reboots its host: a new image is the update (`docker compose pull
+&& docker compose up -d`), and it reports `X-Packaging: docker`, so the
+console offers no self-update. `docker exec -it <container> connlog-agent
+integration add …` stores an integration in the `integrations.d` volume,
+readable by the agent's user only.
+
+### Run on OPNsense, pfSense or FreeBSD
+
+On a firewall (amd64), as root in its shell:
+
+```sh
+fetch -o - https://connlog.com/install.sh | CONNLOG_TOKEN=<TOKEN> sh -s -- --install --map-network
+```
+
+The installer verifies the signed package (`connlog-agent-vX.Y.Z-freebsd-x86_64.pkg`, SHA-256 and
+Ed25519 as for the Linux binary), `pkg add`s it, writes `/usr/local/etc/connlog/agent.conf`
+(root:connlog 0640, the same `CONNLOG_*` names as on Linux, one per line, no quotes) and starts the
+rc.d service (`packaging/freebsd/connlog_agent`, enabled in `/etc/rc.conf.d/connlog_agent`). It
+runs as the unprivileged `connlog` user: it reads the firewall's ARP and NDP tables, routes and
+VLANs through sysctl and ioctls, and finds devices without ping (each sweep's handshakes fill the
+ARP table). For ping, run it as root: `sysrc -f /etc/rc.conf.d/connlog_agent
+connlog_agent_user=root` and `service connlog_agent restart`. A new package is the update (the
+installer again); the agent never replaces its own binary there, and `install`, `config` and
+`update` refuse (`CONNLOG_PACKAGING=freebsd`, which the rc.d script sets).
+
 ### Environment variables
 
 | Variable                          | Description                                                                                                                                                                          |
@@ -58,10 +100,15 @@ CONNLOG_TOKEN=<TOKEN> connlog-agent register
 | `CONNLOG_EXPOSE_SYSTEM_INFO`      | Set to `true` to opt in to sending hostname with heartbeats (off by default). Prefer `sudo connlog-agent config enable-hostname`, which creates `/etc/connlog/agent.conf` if needed and restarts the service. |
 | `CONNLOG_ALLOW_REMOTE_REBOOT`     | `true` to let the dashboard reboot this host; unset or anything else refuses (the default). Prefer `sudo connlog-agent config enable-remote-reboot`, or `install --enable-remote-reboot`. The root-side hook checks the same root-only file, so neither the platform nor the running agent can turn it on. |
 | `CONNLOG_SHARE_POSTMORTEM`        | `true` to send, after the host went down without a clean stop, the previous boot's last journal and kernel warnings with the outage report: redacted, at most 8 KB, needs a persistent journal. Off by default. Prefer `sudo connlog-agent config enable-postmortem`. |
+| `CONNLOG_CHECKS`                  | `true` to run the checks ConnLog assigns, for devices without an agent: ping (3 echoes), TCP connect, HTTP(S) (status, time to the first byte, the certificate's days left; never a byte of the body) and DNS (answers from a given resolver). At most 16 at a time, 10 s each, each target at most once a minute; a private target only at the `passive` discovery level. Off by default. Prefer `sudo connlog-agent config enable-checks`, or `install --enable-checks`. |
+| `CONNLOG_COLLECTOR`               | `true` to make this host a collector: it reads the integrations in `/etc/connlog/integrations.d` (Proxmox VE: nodes, bridges, guests, their interfaces' MAC addresses, bridges and VLAN tags; OPNsense: interfaces, VLANs, gateways and their state, DHCP leases, with hostnames only while the workspace collects device names; switches and routers over SNMP v2c or v3: interfaces, VLANs, LLDP neighbours, the bridge table) every five minutes while ConnLog asks, and reports them. Credentials stay on the host, readable by root and the service account only; a report never carries one. Off by default. `sudo connlog-agent integration add` turns it on; `config enable-collector` / `disable-collector` too. |
+| `CONNLOG_DISCOVERY`               | How much this host may find out about its network: `off` (the default), `peers` (the network map, below), `passive` (peers, the VLAN id of each address on a VLAN interface, the neighbour table's private entries: address, MAC and state, at most 1,024; read with netlink dumps without privilege; and a trace of at most 16 hops towards the gateway and ConnLog every 6 hours, over the unprivileged ping socket where `net.ipv4.ping_group_range` allows it; never an interface's or a device's name). When ConnLog asks for them, the host's established connections are sent too (peer, port, direction; never the process or a byte count): at `peers` only with the other opted-in hosts on its site, at `passive` with any private address or `active` (passive, and sweeps of the host's own IPv4 subnets the console lists: a /22 at most, 64 addresses a second, an echo and handshakes to at most 8 well-known ports per address, one mDNS question and one SSDP search; never an mDNS name or a UUID). The host runs at the lower of this and what the console allows. A ceiling: ConnLog's console chooses at or below it per host and can never raise it. Set with `sudo connlog-agent config set-discovery <level>` or `install --discovery <level>`; `install --map-network` and `config map-network` set `active` (the installer asks "Map this network from here?" in a terminal). When unset, `CONNLOG_NETWORK_MAP=true` reads as `peers`. A value that is not a level is refused by `install` and `config`; the running agent warns and ignores it. |
 | `CONNLOG_NETWORK_MAP`             | `true` to take part in the network map: the agent sends its interface addresses (with prefix length), the TCP port numbers listening on a non-loopback address, its default gateway and the gateway's MAC, and runs the reachability probes ConnLog asks for. Unset or anything else is off (the default). Prefer `sudo connlog-agent config enable-network-map`, or `install --enable-network-map`. The workspace must turn the map on too. |
 | `CONNLOG_NETWORK_SITE`            | Optional network map site name: hosts with the same name are drawn as one site. Lowercase letters, digits, `.`, `_`, `-`, starting with a letter or digit; at most 64. Also set by `install --network-site` or `config enable-network-map --network-site`. |
 | `CONNLOG_NETWORK_MAP_PORTS`       | Optional comma list of at most 16 TCP ports (1..65535) other hosts should try on this one even if nothing listens yet, e.g. `443,8443`. Also set by `install --network-map-ports` or `config enable-network-map --network-map-ports`. A bad site or port list is refused by `install` and `config`; the running agent warns and ignores it. |
 | `CONNLOG_PROBE_PUBLIC`            | `true` to let network map probes reach addresses outside the private ranges (RFC 1918, 100.64/10, 169.254/16, fc00::/7, fe80::/10). Off by default: public targets are reported `skipped`. |
+| `CONNLOG_PACKAGING`               | `docker` in the Docker image: no self-update, no remote reboot, and the commands that change a systemd install refuse. Set by the image; anything else is a systemd install. |
+| `CONNLOG_HOST_ROOT`               | Where the host's root is mounted when the agent does not run in it (`/host` in the image): disks and the machine id are read through it. Only an absolute path other than `/` that exists counts. |
 | `CONNLOG_ALLOWED_ENDPOINT_DOMAINS`| Comma-separated extra domains the agent will trust for heartbeat **endpoint assignments** (see below), in addition to `connlog.com`; only relevant for self-hosted/regional setups |
 | `CONNLOG_BMC_ENDPOINT`            | Optional. The Redfish endpoint of this machine's BMC (iDRAC, iLO, OpenBMC), e.g. `https://10.0.0.120`. With the username and password below, the agent polls it for hardware health (drives, volumes, controllers, fans, PSUs, temperatures) and reports it to ConnLog. Also set by `install --bmc-endpoint ...`. |
 | `CONNLOG_BMC_USERNAME`, `CONNLOG_BMC_PASSWORD` | BMC credentials. Stored in `/etc/connlog/agent.conf` (0600 root), sent only to the configured BMC origin, never to ConnLog. |
@@ -110,6 +157,24 @@ sudo connlog-agent config disable-remote-reboot
 sudo connlog-agent config enable-network-map
 sudo connlog-agent config enable-network-map --network-site hq --network-map-ports 443,8443
 sudo connlog-agent config disable-network-map
+
+# Run the checks ConnLog assigns (off by default), and stop again
+sudo connlog-agent config enable-checks
+sudo connlog-agent config disable-checks
+
+# Read a Proxmox VE cluster as a collector: the token's secret is asked for,
+# the node's certificate shown and pinned, and the host made a collector
+sudo connlog-agent integration add pve --url https://pve.lan:8006 --token-id connlog@pve!collector
+sudo connlog-agent integration list
+sudo connlog-agent integration test pve
+sudo connlog-agent integration remove pve
+# An OPNsense firewall: the API key's secret is asked for the same way.
+sudo connlog-agent integration add fw --kind opnsense --url https://10.0.0.1 --key w86XNZob…
+# A switch over SNMPv3 (SHA-256 and AES-128); the two passwords are asked for.
+sudo connlog-agent integration add core --kind snmp --url snmp://10.0.0.2 --snmp-version 3 --user connlog
+
+# The discovery ceiling directly (off, peers, passive, active)
+sudo connlog-agent config set-discovery peers
 
 # Or at install time
 sudo CONNLOG_TOKEN=<TOKEN> connlog-agent install --enable-network-map --network-site hq
@@ -385,7 +450,9 @@ trigger it.
 
 ### Network map (opt-in)
 
-With `CONNLOG_NETWORK_MAP=true` (and the map turned on for the workspace), the
+With a discovery ceiling of `peers` or above (`CONNLOG_DISCOVERY`, or the
+older `CONNLOG_NETWORK_MAP=true`), the map turned on for the workspace and
+not turned off for this server in the console, the
 agent sends an inventory to ConnLog: this host's interface addresses with
 their prefix length (loopback, IPv6 link-local and container bridges left
 out), the TCP port numbers listening on a non-loopback address, the default

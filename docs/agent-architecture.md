@@ -21,8 +21,10 @@ the agent can be requested from the dashboard; each is confirmed on three
 consecutive heartbeats. A host can refuse remote reboot outright (see "Remote
 reboot" below).
 
-One more outbound behaviour exists only when the host opts in with
-`CONNLOG_NETWORK_MAP=true` in its root-only `agent.conf`: the network map
+One more outbound behaviour exists only when the host opts in with a
+discovery ceiling of `peers` or above in its root-only `agent.conf`
+(`CONNLOG_DISCOVERY`; an older `CONNLOG_NETWORK_MAP=true` reads as `peers`):
+the network map
 (see "Network map" below). The agent then reports its own interface
 addresses and listening TCP port numbers, and runs the capped reachability
 probes the platform asks for against other opted-in hosts. Off by default.
@@ -70,7 +72,20 @@ src/
                               storage, fans, temps, PSUs; own thread + clients
     remote_reboot.rs       — What became of a remote reboot: the attempt record
                               across the reboot, X-Reboot-State reports
-    network_map.rs         — Opt-in network map: CONNLOG_NETWORK_MAP* settings,
+    discovery.rs           — The discovery ceiling (CONNLOG_DISCOVERY, the older
+                              CONNLOG_NETWORK_MAP as peers), X-Discovery, and
+                              the level the console grants (heartbeat answer)
+    netlink.rs             — One unprivileged rtnetlink dump, for passive
+    vlan.rs                — VLAN ids of the host's VLAN interfaces (passive)
+    neighbours.rs          — The neighbour table's private entries (passive)
+    trace.rs               — The path out: a TTL trace over the ping socket
+                              towards the gateway and ConnLog (passive)
+    connections.rs         — Observed connections from /proc/net/tcp{,6}, only when
+                              the platform asks: named peers at peers, private at passive
+    checks.rs              — Checks for devices without an agent (CONNLOG_CHECKS):
+                              ping, TCP, HTTP(S), DNS within compiled-in caps;
+                              own thread and HTTP client, X-Checks
+    network_map.rs         — Opt-in network map: CONNLOG_NETWORK_* settings,
                               the inventory schedule, the inventory and probe
                               threads (own HTTP clients), X-Network-Map
     network_inventory.rs   — Addresses (getifaddrs), TCP listeners
@@ -499,17 +514,20 @@ while the platform was unreachable.
 ## Network map
 
 Opt-in on the host: nothing below runs unless the root-only
-`/etc/connlog/agent.conf` says `CONNLOG_NETWORK_MAP=true` (`config
-enable-network-map`, or `install --enable-network-map`), and the workspace
+`/etc/connlog/agent.conf` sets a discovery ceiling of `peers` or above
+(`CONNLOG_DISCOVERY`, written by `config set-discovery`, `config
+enable-network-map` or `install --discovery` / `--enable-network-map`; an
+older `CONNLOG_NETWORK_MAP=true` alone reads as `peers`), and the workspace
 must turn the map on as well. The design and the guarantees given to
 customers are in `docs/topology/PLAN.md`; the wire formats are
 `packages/agent-protocol/src/network.ts` and its fixtures.
 
 ```
 run_agent_with_shutdown_inner()
-  ├─ NetworkMapSettings::from_config — flag, site, extra ports, public probes;
-  │    a site or port list that does not parse is warned about once and left out
-  ├─ client.set_network_map_enabled  — X-Network-Map on every heartbeat
+  ├─ NetworkMapSettings::from_config — ceiling, site, extra ports, public probes;
+  │    a level, site or port list that does not parse is warned about once and
+  │    left out (a bad level falls back to CONNLOG_NETWORK_MAP, never higher)
+  ├─ client.set_discovery            — X-Discovery and X-Network-Map on every heartbeat
   └─ NetworkMap::start               — flag off: no thread, nothing else below
        ├─ "network-inventory" thread (own ApiClient)
        └─ "network-probes" thread    (own ApiClient)
@@ -741,7 +759,8 @@ In rough priority order:
    `apps/web/src/app/api/agents/heartbeat/route.ts` in the same
    commit and must bump `PROTOCOL_VERSION`.
 6. **Network map consent and caps** — nothing in `network_map.rs` may run
-   unless the host's own agent.conf says `CONNLOG_NETWORK_MAP=true`, and the
+   unless the host's own agent.conf sets a discovery ceiling of `peers` or
+   above (`features::discovery`), and the
    probe caps and private-range guard in `reachability.rs` must hold whatever
    the platform sends (guarantees 1 and 3 of `docs/topology/PLAN.md`). They
    are what we tell a customer's security team; a change that loosens one is

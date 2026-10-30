@@ -1,6 +1,6 @@
 [package]
 name = "connlog-agent"
-version = "1.21.0"
+version = "1.22.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/connlog/agent"
@@ -17,6 +17,16 @@ env_logger = "0.11"
 log = "0.4"
 hostname = "0.4"
 ring = "0.17"
+# Integrations (Phase 10) pin a Proxmox node's self-signed certificate by its
+# SHA-256 fingerprint, checked in the handshake so the API token is never
+# sent to anything else. The same rustls, and the same ring provider, that
+# reqwest already builds: nothing new is compiled in.
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+# SNMPv3 privacy (T10.3) is AES-128 in CFB mode (RFC 3826), which ring does
+# not offer. The RustCrypto block cipher and mode: pure Rust, no runtime,
+# no parser, a few tens of KB.
+aes = "0.8"
+cfb-mode = "0.8"
 # Arrow-key menus for `connlog-agent` run by hand in a terminal
 # (`features::menu`). Default features off: no editor (tempfile) and no
 # password prompts (zeroize); Select, Confirm and Input are all it uses.

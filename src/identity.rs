@@ -44,11 +44,15 @@ pub fn machine_id() -> Option<String> {
     Some(hex_encode(digest.as_ref()))
 }
 
+/// In a container (T13.1) the host's own id, through `CONNLOG_HOST_ROOT`:
+/// the image has none of its own, and the platform must see the same host
+/// whether the agent runs on it or beside it.
 #[cfg(target_os = "linux")]
 fn read_raw_machine_id() -> Option<String> {
-    std::fs::read_to_string("/etc/machine-id")
-        .ok()
-        .or_else(|| std::fs::read_to_string("/var/lib/dbus/machine-id").ok())
+    let root = crate::platform::host_root().unwrap_or_else(|| "/".into());
+    ["etc/machine-id", "var/lib/dbus/machine-id"]
+        .iter()
+        .find_map(|path| std::fs::read_to_string(root.join(path)).ok())
 }
 
 #[cfg(not(target_os = "linux"))]

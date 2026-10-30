@@ -10,9 +10,111 @@ env:
 
 # Actions are pinned to commit SHAs (the tag is a comment) so a moved tag
 # cannot change what builds or signs a release.
+#
+# The checks gate the build. They run here, in this public repository (no
+# Actions minutes are billed for one), and nowhere else: connlog/platform
+# runs no CI (owner, 2026-10-30; canary is its check), so this is where the
+# signing-key refusal, the size budget, cargo deny and the FreeBSD build
+# (OPNsense and pfSense run the agent there) are proved before a release.
 jobs:
+  checks:
+    name: fmt + clippy + test, size budget, signing-key refusal
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      RUSTFLAGS: '-D warnings'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          components: rustfmt, clippy
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --all-targets
+
+      - name: Binary size budget
+        # Hard ceiling on the release binary: 12 MiB. Built without the
+        # signing key, so it never ships.
+        env:
+          CONNLOG_ALLOW_UNSIGNED_BUILD: '1'
+        run: |
+          set -e
+          cargo build --release
+          SIZE=$(stat -c '%s' target/release/connlog-agent)
+          BUDGET=$((12 * 1024 * 1024))
+          echo "release binary: $SIZE bytes (budget $BUDGET)"
+          if [ "$SIZE" -gt "$BUDGET" ]; then
+            echo "::error::Release binary exceeds 12 MiB ($SIZE bytes)."
+            exit 1
+          fi
+
+      - name: Release build refuses to ship without a signing key
+        # The guard in build.rs is the only thing between an unset secret
+        # and a fleet-wide update that cannot be verified. Prove it trips.
+        run: |
+          set +e
+          out=$(cargo build --release 2>&1)
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "::error::A release build without CONNLOG_SIGNING_PUBLIC_KEY succeeded; build.rs must refuse it."
+            exit 1
+          fi
+          echo "$out" | grep -q "CONNLOG_SIGNING_PUBLIC_KEY" || { echo "::error::Unexpected failure output"; echo "$out"; exit 1; }
+
+  deny:
+    name: cargo deny (advisories, licences, sources)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --all-features
+
+  freebsd:
+    # A real FreeBSD VM on this Linux runner (there is no FreeBSD runner):
+    # clippy and the tests, then the firewall readers against the VM's own
+    # kernel with a VLAN interface and a static ARP entry (T13.5b).
+    name: FreeBSD 14
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: clippy and test in FreeBSD 14
+        uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
+        with:
+          release: '14.3'
+          copyback: false
+          prepare: |
+            pkg install -y curl
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal -c clippy
+          run: |
+            . "$HOME/.cargo/env"
+            cargo clippy --all-targets -- -D warnings
+            cargo test --all-targets
+            parent=$(route -n get default | awk '/interface:/ { print $2 }')
+            ifconfig vlan0 create vlan 20 vlandev "$parent" inet 10.99.20.1/24 up
+            arp -s 10.99.20.7 02:00:00:00:00:07
+            cargo test --all-targets -- --ignored freebsd_
+
   build:
     name: Build ${{ matrix.target }}
+    needs: [checks, deny, freebsd]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -108,6 +210,60 @@ jobs:
             target/${{ matrix.target }}/release/connlog-agent-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz.sha256
             target/${{ matrix.target }}/release/connlog-agent-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}
 
+  # The FreeBSD binary and its package (OPNsense, pfSense; T13.5d), built in a
+  # FreeBSD VM: the binary links the base system's libc, so it is built where
+  # that libc is. With the signing public key, like the Linux builds; signed
+  # with them by the next job (the package as a file of its own, so install.sh
+  # can verify it before `pkg add`).
+  build-freebsd:
+    name: Build FreeBSD amd64 and its package
+    needs: [checks, deny, freebsd]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build and package in FreeBSD 14
+        uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
+        env:
+          CONNLOG_SIGNING_PUBLIC_KEY: ${{ secrets.CONNLOG_SIGNING_PUBLIC_KEY }}
+          VERSION: ${{ github.ref_name }}
+        with:
+          release: '14.3'
+          envs: 'CONNLOG_SIGNING_PUBLIC_KEY VERSION'
+          prepare: |
+            pkg install -y curl
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          run: |
+            set -e
+            . "$HOME/.cargo/env"
+            case "$VERSION" in v[0-9]*.[0-9]*.[0-9]*) ;; *) echo "bad tag $VERSION"; exit 1 ;; esac
+            cargo build --release
+            reported=$(target/release/connlog-agent --version | awk '{print $NF}')
+            [ "v$reported" = "$VERSION" ] || { echo "binary reports v$reported, tag is $VERSION"; exit 1; }
+            mkdir -p dist
+            cp target/release/connlog-agent "dist/connlog-agent-${VERSION}-freebsd-x86_64"
+            sh packaging/freebsd/build-pkg.sh target/release/connlog-agent "$reported" pkgout
+            cp pkgout/connlog-agent-*.pkg "dist/connlog-agent-${VERSION}-freebsd-x86_64.pkg"
+            # The package installs and its service starts (no token: it
+            # stops at the missing settings, which is the point checked).
+            pkg add "dist/connlog-agent-${VERSION}-freebsd-x86_64.pkg"
+            pw usershow connlog
+            test "$(stat -f %Lp /usr/local/etc/connlog)" = 750
+            sysrc -f /etc/rc.conf.d/connlog_agent connlog_agent_enable=YES
+            if service connlog_agent start 2>err.log; then
+              echo "started without settings"; exit 1
+            fi
+            grep -q "agent.conf is missing" err.log
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: connlog-agent-freebsd-x86_64
+          path: dist/
+
   # ── Sign & Publish ──────────────────────────────────────────
   # This job runs in the protected "release" environment.
   # Configure it in GitHub → Settings → Environments → release:
@@ -115,7 +271,7 @@ jobs:
   #   ✓ Restrict to tags matching v*
   sign-and-release:
     name: Sign & Create Release
-    needs: build
+    needs: [build, build-freebsd]
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -162,6 +318,8 @@ jobs:
           subject-path: |
             artifacts/**/connlog-agent-${{ github.ref_name }}-linux-x86_64
             artifacts/**/connlog-agent-${{ github.ref_name }}-linux-aarch64
+            artifacts/**/connlog-agent-${{ github.ref_name }}-freebsd-x86_64
+            artifacts/**/connlog-agent-${{ github.ref_name }}-freebsd-x86_64.pkg
             artifacts/**/*.tar.gz
 
       - name: Create or update release
@@ -180,6 +338,8 @@ jobs:
           ### Supported platforms
           - Linux x86_64 (\`connlog-agent-${VERSION}-linux-x86_64\`)
           - Linux aarch64 (\`connlog-agent-${VERSION}-linux-aarch64\`)
+          - FreeBSD amd64, and its package for OPNsense and pfSense (\`connlog-agent-${VERSION}-freebsd-x86_64.pkg\`)
+          - Docker, both architectures (\`ghcr.io/connlog/agent:${VERSION#v}\`, published once this release is)
 
           ### Auto-update
           Existing agents update to this version on their next heartbeat. Every
@@ -218,3 +378,72 @@ jobs:
               --latest \
               $RAW_BINS artifacts/*/*.tar.gz artifacts/*/*.sha256 artifacts/*/*.sig "$NOTICES"
           fi
+
+  # The Docker image (docs/topology/PLAN.md, T13.1): the binaries the job
+  # above signed, verified here again with the public key alone, packed into
+  # an image with nothing else in it. Runs after the release is published, so
+  # an image never exists for a release that does not. No third-party action:
+  # the runner's own docker and buildx.
+  #
+  # The first push creates ghcr.io/connlog/agent as a private package; it is
+  # made public once, by hand, in the organisation's package settings.
+  image:
+    name: Docker image
+    needs: sign-and-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+
+      - name: Fetch the signatures the release published
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -e
+          mkdir -p sigs
+          gh release download "$VERSION" --dir sigs --pattern '*.sig'
+
+      - name: Verify and prepare the build context
+        env:
+          CONNLOG_SIGNING_PUBLIC_KEY: ${{ secrets.CONNLOG_SIGNING_PUBLIC_KEY }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -e
+          for arch in x86_64 aarch64; do
+            bin=$(find artifacts -type f -name "connlog-agent-${VERSION}-linux-${arch}" | head -n 1)
+            test -n "$bin" || { echo "::error::no ${arch} binary"; exit 1; }
+            cp "sigs/connlog-agent-${VERSION}-linux-${arch}.sig" "$bin.sig"
+            sh scripts/verify-release.sh "$bin" "$CONNLOG_SIGNING_PUBLIC_KEY"
+            eval "bin_${arch}=\$bin"
+          done
+          sh docker/context.sh "$RUNNER_TEMP/image" "$bin_x86_64" "$bin_aarch64"
+
+      - name: Build and push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -e
+          version=${VERSION#v}
+          major=${version%%.*}
+          image=ghcr.io/connlog/agent
+          printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker buildx create --use --name connlog
+          # Only COPY instructions: nothing runs for the arm64 image, so no
+          # emulation is needed to build it here.
+          docker buildx build "$RUNNER_TEMP/image" \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg "VERSION=$version" \
+            --provenance=true --sbom=false \
+            --tag "$image:$version" --tag "$image:$major" --tag "$image:latest" \
+            --push

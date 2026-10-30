@@ -6,7 +6,140 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 [`VERSIONING.md`](./VERSIONING.md) for the full policy. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [1.22.0] — 2026-10-30
+
+### Added
+
+- **OPNsense, pfSense and FreeBSD (T13.5).** A FreeBSD amd64 build and package
+  (`connlog-agent-vX.Y.Z-freebsd-x86_64.pkg`, signed like the binaries), with an
+  rc.d service that runs the agent as an unprivileged `connlog` user, or as root
+  for ping. The passive level reads the firewall's ARP and NDP tables and its
+  default route through the routing sysctl and VLAN tags with `SIOCGETVLAN`. A
+  sweep counts what answered ARP after its handshakes, which is how it finds
+  devices without ping (on Linux too); the echo falls back to a raw ICMP socket
+  as root. `X-Packaging: freebsd`: never offered a self-update. The release
+  workflow now runs fmt, clippy, the tests, the size budget, the signing-key
+  refusal, cargo deny and a FreeBSD VM before it builds.
+
+- **One question at install (T13.4).** `--map-network` (with `install`) and
+  `config map-network` write `CONNLOG_DISCOVERY=active`: "map this network
+  from here". The installer asks it once, in a terminal, when its command
+  said nothing about the network, and only of an agent that has the flag.
+
+- **A Docker image (T13.1).** `ghcr.io/connlog/agent`, published by the
+  release workflow after the binaries are signed (and verified again with the
+  public key alone): the static binary, its licences and nothing else, run
+  unprivileged with the host's network and its root read-only at `/host`.
+  `CONNLOG_PACKAGING=docker` (set by the image) turns off the self-update and
+  remote reboot and makes `install`, `config` and `update` refuse;
+  `CONNLOG_HOST_ROOT` reads disks and the machine id through the host's
+  mount. Every heartbeat now carries `X-Packaging: systemd|docker`, so the
+  console offers a Docker agent a new image, never a self-update.
+
+- **Integrations, as a collector (Phase 10).** `CONNLOG_COLLECTOR=true` makes
+  the host read the integrations in `/etc/connlog/integrations.d` and post
+  what they read to `POST /api/agents/integrations` every five minutes, while
+  the heartbeat answer says `integrations: true`; reported in `X-Collector`.
+  Today, **Proxmox VE** through its REST API with a read-only API token
+  (`PVEAuditor`): nodes, bridges, guests, each guest's interfaces (MAC,
+  bridge, VLAN tag, a container's static address). `sudo connlog-agent
+  integration add|list|test|remove` manages them: the secret is read from
+  standard input, never the command line, each file is `root:connlog-agent`
+  0640, and an integration is saved only once it reads. A self-signed node
+  certificate is pinned by its SHA-256 fingerprint, checked in the TLS
+  handshake, so the token is never sent anywhere else. A report names each
+  integration and, when it fails, one word from a fixed list; never a
+  secret, never an error's text. `rustls` is now a direct dependency for the
+  pinning, the same version and provider reqwest already builds (+207 KB).
+
+- **OPNsense as an integration (T10.2).** `integration add <name> --kind
+  opnsense --url https://… --key …` reads a firewall through its REST API
+  with an API key and secret (HTTP basic) of a user that only has the pages
+  read: its interfaces with their IPv4 addresses and VLAN tags, its gateways
+  with dpinger's state, round trip and loss, and the active DHCP leases of
+  Kea, Dnsmasq or the ISC plugin, whichever answers. A lease's hostname is
+  read only while the heartbeat answer says `device_names: true` (the
+  workspace collects device names); otherwise no hostname leaves the host.
+
+- **Subnet sweeps at `active` (T12.1).** A heartbeat answer's
+  `sweep_request` (an IPv4 subnet, the ports, whether to ask mDNS and SSDP)
+  is run only by a host at `active`, its own ceiling and the console's
+  allowance both; below that it is answered `not-active` without a packet.
+  Compiled-in caps: a subnet the host has an address in, a /22 at most,
+  64 addresses started a second (32 in flight), an ICMP echo and TCP
+  handshakes to at most 8 ports of a fixed list of 16 well-known ones, one
+  `_services._dns-sd._udp.local` question (a legacy unicast query: no
+  multicast group joined) and one SSDP M-SEARCH, each out of that
+  interface with a TTL of 1. Results go to `POST /api/agents/sweeps`: the
+  addresses that answered, their open ports, their mDNS service types and
+  their SSDP `SERVER` line and types; never an mDNS instance name, never a
+  UUID. One sweep at a time, on its own thread.
+
+- **Switches and routers over SNMP (T10.3).** `integration add <name> --kind
+  snmp --url snmp://host[:port]` with `--snmp-version 2c` (a community) or
+  `3` (`--user`, `--auth sha256|sha`, AES-128 privacy unless
+  `--no-privacy`); MD5 and DES are not offered. The agent's own SNMP
+  manager (GET and GETBULK only, never a SET; engine discovery, time-window
+  resync, every v3 answer authenticated) reads IF-MIB interfaces, the
+  Q-BRIDGE VLANs with each port's PVID and tagged VLANs, LLDP-MIB
+  neighbours and the bridge table (Q-BRIDGE, else BRIDGE-MIB). CDP, the
+  device's description and its configuration are not read. `aes` and
+  `cfb-mode` are new direct dependencies for RFC 3826's AES-CFB, which ring
+  does not offer (pure Rust, no runtime).
+
+- **Discovery levels.** `CONNLOG_DISCOVERY` in the root-only
+  `/etc/connlog/agent.conf` sets how much this host may find out about its
+  network: `off` (the default), `peers` (the network map), `passive` and
+  `active` (reserved for subnet sweeps; today the same as `passive`). It is a
+  ceiling: ConnLog's console chooses at or below it and cannot raise it; the
+  heartbeat answer's `discovery` says what the console allows, and the host
+  runs at the lower of the two (an answer without it is `peers`). Set
+  with `config set-discovery <level>` or `install --discovery <level>`; a
+  host with only `CONNLOG_NETWORK_MAP=true` reads as `peers`, so nothing
+  installed changes level on upgrade. Reported on every heartbeat in
+  `X-Discovery`, beside `X-Network-Map`.
+- **VLAN ids at `passive`.** The inventory gives each address on a VLAN
+  interface its 802.1Q id (`vlan`), read with one netlink link dump
+  (`RTM_GETLINK`), which needs no privilege; the interface's name never
+  leaves the host. A level turned down reads the inventory again at once.
+- **Neighbours at `passive`.** The inventory adds the host's neighbour
+  table (`neighbours`): each private entry's address, MAC and state
+  (`reachable`, `stale`, `permanent`), IPv4 and IPv6, from one netlink dump
+  (`RTM_GETNEIGH`) without privilege; entries without a MAC, public
+  addresses and multicast MACs left out; at most 1,024, in address order.
+- **The path out at `passive`.** A trace towards the default gateway and
+  towards ConnLog's address (`path`), at most 16 hops, one echo per hop with
+  a rising TTL over the unprivileged ping socket the probes use, the
+  routers' answers read from its error queue (`IP_RECVERR`); every 6 hours
+  or when the gateway changes. No trace where `net.ipv4.ping_group_range`
+  does not allow the socket.
+
+- **Observed connections, when the platform asks.** With `connections` on
+  a heartbeat answer, the inventory adds the host's established TCP
+  connections with private peers (`connections`): the peer, the port and
+  the direction (`in` when the peer opened it to a port this host listens
+  on), from `/proc/net/tcp{,6}`; never the process, the user or a byte
+  count, never a public or loopback peer; at most 512. At `peers`, only the
+  peers the platform named with its probe request (`peers`: the other
+  opted-in hosts on the site); at `passive`, any private peer.
+- **Checks for devices without an agent.** With `CONNLOG_CHECKS=true`
+  (`config enable-checks`, `install --enable-checks`, a toggle in the menu),
+  the agent runs the `check_request` a heartbeat answer carries and posts the
+  results to `POST /api/agents/checks`
+  (`application/vnd.connlog.checks.v1+json`): ping (3 echoes over the
+  unprivileged ping socket), TCP connect, HTTP(S) (one GET pinned to the
+  resolved address, no redirect, status, time to the first byte and the
+  certificate's days left, never the body, never through a proxy) and DNS (A
+  or AAAA from a given resolver). Caps compiled in: 16 checks a request, 10
+  s each, each target once a minute, private targets only at `passive`,
+  never loopback or multicast. Reported in `X-Checks`.
+
+### Changed
+
+- `config enable-network-map`, `config disable-network-map`, the menu's
+  toggle and `install --enable-network-map` write `CONNLOG_DISCOVERY` with
+  the `CONNLOG_NETWORK_MAP` it implies. Joining the map never lowers a
+  higher level the host already allows.
 
 ## [1.21.0] — 2026-10-28
 
@@ -1022,6 +1155,7 @@ considered stable; breaking changes from this point on require a major bump.
 
 - Last pre-1.0 release. See git history for prior changes.
 
+[1.22.0]: https://github.com/connlog/agent/compare/v1.21.0...v1.22.0
 [1.21.0]: https://github.com/connlog/agent/compare/v1.20.0...v1.21.0
 [1.20.0]: https://github.com/connlog/agent/compare/v1.19.0...v1.20.0
 [1.19.0]: https://github.com/connlog/agent/compare/v1.18.0...v1.19.0

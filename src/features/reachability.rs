@@ -48,7 +48,13 @@ const MAX_ID_LEN: usize = 64;
 pub struct ProbeRequest {
     pub id: String,
     pub targets: Vec<ProbeTarget>,
+    /// The other opted-in hosts on this host's site (T11.1): at the peers
+    /// level, the only ones whose connections may be sent. At most 1,024.
+    pub peers: Vec<IpAddr>,
 }
+
+/// `PROBE_MAX_PEERS` in the protocol.
+pub const MAX_PEERS: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeTarget {
@@ -100,9 +106,21 @@ impl ProbeRequest {
                 })
             })
             .collect();
+        let peers = value
+            .get("peers")
+            .and_then(Value::as_array)
+            .map(|peers| {
+                peers
+                    .iter()
+                    .take(MAX_PEERS)
+                    .filter_map(|p| parse_address(p.as_str()?))
+                    .collect()
+            })
+            .unwrap_or_default();
         Some(Self {
             id: id.to_string(),
             targets,
+            peers,
         })
     }
 }
@@ -337,7 +355,7 @@ fn last_errno() -> i32 {
 
 /// One echo request on an unprivileged ping socket, and its reply.
 /// `skipped` when this host does not let the agent's group open one.
-fn icmp_echo(address: IpAddr, timeout: Duration) -> Probe {
+pub fn icmp_echo(address: IpAddr, timeout: Duration) -> Probe {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     let (domain, protocol, request_type, reply_type) = match address {
@@ -347,9 +365,14 @@ fn icmp_echo(address: IpAddr, timeout: Duration) -> Probe {
     // SAFETY: plain socket(2); the descriptor is owned below.
     let raw = unsafe { libc::socket(domain, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, protocol) };
     if raw < 0 {
-        // EACCES / EPERM (ping_group_range), or no such protocol: not a
-        // probe this host allows.
-        return Probe::of(Outcome::Skipped);
+        // EACCES / EPERM (ping_group_range), or no such protocol (FreeBSD
+        // has no ping socket): a raw socket, which only an agent its host's
+        // root chose to run as root can open (T13.5c); else not a probe
+        // this host allows.
+        return match address {
+            IpAddr::V4(v4) => raw_echo_v4(v4, timeout).unwrap_or(Probe::of(Outcome::Skipped)),
+            IpAddr::V6(_) => Probe::of(Outcome::Skipped),
+        };
     }
     // SAFETY: `raw` is a fresh descriptor nothing else owns.
     let socket = unsafe { OwnedFd::from_raw_fd(raw) };
@@ -443,6 +466,106 @@ fn icmp_echo(address: IpAddr, timeout: Duration) -> Probe {
     }
 }
 
+/// Whether a raw socket's IPv4 packet is the echo reply to `id`, sequence 1:
+/// a raw socket hands back the IP header and every ICMP message the host
+/// gets, so the identifier is what tells ours apart.
+pub fn is_echo_reply(packet: &[u8], id: u16) -> bool {
+    let Some(first) = packet.first() else {
+        return false;
+    };
+    let header = usize::from(first & 0x0f) * 4;
+    matches!(
+        packet.get(header..header + 8),
+        Some(icmp) if icmp[0] == 0 && icmp[4..6] == id.to_be_bytes() && icmp[6..8] == [0, 1]
+    )
+}
+
+/// One echo on a raw ICMP socket, for a host without a ping socket whose
+/// root runs the agent as root (a firewall, T13.5c). `None` when the socket
+/// cannot be opened: without privilege, that is every time.
+pub fn raw_echo_v4(address: Ipv4Addr, timeout: Duration) -> Option<Probe> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::sync::atomic::{AtomicU16, Ordering};
+
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    // SAFETY: plain socket(2); the descriptor is owned below.
+    let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_ICMP) };
+    if raw < 0 {
+        return None;
+    }
+    // SAFETY: `raw` is a fresh descriptor nothing else owns.
+    let socket = unsafe { OwnedFd::from_raw_fd(raw) };
+    let fd = socket.as_raw_fd();
+    let id = (std::process::id() as u16) ^ NEXT.fetch_add(1, Ordering::Relaxed).rotate_left(8);
+    let mut packet = [8u8, 0, 0, 0, 0, 0, 0, 1];
+    packet[4..6].copy_from_slice(&id.to_be_bytes());
+    let sum = icmp_checksum(&packet).to_be_bytes();
+    packet[2..4].copy_from_slice(&sum);
+    let to = sockaddr_v4(address);
+    let started = Instant::now();
+    // SAFETY: `to` is a valid sockaddr_in for its stated length.
+    let sent = unsafe {
+        libc::sendto(
+            fd,
+            packet.as_ptr().cast(),
+            packet.len(),
+            0,
+            (&to as *const libc::sockaddr_in).cast(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    if sent < 0 {
+        return Some(Probe::of(Outcome::Unreachable));
+    }
+    let mut reply = [0u8; 256];
+    loop {
+        let Some(left) = timeout.checked_sub(started.elapsed()) else {
+            return Some(Probe::of(Outcome::Timeout));
+        };
+        let mut poll = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = left.as_millis().clamp(1, i32::MAX as u128) as libc::c_int;
+        // SAFETY: one pollfd, valid for the call.
+        let ready = unsafe { libc::poll(&mut poll, 1, millis) };
+        if ready == 0 {
+            return Some(Probe::of(Outcome::Timeout));
+        }
+        if ready < 0 {
+            if last_errno() == libc::EINTR {
+                continue;
+            }
+            return Some(Probe::of(Outcome::Unreachable));
+        }
+        // SAFETY: all-zero is a valid sockaddr_in; recvfrom writes within
+        // `reply` and `from`.
+        let mut from: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        let mut from_len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+        let n = unsafe {
+            libc::recvfrom(
+                fd,
+                reply.as_mut_ptr().cast(),
+                reply.len(),
+                libc::MSG_DONTWAIT,
+                (&mut from as *mut libc::sockaddr_in).cast(),
+                &mut from_len,
+            )
+        };
+        if n < 0 {
+            match last_errno() {
+                libc::EAGAIN | libc::EINTR => continue,
+                _ => return Some(Probe::of(Outcome::Unreachable)),
+            }
+        }
+        let source = Ipv4Addr::from(from.sin_addr.s_addr.to_ne_bytes());
+        if source == address && is_echo_reply(&reply[..n as usize], id) {
+            return Some(Probe::open(started.elapsed()));
+        }
+    }
+}
+
 fn sockaddr_v4(ip: Ipv4Addr) -> libc::sockaddr_in {
     // SAFETY: all-zero is a valid sockaddr_in.
     let mut to: libc::sockaddr_in = unsafe { std::mem::zeroed() };
@@ -483,6 +606,34 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn tells_its_own_echo_reply_from_any_other_icmp() {
+        // An IPv4 header (20 bytes), then an echo reply to id 0x1234, sequence 1.
+        let mut packet = vec![0x45u8];
+        packet.resize(20, 0);
+        packet.extend([0, 0, 0, 0, 0x12, 0x34, 0, 1]);
+        assert!(is_echo_reply(&packet, 0x1234));
+        assert!(!is_echo_reply(&packet, 0x4321), "another process's ping");
+        packet[20] = 8;
+        assert!(!is_echo_reply(&packet, 0x1234), "a request, not a reply");
+        assert!(!is_echo_reply(&packet[..24], 0x1234), "cut short");
+        assert!(!is_echo_reply(&[], 0x1234));
+    }
+
+    /// Only as root (the FreeBSD VM in CI, a root agent on a firewall):
+    /// unprivileged, the raw socket cannot be opened and nothing is sent.
+    #[test]
+    fn a_raw_echo_reaches_loopback_as_root_and_nothing_opens_otherwise() {
+        // SAFETY: geteuid has no preconditions.
+        let root = unsafe { libc::geteuid() } == 0;
+        let probe = raw_echo_v4(Ipv4Addr::LOCALHOST, Duration::from_secs(2));
+        if root {
+            assert_eq!(probe.map(|p| p.outcome), Some(Outcome::Open));
+        } else {
+            assert!(probe.is_none());
+        }
     }
 
     /// The agent's half of `probe-requests.json`: the same addresses are

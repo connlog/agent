@@ -257,6 +257,23 @@ impl QuickActionPollState {
 /// error messages. Centralising it removes the drift hazard and gives both
 /// the daemon and the diagnostic CLI paths a single place to evolve the
 /// prefix rules from.
+/// The command a run would make that installs, configures or updates a
+/// systemd install, which the Docker image has none of; `None` for the rest.
+fn changes_the_host(config: &Config) -> Option<&'static str> {
+    match &config.command {
+        Some(AgentCommand::Install) => Some("install"),
+        Some(AgentCommand::Uninstall) => Some("uninstall"),
+        Some(AgentCommand::Config { .. }) => Some("config"),
+        Some(AgentCommand::Update) => Some("update"),
+        Some(AgentCommand::ApplyStagedUpdate) => Some("apply-staged-update"),
+        Some(AgentCommand::RefreshService { .. }) => Some("refresh-service"),
+        _ if config.install => Some("--install"),
+        _ if config.uninstall => Some("--uninstall"),
+        _ if config.update => Some("--update"),
+        _ => None,
+    }
+}
+
 fn validate_token_prefix(token: &str) -> Result<()> {
     if !token.starts_with("agent_") {
         anyhow::bail!("Invalid token format — must start with 'agent_'");
@@ -282,6 +299,21 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    match (platform::Packaging::current(), changes_the_host(&config)) {
+        (platform::Packaging::Docker, Some(what)) => anyhow::bail!(
+            "`{what}` changes a systemd install; in Docker the agent's settings are the \
+             container's environment and a new image is the update. Change the environment \
+             in `docker run` or the Compose file and recreate the container."
+        ),
+        (platform::Packaging::Freebsd, Some(what)) => anyhow::bail!(
+            "`{what}` changes a systemd install; on FreeBSD the agent's settings are in \
+             {} and a new package is the update. Edit the file and run \
+             `service connlog_agent restart`.",
+            install::freebsd::CONF
+        ),
+        _ => {}
+    }
+
     if let Some(command) = config.command.clone() {
         match command {
             AgentCommand::Register => {}
@@ -294,6 +326,7 @@ fn main() -> Result<()> {
                     bmc.as_ref(),
                     config.expose_system_info,
                     config.requested_remote_reboot(),
+                    config.requested_checks(),
                     &network_map,
                 );
             }
@@ -314,15 +347,36 @@ fn main() -> Result<()> {
                     return install::set_postmortem_sharing(false);
                 }
                 LocalConfigCommand::EnableNetworkMap => {
+                    // Joining the map never lowers a level the host already allows.
+                    let now = install::read_agent_conf()
+                        .as_deref()
+                        .map(features::discovery::conf_ceiling)
+                        .unwrap_or_default();
                     let choice = features::network_map::ConfChoice {
-                        enabled: Some(true),
+                        discovery: Some(now.max(features::discovery::DiscoveryLevel::Peers)),
                         ..features::network_map::ConfChoice::from_config(&config)?
                     };
                     return install::set_network_map(&choice);
                 }
+                LocalConfigCommand::MapNetwork => {
+                    return install::set_network_map(&features::network_map::ConfChoice {
+                        discovery: Some(features::discovery::DiscoveryLevel::Active),
+                        ..features::network_map::ConfChoice::from_config(&config)?
+                    });
+                }
                 LocalConfigCommand::DisableNetworkMap => {
                     return install::set_network_map(&features::network_map::ConfChoice {
-                        enabled: Some(false),
+                        discovery: Some(features::discovery::DiscoveryLevel::Off),
+                        ..Default::default()
+                    });
+                }
+                LocalConfigCommand::EnableChecks => return install::set_checks(true),
+                LocalConfigCommand::DisableChecks => return install::set_checks(false),
+                LocalConfigCommand::EnableCollector => return install::set_collector(true),
+                LocalConfigCommand::DisableCollector => return install::set_collector(false),
+                LocalConfigCommand::SetDiscovery { level } => {
+                    return install::set_network_map(&features::network_map::ConfChoice {
+                        discovery: Some(level),
                         ..Default::default()
                     });
                 }
@@ -349,6 +403,9 @@ fn main() -> Result<()> {
                 return run_test_heartbeat(token, endpoint);
             }
             AgentCommand::Action { command } => return run_action_command(command),
+            AgentCommand::Integration { command } => {
+                return features::integrations::cli::run(command, config.collector_enabled());
+            }
             AgentCommand::Diagnostics { command } => match command {
                 DiagnosticCommand::CheckConfig => {
                     let token = config
@@ -441,6 +498,7 @@ fn main() -> Result<()> {
             bmc.as_ref(),
             config.expose_system_info,
             config.requested_remote_reboot(),
+            config.requested_checks(),
             &network_map,
         );
     }
@@ -452,7 +510,11 @@ fn main() -> Result<()> {
 
     let endpoint = config.resolve_endpoint(DEFAULT_ENDPOINT);
     let expose_system_info = config.expose_system_info;
-    let allow_remote_reboot = config.remote_reboot_allowed();
+    // A container cannot reboot its host, and must not try: there is no
+    // root-side step outside it to do the reboot (T13.1); nor is there on a
+    // firewall's package (T13.5d).
+    let packaging = platform::Packaging::current();
+    let allow_remote_reboot = config.remote_reboot_allowed() && packaging.manages_itself();
     // Resolve BMC config here (where the parsed Config is in scope). None ->
     // the poller stays inert.
     let bmc_config = features::bmc::BmcConfig::from_config(&config);
@@ -478,6 +540,8 @@ fn main() -> Result<()> {
         allow_remote_reboot,
         host_settings,
         network_map,
+        config.checks_enabled(),
+        config.collector_enabled(),
         bmc_config,
         stop,
     )
@@ -492,11 +556,16 @@ fn run_agent_with_shutdown_inner(
     allow_remote_reboot: bool,
     host_settings: http::HostSettings,
     network_map: features::network_map::NetworkMapSettings,
+    checks_enabled: bool,
+    collector_enabled: bool,
     bmc_config: Option<features::bmc::BmcConfig>,
     stop: Arc<AtomicBool>,
 ) -> Result<()> {
     info!("ConnLog Agent v{} starting", AGENT_VERSION);
-    install::warn_if_installed_service_stale_once();
+    // A container has no unit file; it is not stale, it is not there.
+    if platform::Packaging::current() == platform::Packaging::Systemd {
+        install::warn_if_installed_service_stale_once();
+    }
 
     #[cfg(debug_assertions)]
     info!("Endpoint: {} (debug build)", endpoint);
@@ -538,6 +607,23 @@ fn run_agent_with_shutdown_inner(
         token.clone(),
         Arc::clone(&stop),
     );
+    // Checks (T9.1): inert unless CONNLOG_CHECKS=true; their own thread and
+    // HTTP client too.
+    let checks = features::checks::Checks::start(
+        checks_enabled,
+        endpoint.clone(),
+        token.clone(),
+        Arc::clone(&stop),
+    );
+
+    // Integrations (Phase 10): inert unless CONNLOG_COLLECTOR=true; their
+    // own thread and HTTP client too.
+    let integrations = features::integrations::Integrations::start(
+        collector_enabled,
+        endpoint.clone(),
+        token.clone(),
+        Arc::clone(&stop),
+    );
 
     let mut client = ApiClient::new(endpoint, token).context("Failed to initialize HTTP client")?;
 
@@ -554,16 +640,32 @@ fn run_agent_with_shutdown_inner(
     client.set_telemetry(telemetry);
     client.set_remote_reboot_allowed(allow_remote_reboot);
     client.set_host_settings(host_settings);
-    client.set_network_map_enabled(network_map.enabled);
-    if !network_map.enabled {
+    client.set_discovery(network_map.discovery);
+    client.set_checks_enabled(checks_enabled);
+    client.set_collector_enabled(collector_enabled);
+    let packaging = platform::Packaging::current();
+    client.set_packaging(packaging);
+    if packaging == platform::Packaging::Docker {
         info!(
-            "Network map is off on this host; `sudo connlog-agent config enable-network-map` joins it"
+            "Running in Docker: settings are the container's environment (CONNLOG_DISCOVERY, \
+             CONNLOG_CHECKS, CONNLOG_COLLECTOR), and a new image is the update"
         );
-    }
-    if !allow_remote_reboot {
+    } else if packaging == platform::Packaging::Freebsd {
         info!(
-            "Remote reboot is off on this host; `sudo connlog-agent config enable-remote-reboot` allows it"
+            "Running from the FreeBSD package: settings are in {}, and a new package is the update",
+            install::freebsd::CONF
         );
+    } else {
+        if !network_map.enabled() {
+            info!(
+                "Network map is off on this host; `sudo connlog-agent config enable-network-map` joins it"
+            );
+        }
+        if !allow_remote_reboot {
+            info!(
+                "Remote reboot is off on this host; `sudo connlog-agent config enable-remote-reboot` allows it"
+            );
+        }
     }
 
     // A reboot this agent handed to systemd before it last exited: say what
@@ -769,7 +871,14 @@ fn run_agent_with_shutdown_inner(
                         update_info.signature_url.is_some(),
                         update_info.sha256.is_some(),
                     );
-                    match update::try_apply_update(update_info) {
+                    let applied = if !packaging.manages_itself() {
+                        // A new image or package is the update: nothing
+                        // outside the agent would verify and swap the binary.
+                        Ok(false)
+                    } else {
+                        update::try_apply_update(update_info)
+                    };
+                    match applied {
                         Ok(true) => {
                             info!(
                                 "Update to v{} staged successfully. Restarting for update...",
@@ -837,8 +946,24 @@ fn run_agent_with_shutdown_inner(
                     );
                 }
 
-                // The network map: never blocks, does nothing with the flag off.
-                network.on_heartbeat(response.inventory_request, response.probe_request);
+                // Private targets only at the passive level: the lower of the
+                // host's ceiling and what the console allows now.
+                let allow_private = network_map.discovery.min(
+                    response
+                        .discovery
+                        .unwrap_or(features::discovery::DiscoveryLevel::Peers),
+                ) >= features::discovery::DiscoveryLevel::Passive;
+                // The network map and checks: never block, do nothing with
+                // their flags off.
+                network.on_heartbeat(
+                    response.inventory_request,
+                    response.probe_request,
+                    response.sweep_request,
+                    response.discovery,
+                    response.connections,
+                );
+                checks.on_heartbeat(response.check_request, allow_private);
+                integrations.on_heartbeat(response.integrations, response.device_names);
 
                 // Monitoring-only: do not execute dashboard-triggered commands.
                 if !response.quick_actions.is_empty() {
@@ -1547,6 +1672,12 @@ struct HeartbeatResult {
     history_request: Option<heartbeat::HistoryRequest>,
     inventory_request: bool,
     probe_request: Option<features::reachability::ProbeRequest>,
+    sweep_request: Option<features::sweep::SweepRequest>,
+    discovery: Option<features::discovery::DiscoveryLevel>,
+    check_request: Option<features::checks::CheckRequest>,
+    connections: bool,
+    integrations: bool,
+    device_names: bool,
 }
 
 fn send_heartbeat(
@@ -1718,6 +1849,12 @@ fn send_heartbeat(
         history_request: response.history_request,
         inventory_request: response.inventory_request,
         probe_request: response.probe_request,
+        sweep_request: response.sweep_request,
+        discovery: response.discovery,
+        check_request: response.check_request,
+        connections: response.connections,
+        integrations: response.integrations,
+        device_names: response.device_names,
     })
 }
 
@@ -1888,5 +2025,35 @@ mod jitter_tests {
             state.report().poll_interval_seconds,
             QUICK_ACTION_MIN_POLL_INTERVAL_SECS
         );
+    }
+}
+
+#[cfg(test)]
+mod packaging_tests {
+    use clap::Parser;
+
+    use super::{changes_the_host, Config};
+
+    fn changes(args: &[&str]) -> Option<&'static str> {
+        let mut argv = vec!["connlog-agent"];
+        argv.extend_from_slice(args);
+        changes_the_host(&Config::try_parse_from(argv).unwrap())
+    }
+
+    /// What Docker refuses: everything that installs, configures or updates
+    /// a systemd install. Running, diagnosing and integrations stay.
+    #[test]
+    fn docker_refuses_only_what_changes_a_systemd_install() {
+        assert_eq!(changes(&["install"]), Some("install"));
+        assert_eq!(changes(&["--install"]), Some("--install"));
+        assert_eq!(
+            changes(&["config", "set-discovery", "active"]),
+            Some("config")
+        );
+        assert_eq!(changes(&["update"]), Some("update"));
+        assert_eq!(changes(&["uninstall"]), Some("uninstall"));
+        assert_eq!(changes(&[]), None);
+        assert_eq!(changes(&["integration", "list"]), None);
+        assert_eq!(changes(&["diagnostics", "heartbeats"]), None);
     }
 }
