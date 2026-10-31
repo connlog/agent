@@ -1,0 +1,1317 @@
+{
+  "valid": [
+    {
+      "description": "A cluster of two nodes: its bridges, a VM tagged into VLAN 20, a container with a static address, a stopped VM with no interface.",
+      "upload": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "lab",
+            "kind": "proxmox",
+            "error": null,
+            "proxmox": {
+              "cluster": "lab",
+              "nodes": [
+                {
+                  "name": "pve-1",
+                  "online": true,
+                  "address": "10.0.20.2"
+                },
+                {
+                  "name": "pve-2",
+                  "online": false,
+                  "address": "10.0.20.3"
+                }
+              ],
+              "bridges": [
+                {
+                  "node": "pve-1",
+                  "name": "vmbr0",
+                  "ports": ["enp3s0"],
+                  "vlanAware": true,
+                  "cidr": "10.0.20.2/24"
+                },
+                {
+                  "node": "pve-2",
+                  "name": "vmbr0",
+                  "ports": ["eno1"],
+                  "vlanAware": false,
+                  "cidr": null
+                }
+              ],
+              "guests": [
+                {
+                  "vmid": 100,
+                  "kind": "qemu",
+                  "name": "web-1",
+                  "node": "pve-1",
+                  "running": true,
+                  "nics": [
+                    {
+                      "mac": "bc:24:11:00:00:01",
+                      "bridge": "vmbr0",
+                      "vlan": 20,
+                      "address": null
+                    }
+                  ]
+                },
+                {
+                  "vmid": 101,
+                  "kind": "lxc",
+                  "name": "dns",
+                  "node": "pve-1",
+                  "running": true,
+                  "nics": [
+                    {
+                      "mac": "bc:24:11:00:00:02",
+                      "bridge": "vmbr0",
+                      "vlan": null,
+                      "address": "10.0.20.53"
+                    }
+                  ]
+                },
+                {
+                  "vmid": 102,
+                  "kind": "qemu",
+                  "name": "old-build",
+                  "node": "pve-2",
+                  "running": false,
+                  "nics": []
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "read": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "lab",
+            "kind": "proxmox",
+            "error": null,
+            "proxmox": {
+              "cluster": "lab",
+              "nodes": [
+                {
+                  "name": "pve-1",
+                  "online": true,
+                  "address": "10.0.20.2"
+                },
+                {
+                  "name": "pve-2",
+                  "online": false,
+                  "address": "10.0.20.3"
+                }
+              ],
+              "bridges": [
+                {
+                  "node": "pve-1",
+                  "name": "vmbr0",
+                  "ports": ["enp3s0"],
+                  "vlanAware": true,
+                  "cidr": "10.0.20.2/24"
+                },
+                {
+                  "node": "pve-2",
+                  "name": "vmbr0",
+                  "ports": ["eno1"],
+                  "vlanAware": false,
+                  "cidr": null
+                }
+              ],
+              "guests": [
+                {
+                  "vmid": 100,
+                  "kind": "qemu",
+                  "name": "web-1",
+                  "node": "pve-1",
+                  "running": true,
+                  "nics": [
+                    {
+                      "mac": "bc:24:11:00:00:01",
+                      "bridge": "vmbr0",
+                      "vlan": 20,
+                      "address": null
+                    }
+                  ]
+                },
+                {
+                  "vmid": 101,
+                  "kind": "lxc",
+                  "name": "dns",
+                  "node": "pve-1",
+                  "running": true,
+                  "nics": [
+                    {
+                      "mac": "bc:24:11:00:00:02",
+                      "bridge": "vmbr0",
+                      "vlan": null,
+                      "address": "10.0.20.53"
+                    }
+                  ]
+                },
+                {
+                  "vmid": 102,
+                  "kind": "qemu",
+                  "name": "old-build",
+                  "node": "pve-2",
+                  "running": false,
+                  "nics": []
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "One that read nothing says why in one word, and carries no data.",
+      "upload": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "pve",
+            "kind": "proxmox",
+            "error": "fingerprint"
+          }
+        ]
+      },
+      "read": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "pve",
+            "kind": "proxmox",
+            "error": "fingerprint"
+          }
+        ]
+      }
+    },
+    {
+      "description": "A single node, no cluster, nothing on it yet.",
+      "upload": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "pve",
+            "kind": "proxmox",
+            "error": null,
+            "proxmox": {
+              "cluster": null,
+              "nodes": [
+                {
+                  "name": "pve",
+                  "online": true,
+                  "address": null
+                }
+              ],
+              "bridges": [],
+              "guests": []
+            }
+          }
+        ]
+      },
+      "read": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "pve",
+            "kind": "proxmox",
+            "error": null,
+            "proxmox": {
+              "cluster": null,
+              "nodes": [
+                {
+                  "name": "pve",
+                  "online": true,
+                  "address": null
+                }
+              ],
+              "bridges": [],
+              "guests": []
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "A collector with nothing set up yet.",
+      "upload": {
+        "version": 1,
+        "integrations": []
+      },
+      "read": {
+        "version": 1,
+        "integrations": []
+      }
+    },
+    {
+      "description": "An OPNsense firewall while the workspace collects device names: interfaces with a VLAN, a gateway down, leases with the hostnames they have.",
+      "upload": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "fw",
+            "kind": "opnsense",
+            "error": null,
+            "opnsense": {
+              "interfaces": [
+                {
+                  "name": "lan",
+                  "description": "LAN",
+                  "device": "igb1",
+                  "up": true,
+                  "cidrs": ["10.0.10.1/24"],
+                  "vlan": null
+                },
+                {
+                  "name": "opt1",
+                  "description": "IoT",
+                  "device": "vlan0.20",
+                  "up": true,
+                  "cidrs": ["10.0.20.1/24"],
+                  "vlan": 20
+                },
+                {
+                  "name": "wan",
+                  "description": "WAN",
+                  "device": "igb0",
+                  "up": true,
+                  "cidrs": ["203.0.113.2/29"],
+                  "vlan": null
+                }
+              ],
+              "gateways": [
+                {
+                  "name": "BACKUP_GW",
+                  "address": null,
+                  "state": "down",
+                  "rttMs": null,
+                  "lossPct": 100.0
+                },
+                {
+                  "name": "WAN_DHCP",
+                  "address": "203.0.113.1",
+                  "state": "up",
+                  "rttMs": 4.2,
+                  "lossPct": 0.0
+                }
+              ],
+              "leases": [
+                {
+                  "address": "10.0.20.40",
+                  "mac": "a4:83:e7:01:02:03",
+                  "hostname": "Johns-iPhone",
+                  "interface": "IoT"
+                },
+                {
+                  "address": "10.0.20.41",
+                  "mac": "a4:83:e7:01:02:04",
+                  "interface": "IoT"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "read": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "fw",
+            "kind": "opnsense",
+            "error": null,
+            "opnsense": {
+              "interfaces": [
+                {
+                  "name": "lan",
+                  "description": "LAN",
+                  "device": "igb1",
+                  "up": true,
+                  "cidrs": ["10.0.10.1/24"],
+                  "vlan": null
+                },
+                {
+                  "name": "opt1",
+                  "description": "IoT",
+                  "device": "vlan0.20",
+                  "up": true,
+                  "cidrs": ["10.0.20.1/24"],
+                  "vlan": 20
+                },
+                {
+                  "name": "wan",
+                  "description": "WAN",
+                  "device": "igb0",
+                  "up": true,
+                  "cidrs": ["203.0.113.2/29"],
+                  "vlan": null
+                }
+              ],
+              "gateways": [
+                {
+                  "name": "BACKUP_GW",
+                  "address": null,
+                  "state": "down",
+                  "rttMs": null,
+                  "lossPct": 100.0
+                },
+                {
+                  "name": "WAN_DHCP",
+                  "address": "203.0.113.1",
+                  "state": "up",
+                  "rttMs": 4.2,
+                  "lossPct": 0.0
+                }
+              ],
+              "leases": [
+                {
+                  "address": "10.0.20.40",
+                  "mac": "a4:83:e7:01:02:03",
+                  "hostname": "Johns-iPhone",
+                  "interface": "IoT"
+                },
+                {
+                  "address": "10.0.20.41",
+                  "mac": "a4:83:e7:01:02:04",
+                  "interface": "IoT"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "The same firewall while the workspace does not: no hostname is sent at all.",
+      "upload": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "fw",
+            "kind": "opnsense",
+            "error": null,
+            "opnsense": {
+              "interfaces": [
+                {
+                  "name": "lan",
+                  "description": "LAN",
+                  "device": "igb1",
+                  "up": true,
+                  "cidrs": ["10.0.10.1/24"],
+                  "vlan": null
+                },
+                {
+                  "name": "opt1",
+                  "description": "IoT",
+                  "device": "vlan0.20",
+                  "up": true,
+                  "cidrs": ["10.0.20.1/24"],
+                  "vlan": 20
+                },
+                {
+                  "name": "wan",
+                  "description": "WAN",
+                  "device": "igb0",
+                  "up": true,
+                  "cidrs": ["203.0.113.2/29"],
+                  "vlan": null
+                }
+              ],
+              "gateways": [
+                {
+                  "name": "BACKUP_GW",
+                  "address": null,
+                  "state": "down",
+                  "rttMs": null,
+                  "lossPct": 100.0
+                },
+                {
+                  "name": "WAN_DHCP",
+                  "address": "203.0.113.1",
+                  "state": "up",
+                  "rttMs": 4.2,
+                  "lossPct": 0.0
+                }
+              ],
+              "leases": [
+                {
+                  "address": "10.0.20.40",
+                  "mac": "a4:83:e7:01:02:03",
+                  "interface": "IoT"
+                },
+                {
+                  "address": "10.0.20.41",
+                  "mac": "a4:83:e7:01:02:04",
+                  "interface": "IoT"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "read": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "fw",
+            "kind": "opnsense",
+            "error": null,
+            "opnsense": {
+              "interfaces": [
+                {
+                  "name": "lan",
+                  "description": "LAN",
+                  "device": "igb1",
+                  "up": true,
+                  "cidrs": ["10.0.10.1/24"],
+                  "vlan": null
+                },
+                {
+                  "name": "opt1",
+                  "description": "IoT",
+                  "device": "vlan0.20",
+                  "up": true,
+                  "cidrs": ["10.0.20.1/24"],
+                  "vlan": 20
+                },
+                {
+                  "name": "wan",
+                  "description": "WAN",
+                  "device": "igb0",
+                  "up": true,
+                  "cidrs": ["203.0.113.2/29"],
+                  "vlan": null
+                }
+              ],
+              "gateways": [
+                {
+                  "name": "BACKUP_GW",
+                  "address": null,
+                  "state": "down",
+                  "rttMs": null,
+                  "lossPct": 100.0
+                },
+                {
+                  "name": "WAN_DHCP",
+                  "address": "203.0.113.1",
+                  "state": "up",
+                  "rttMs": 4.2,
+                  "lossPct": 0.0
+                }
+              ],
+              "leases": [
+                {
+                  "address": "10.0.20.40",
+                  "mac": "a4:83:e7:01:02:03",
+                  "interface": "IoT"
+                },
+                {
+                  "address": "10.0.20.41",
+                  "mac": "a4:83:e7:01:02:04",
+                  "interface": "IoT"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "A firewall whose DHCP leases the key cannot read, beside one whose key was refused.",
+      "upload": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "fw",
+            "kind": "opnsense",
+            "error": null,
+            "opnsense": {
+              "interfaces": [],
+              "gateways": [],
+              "leases": null
+            }
+          },
+          {
+            "name": "office-fw",
+            "kind": "opnsense",
+            "error": "forbidden"
+          }
+        ]
+      },
+      "read": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "fw",
+            "kind": "opnsense",
+            "error": null,
+            "opnsense": {
+              "interfaces": [],
+              "gateways": [],
+              "leases": null
+            }
+          },
+          {
+            "name": "office-fw",
+            "kind": "opnsense",
+            "error": "forbidden"
+          }
+        ]
+      }
+    },
+    {
+      "description": "A switch over SNMP: three ports, an uplink carrying VLAN 20 tagged, an LLDP neighbour, two learned MACs; beside a switch that did not answer.",
+      "upload": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "core",
+            "kind": "snmp",
+            "error": null,
+            "switch": {
+              "name": "sw-core",
+              "address": "10.0.0.2",
+              "ports": [
+                {
+                  "index": 1,
+                  "name": "ge-0/0/1",
+                  "description": "uplink to fw",
+                  "up": true,
+                  "speedMbps": 1000,
+                  "vlan": 1,
+                  "tagged": [20]
+                },
+                {
+                  "index": 2,
+                  "name": "ge-0/0/2",
+                  "description": null,
+                  "up": false,
+                  "speedMbps": null,
+                  "vlan": 20,
+                  "tagged": []
+                },
+                {
+                  "index": 3,
+                  "name": "Port 3",
+                  "description": null,
+                  "up": true,
+                  "speedMbps": null,
+                  "vlan": 1,
+                  "tagged": []
+                }
+              ],
+              "vlans": [
+                {
+                  "id": 1,
+                  "name": "default"
+                },
+                {
+                  "id": 20,
+                  "name": "IoT"
+                }
+              ],
+              "neighbours": [
+                {
+                  "port": 1,
+                  "chassisId": "00:1b:00:00:00:01",
+                  "portId": "igb1",
+                  "portDescription": "LAN",
+                  "systemName": "fw.lan"
+                }
+              ],
+              "macs": [
+                {
+                  "mac": "00:1b:00:00:00:01",
+                  "port": 1,
+                  "vlan": 1
+                },
+                {
+                  "mac": "a4:83:e7:01:02:03",
+                  "port": 2,
+                  "vlan": 20
+                }
+              ]
+            }
+          },
+          {
+            "name": "closet",
+            "kind": "snmp",
+            "error": "timeout"
+          }
+        ]
+      },
+      "read": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "core",
+            "kind": "snmp",
+            "error": null,
+            "switch": {
+              "name": "sw-core",
+              "address": "10.0.0.2",
+              "ports": [
+                {
+                  "index": 1,
+                  "name": "ge-0/0/1",
+                  "description": "uplink to fw",
+                  "up": true,
+                  "speedMbps": 1000,
+                  "vlan": 1,
+                  "tagged": [20]
+                },
+                {
+                  "index": 2,
+                  "name": "ge-0/0/2",
+                  "description": null,
+                  "up": false,
+                  "speedMbps": null,
+                  "vlan": 20,
+                  "tagged": []
+                },
+                {
+                  "index": 3,
+                  "name": "Port 3",
+                  "description": null,
+                  "up": true,
+                  "speedMbps": null,
+                  "vlan": 1,
+                  "tagged": []
+                }
+              ],
+              "vlans": [
+                {
+                  "id": 1,
+                  "name": "default"
+                },
+                {
+                  "id": 20,
+                  "name": "IoT"
+                }
+              ],
+              "neighbours": [
+                {
+                  "port": 1,
+                  "chassisId": "00:1b:00:00:00:01",
+                  "portId": "igb1",
+                  "portDescription": "LAN",
+                  "systemName": "fw.lan"
+                }
+              ],
+              "macs": [
+                {
+                  "mac": "00:1b:00:00:00:01",
+                  "port": 1,
+                  "vlan": 1
+                },
+                {
+                  "mac": "a4:83:e7:01:02:03",
+                  "port": 2,
+                  "vlan": 20
+                }
+              ]
+            }
+          },
+          {
+            "name": "closet",
+            "kind": "snmp",
+            "error": "timeout"
+          }
+        ]
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "description": "A version this platform does not know.",
+      "upload": {
+        "version": 2,
+        "integrations": []
+      }
+    },
+    {
+      "description": "An error in words of its own, which could carry a URL or a token.",
+      "upload": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "pve",
+            "kind": "proxmox",
+            "error": "connection refused to https://pve:8006 with token abc",
+            "proxmox": {
+              "cluster": null,
+              "nodes": [],
+              "bridges": [],
+              "guests": []
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "A kind not built.",
+      "upload": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "pve",
+            "kind": "unifi",
+            "error": null,
+            "proxmox": {
+              "cluster": null,
+              "nodes": [],
+              "bridges": [],
+              "guests": []
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "A name that is not a file name on the host.",
+      "upload": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "../etc",
+            "kind": "proxmox",
+            "error": null,
+            "proxmox": {
+              "cluster": null,
+              "nodes": [],
+              "bridges": [],
+              "guests": []
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "The same name twice.",
+      "upload": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "pve",
+            "kind": "proxmox",
+            "error": "auth"
+          },
+          {
+            "name": "pve",
+            "kind": "proxmox",
+            "error": "auth"
+          }
+        ]
+      }
+    },
+    {
+      "description": "A MAC in capitals.",
+      "upload": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "pve",
+            "kind": "proxmox",
+            "error": null,
+            "proxmox": {
+              "cluster": null,
+              "nodes": [],
+              "bridges": [],
+              "guests": [
+                {
+                  "vmid": 100,
+                  "kind": "qemu",
+                  "name": "web-1",
+                  "node": "pve",
+                  "running": true,
+                  "nics": [
+                    {
+                      "mac": "BC:24:11:00:00:01",
+                      "bridge": "vmbr0",
+                      "vlan": null,
+                      "address": null
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "A VLAN tag out of range.",
+      "upload": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "pve",
+            "kind": "proxmox",
+            "error": null,
+            "proxmox": {
+              "cluster": null,
+              "nodes": [],
+              "bridges": [],
+              "guests": [
+                {
+                  "vmid": 100,
+                  "kind": "qemu",
+                  "name": "web-1",
+                  "node": "pve",
+                  "running": true,
+                  "nics": [
+                    {
+                      "mac": "bc:24:11:00:00:01",
+                      "bridge": "vmbr0",
+                      "vlan": 4095,
+                      "address": null
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "A guest id Proxmox never gives.",
+      "upload": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "pve",
+            "kind": "proxmox",
+            "error": null,
+            "proxmox": {
+              "cluster": null,
+              "nodes": [],
+              "bridges": [],
+              "guests": [
+                {
+                  "vmid": 7,
+                  "kind": "qemu",
+                  "name": "web-1",
+                  "node": "pve",
+                  "running": true,
+                  "nics": []
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "Seventeen integrations, one more than a collector runs.",
+      "upload": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "p0",
+            "kind": "proxmox",
+            "error": "auth"
+          },
+          {
+            "name": "p1",
+            "kind": "proxmox",
+            "error": "auth"
+          },
+          {
+            "name": "p2",
+            "kind": "proxmox",
+            "error": "auth"
+          },
+          {
+            "name": "p3",
+            "kind": "proxmox",
+            "error": "auth"
+          },
+          {
+            "name": "p4",
+            "kind": "proxmox",
+            "error": "auth"
+          },
+          {
+            "name": "p5",
+            "kind": "proxmox",
+            "error": "auth"
+          },
+          {
+            "name": "p6",
+            "kind": "proxmox",
+            "error": "auth"
+          },
+          {
+            "name": "p7",
+            "kind": "proxmox",
+            "error": "auth"
+          },
+          {
+            "name": "p8",
+            "kind": "proxmox",
+            "error": "auth"
+          },
+          {
+            "name": "p9",
+            "kind": "proxmox",
+            "error": "auth"
+          },
+          {
+            "name": "p10",
+            "kind": "proxmox",
+            "error": "auth"
+          },
+          {
+            "name": "p11",
+            "kind": "proxmox",
+            "error": "auth"
+          },
+          {
+            "name": "p12",
+            "kind": "proxmox",
+            "error": "auth"
+          },
+          {
+            "name": "p13",
+            "kind": "proxmox",
+            "error": "auth"
+          },
+          {
+            "name": "p14",
+            "kind": "proxmox",
+            "error": "auth"
+          },
+          {
+            "name": "p15",
+            "kind": "proxmox",
+            "error": "auth"
+          },
+          {
+            "name": "p16",
+            "kind": "proxmox",
+            "error": "auth"
+          }
+        ]
+      }
+    },
+    {
+      "description": "A gateway state of its own words.",
+      "upload": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "fw",
+            "kind": "opnsense",
+            "error": null,
+            "opnsense": {
+              "interfaces": [],
+              "gateways": [
+                {
+                  "name": "WAN",
+                  "address": null,
+                  "state": "Online",
+                  "rttMs": null,
+                  "lossPct": null
+                }
+              ],
+              "leases": []
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "A lease MAC in capitals.",
+      "upload": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "fw",
+            "kind": "opnsense",
+            "error": null,
+            "opnsense": {
+              "interfaces": [],
+              "gateways": [],
+              "leases": [
+                {
+                  "address": "10.0.20.40",
+                  "mac": "A4:83:E7:01:02:03",
+                  "interface": null
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "A lease with no address.",
+      "upload": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "fw",
+            "kind": "opnsense",
+            "error": null,
+            "opnsense": {
+              "interfaces": [],
+              "gateways": [],
+              "leases": [
+                {
+                  "address": null,
+                  "mac": "a4:83:e7:01:02:03",
+                  "interface": null
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "A VLAN tag out of range.",
+      "upload": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "fw",
+            "kind": "opnsense",
+            "error": null,
+            "opnsense": {
+              "interfaces": [
+                {
+                  "name": "opt1",
+                  "description": "IoT",
+                  "device": null,
+                  "up": true,
+                  "cidrs": [],
+                  "vlan": 4095
+                }
+              ],
+              "gateways": [],
+              "leases": []
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "An interface address without its prefix length.",
+      "upload": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "fw",
+            "kind": "opnsense",
+            "error": null,
+            "opnsense": {
+              "interfaces": [
+                {
+                  "name": "lan",
+                  "description": "LAN",
+                  "device": null,
+                  "up": true,
+                  "cidrs": ["10.0.10.1"],
+                  "vlan": null
+                }
+              ],
+              "gateways": [],
+              "leases": []
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "A hostname longer than 64 characters.",
+      "upload": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "fw",
+            "kind": "opnsense",
+            "error": null,
+            "opnsense": {
+              "interfaces": [],
+              "gateways": [],
+              "leases": [
+                {
+                  "address": "10.0.20.40",
+                  "mac": "a4:83:e7:01:02:03",
+                  "hostname": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+                  "interface": null
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "A negative round trip.",
+      "upload": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "fw",
+            "kind": "opnsense",
+            "error": null,
+            "opnsense": {
+              "interfaces": [],
+              "gateways": [
+                {
+                  "name": "WAN",
+                  "address": null,
+                  "state": "up",
+                  "rttMs": -1,
+                  "lossPct": 0
+                }
+              ],
+              "leases": []
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "A learned MAC on port 0, the switch's own.",
+      "upload": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "core",
+            "kind": "snmp",
+            "error": null,
+            "switch": {
+              "name": null,
+              "address": null,
+              "ports": [],
+              "vlans": [],
+              "neighbours": [],
+              "macs": [
+                {
+                  "mac": "a4:83:e7:01:02:03",
+                  "port": 0,
+                  "vlan": null
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "A port speed of 0.",
+      "upload": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "core",
+            "kind": "snmp",
+            "error": null,
+            "switch": {
+              "name": null,
+              "address": null,
+              "ports": [
+                {
+                  "index": 1,
+                  "name": "p1",
+                  "description": null,
+                  "up": true,
+                  "speedMbps": 0,
+                  "vlan": null,
+                  "tagged": []
+                }
+              ],
+              "vlans": [],
+              "neighbours": [],
+              "macs": []
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "A tagged VLAN out of range.",
+      "upload": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "core",
+            "kind": "snmp",
+            "error": null,
+            "switch": {
+              "name": null,
+              "address": null,
+              "ports": [
+                {
+                  "index": 1,
+                  "name": "p1",
+                  "description": null,
+                  "up": true,
+                  "speedMbps": null,
+                  "vlan": null,
+                  "tagged": [4095]
+                }
+              ],
+              "vlans": [],
+              "neighbours": [],
+              "macs": []
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "A neighbour without a chassis id.",
+      "upload": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "core",
+            "kind": "snmp",
+            "error": null,
+            "switch": {
+              "name": null,
+              "address": null,
+              "ports": [],
+              "vlans": [],
+              "neighbours": [
+                {
+                  "port": 1,
+                  "chassisId": "",
+                  "portId": "igb1",
+                  "portDescription": null,
+                  "systemName": null
+                }
+              ],
+              "macs": []
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "An SNMP integration whose report is under another kind's name.",
+      "upload": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "core",
+            "kind": "snmp",
+            "error": null,
+            "proxmox": {
+              "cluster": null,
+              "nodes": [],
+              "bridges": [],
+              "guests": []
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

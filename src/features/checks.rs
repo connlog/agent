@@ -46,7 +46,7 @@ pub const CHECKS_DISABLED: &str = "disabled";
 pub const CONF_CHECKS: &str = "CONNLOG_CHECKS";
 
 /// `CHECK_MAX_PER_REQUEST`, `CHECK_TIMEOUT_MS`, `CHECK_PING_COUNT` and
-/// `CHECK_DNS_MAX_ANSWERS` in the protocol.
+/// `CHECK_DNS_MAX_ANSWERS` in the protocol, held to `check-limits.json`.
 pub const MAX_PER_REQUEST: usize = 16;
 pub const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 pub const PING_COUNT: u32 = 3;
@@ -945,10 +945,8 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
-    const REQUESTS: &str =
-        include_str!("../../../../packages/agent-protocol/fixtures/check-requests.json");
-    const RESULTS: &str =
-        include_str!("../../../../packages/agent-protocol/fixtures/check-results.json");
+    const REQUESTS: &str = protocol_fixture!("check-requests.json");
+    const RESULTS: &str = protocol_fixture!("check-results.json");
 
     /// The agent's half of `check-requests.json`: it runs exactly `runs`.
     #[test]
@@ -1235,21 +1233,16 @@ mod tests {
         assert_eq!(sent, fixture["valid"][0]["upload"]);
     }
 
+    /// The agent's half of `check-limits.json`; the platform's is in
+    /// `packages/agent-protocol/src/__tests__/checks.test.ts`.
     #[test]
-    fn caps_are_what_the_protocol_says() {
-        let protocol = include_str!("../../../../packages/agent-protocol/src/checks.ts");
-        for (name, value) in [
-            ("CHECK_MAX_PER_REQUEST", MAX_PER_REQUEST.to_string()),
-            ("CHECK_TIMEOUT_MS", "10_000".to_string()),
-            ("CHECK_PING_COUNT", PING_COUNT.to_string()),
-            ("CHECK_DNS_MAX_ANSWERS", MAX_DNS_ANSWERS.to_string()),
-        ] {
-            assert!(
-                protocol.contains(&format!("export const {name} = {value};")),
-                "{name} = {value}"
-            );
-        }
-        assert_eq!(CHECK_TIMEOUT, Duration::from_millis(10_000));
+    fn limits_match_the_shared_fixture() {
+        let fixture: Value = serde_json::from_str(protocol_fixture!("check-limits.json")).unwrap();
+        let field = |name: &str| fixture[name].as_u64().expect(name);
+        assert_eq!(MAX_PER_REQUEST as u64, field("maxPerRequest"));
+        assert_eq!(CHECK_TIMEOUT.as_millis(), u128::from(field("timeoutMs")));
+        assert_eq!(u64::from(PING_COUNT), field("pingCount"));
+        assert_eq!(MAX_DNS_ANSWERS as u64, field("dnsMaxAnswers"));
     }
 
     // A certificate's validity, as DER: notBefore 2026-01-01, notAfter

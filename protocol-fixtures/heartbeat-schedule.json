@@ -1,0 +1,13 @@
+{
+  "description": "When an agent sends its heartbeats. The agent's AgentConfig::clamp, jittered and next_heartbeat_sleep implement it; the platform's plan limits, its minimum-interval guard and the console's countdown read it.",
+  "minIntervalSecs": 5,
+  "maxIntervalSecs": 86400,
+  "jitterPct": 10,
+  "earliestGapPermille": 900,
+  "examples": [
+    { "intervalSecs": 5, "earliestGapMs": 4500, "latestGapSecs": 5 },
+    { "intervalSecs": 10, "earliestGapMs": 9000, "latestGapSecs": 11 },
+    { "intervalSecs": 60, "earliestGapMs": 54000, "latestGapSecs": 66 },
+    { "intervalSecs": 300, "earliestGapMs": 270000, "latestGapSecs": 330 }
+  ]
+}

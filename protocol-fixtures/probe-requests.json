@@ -1,0 +1,101 @@
+{
+  "description": "What an agent does with a probe request, whatever it says (guarantee 3): at most 32 targets and 8 ports each in the order given, the rest dropped; a public address is skipped unless the host allows public targets (CONNLOG_PROBE_PUBLIC). `tried` is every (address, port) the agent may open, port null for ICMP; `skipped` is reported with outcome skipped.",
+  "privateAddresses": [
+    "10.0.0.1",
+    "10.255.255.255",
+    "172.16.0.1",
+    "172.31.255.254",
+    "192.168.1.20",
+    "100.64.0.1",
+    "100.127.255.255",
+    "169.254.10.1",
+    "fd00:10::7",
+    "fc00::1",
+    "fe80::1"
+  ],
+  "publicAddresses": [
+    "8.8.8.8",
+    "172.32.0.1",
+    "172.15.255.255",
+    "192.169.0.1",
+    "100.128.0.1",
+    "203.0.113.10",
+    "2001:db8::1",
+    "::1"
+  ],
+  "cases": [
+    {
+      "description": "A private target: every port and the echo.",
+      "request": {
+        "id": "prb_a",
+        "targets": [
+          {
+            "address": "10.0.20.7",
+            "ports": [5432, 22],
+            "icmp": true
+          }
+        ]
+      },
+      "allowPublic": false,
+      "tried": [["10.0.20.7", 5432], ["10.0.20.7", 22], ["10.0.20.7", null]],
+      "skipped": []
+    },
+    {
+      "description": "A public target is skipped, and reported so.",
+      "request": {
+        "id": "prb_b",
+        "targets": [
+          {
+            "address": "203.0.113.10",
+            "ports": [443],
+            "icmp": true
+          }
+        ]
+      },
+      "allowPublic": false,
+      "tried": [],
+      "skipped": [["203.0.113.10", 443], ["203.0.113.10", null]]
+    },
+    {
+      "description": "The host allows public targets.",
+      "request": {
+        "id": "prb_c",
+        "targets": [
+          {
+            "address": "203.0.113.10",
+            "ports": [443],
+            "icmp": false
+          }
+        ]
+      },
+      "allowPublic": true,
+      "tried": [["203.0.113.10", 443]],
+      "skipped": []
+    },
+    {
+      "description": "Ten ports on one target: the first eight are tried, the rest dropped.",
+      "request": {
+        "id": "prb_d",
+        "targets": [
+          {
+            "address": "10.0.0.9",
+            "ports": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            "icmp": false
+          }
+        ]
+      },
+      "allowPublic": false,
+      "tried": [
+        ["10.0.0.9", 1],
+        ["10.0.0.9", 2],
+        ["10.0.0.9", 3],
+        ["10.0.0.9", 4],
+        ["10.0.0.9", 5],
+        ["10.0.0.9", 6],
+        ["10.0.0.9", 7],
+        ["10.0.0.9", 8]
+      ],
+      "skipped": []
+    }
+  ]
+}

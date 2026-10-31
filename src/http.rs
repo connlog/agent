@@ -18,6 +18,7 @@ use crate::features::quick_actions::{
 };
 use crate::features::remote_reboot::{RebootReport, REBOOT_MESSAGE_HEADER, REBOOT_STATE_HEADER};
 use crate::heartbeat::{AgentConfig, HeartbeatPayload, HeartbeatResponse};
+use crate::platform::os_release::{OsRelease, OS_ID_HEADER, OS_LIKE_HEADER, OS_VERSION_HEADER};
 
 /// Header carrying the agent-generated heartbeat correlation id. Authentication
 /// is bearer-token only (no HMAC over headers/body — see
@@ -148,6 +149,33 @@ pub(crate) fn transient_retry_delay(attempt: u32) -> Duration {
     Duration::from_millis(250 * 2u64.pow(attempt.saturating_sub(1).min(2)))
 }
 
+/// What the host runs, read again at most hourly: an upgrade without a
+/// restart still shows.
+struct OsReporting {
+    share_version: bool,
+    read: Mutex<Option<(Instant, Option<OsRelease>)>>,
+}
+
+/// How long a reading of the host's OS stands before it is read again.
+const OS_REREAD: Duration = Duration::from_secs(3600);
+
+impl OsReporting {
+    fn current(&self) -> Option<OsRelease> {
+        let mut read = self
+            .read
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match &*read {
+            Some((at, release)) if at.elapsed() < OS_REREAD => release.clone(),
+            _ => {
+                let release = OsRelease::read();
+                *read = Some((Instant::now(), release.clone()));
+                release
+            }
+        }
+    }
+}
+
 pub struct ApiClient {
     client: Client,
     base_url: String,
@@ -171,6 +199,9 @@ pub struct ApiClient {
     collector_enabled: Option<bool>,
     /// `X-Packaging`; `None` until the daemon says.
     packaging: Option<crate::platform::Packaging>,
+    /// What the host runs (`X-Os-*`, agent 1.23); `None` until the daemon
+    /// says, so a diagnostic command or a test sends none of it.
+    os: Option<OsReporting>,
     /// What became of the last reboot request, sent until a heartbeat is
     /// accepted (`features::remote_reboot`).
     reboot_report: Mutex<Option<RebootReport>>,
@@ -290,6 +321,7 @@ impl ApiClient {
             checks_enabled: None,
             collector_enabled: None,
             packaging: None,
+            os: None,
             reboot_report: Mutex::new(None),
             heartbeat_url: Mutex::new(heartbeat_url),
             telemetry: None,
@@ -330,6 +362,16 @@ impl ApiClient {
 
     /// How this agent is installed and updated, said on every heartbeat
     /// (`X-Packaging`), so the console offers a new image, not an update.
+    /// Send what the host runs on every heartbeat: its distribution and
+    /// family always, its exact version only when `share_version`, the
+    /// host's system-info opt-in (`CONNLOG_EXPOSE_SYSTEM_INFO`).
+    pub fn report_os(&mut self, share_version: bool) {
+        self.os = Some(OsReporting {
+            share_version,
+            read: Mutex::new(None),
+        });
+    }
+
     pub fn set_packaging(&mut self, packaging: crate::platform::Packaging) {
         self.packaging = Some(packaging);
     }
@@ -585,6 +627,31 @@ impl ApiClient {
                 PACKAGING_HEADER,
                 HeaderValue::from_static(packaging.as_str()),
             );
+        }
+
+        if let Some(os) = &self.os {
+            if let Some(release) = os.current() {
+                // Sanitized when read: every value is a valid header.
+                if let Ok(id) = HeaderValue::from_str(&release.id) {
+                    headers.insert(OS_ID_HEADER, id);
+                }
+                if let Some(like) = release
+                    .like
+                    .as_deref()
+                    .and_then(|v| HeaderValue::from_str(v).ok())
+                {
+                    headers.insert(OS_LIKE_HEADER, like);
+                }
+                if os.share_version {
+                    if let Some(version) = release
+                        .version
+                        .as_deref()
+                        .and_then(|v| HeaderValue::from_str(v).ok())
+                    {
+                        headers.insert(OS_VERSION_HEADER, version);
+                    }
+                }
+            }
         }
 
         if let Some(level) = self.discovery {
@@ -1051,6 +1118,33 @@ impl ApiClient {
             });
         }
 
+        Ok(())
+    }
+
+    /// A piece of a running action's output, for the person watching it. A
+    /// short timeout: a slow platform must not hold the action past its own.
+    pub fn send_quick_action_output(
+        &self,
+        payload: &crate::features::quick_actions::QuickActionOutputPayload,
+    ) -> Result<(), ApiError> {
+        let url = format!("{}/api/agents/actions/output", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .timeout(Duration::from_secs(3))
+            .header(CONTENT_TYPE, "application/json")
+            .header(AUTHORIZATION, format!("Bearer {}", self.token))
+            .json(payload)
+            .send()
+            .context("Failed to send quick action output")?;
+        if !response.status().is_success() {
+            return Err(ApiError::HttpError {
+                status: response.status().as_u16(),
+                message: response
+                    .text()
+                    .unwrap_or_else(|_| "Unknown error".to_string()),
+            });
+        }
         Ok(())
     }
 
@@ -1682,22 +1776,15 @@ mod tests {
 /// fixture's `agent` input and must produce exactly its `frame`; the platform
 /// decodes that `frame` and must produce exactly its `platform` values. A change
 /// to either side that breaks the other fails in the same pull request.
-///
-/// `include_str!` reaches outside the crate on purpose, and only in tests: a
-/// release build (including `cross`, which mounts only this crate) never reads
-/// these files.
 #[cfg(test)]
 mod shared_fixtures {
     use super::encode_heartbeat;
     use crate::heartbeat::{HeartbeatPayload, HeartbeatResponse, Metrics};
     use serde_json::Value;
 
-    const FRAMES: &str =
-        include_str!("../../../packages/agent-protocol/fixtures/heartbeat-frames.json");
-    const RESPONSES: &str =
-        include_str!("../../../packages/agent-protocol/fixtures/heartbeat-responses.json");
-    const HEADERS: &str =
-        include_str!("../../../packages/agent-protocol/fixtures/heartbeat-headers.json");
+    const FRAMES: &str = protocol_fixture!("heartbeat-frames.json");
+    const RESPONSES: &str = protocol_fixture!("heartbeat-responses.json");
+    const HEADERS: &str = protocol_fixture!("heartbeat-headers.json");
 
     fn fixtures(raw: &str) -> Vec<Value> {
         let all: Vec<Value> = serde_json::from_str(raw).expect("fixture file must be a JSON array");
@@ -2007,6 +2094,18 @@ mod shared_fixtures {
                 Sent::Parsed(crate::features::remote_reboot::sanitize_message),
             ),
             (super::PACKAGING_HEADER, Sent::OneOf(&PACKAGINGS)),
+            (
+                super::OS_ID_HEADER,
+                Sent::Parsed(crate::platform::os_release::sanitize_id),
+            ),
+            (
+                super::OS_LIKE_HEADER,
+                Sent::Parsed(crate::platform::os_release::sanitize_like),
+            ),
+            (
+                super::OS_VERSION_HEADER,
+                Sent::Parsed(crate::platform::os_release::sanitize_version),
+            ),
         ];
 
         let all = fixtures(HEADERS);

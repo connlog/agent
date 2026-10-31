@@ -832,9 +832,9 @@ mod tests {
     fn fixture(name: &str) -> Value {
         let text = match name {
             "requests" => {
-                include_str!("../../../../packages/agent-protocol/fixtures/sweep-requests.json")
+                protocol_fixture!("sweep-requests.json")
             }
-            _ => include_str!("../../../../packages/agent-protocol/fixtures/sweep-results.json"),
+            _ => protocol_fixture!("sweep-results.json"),
         };
         serde_json::from_str(text).unwrap()
     }

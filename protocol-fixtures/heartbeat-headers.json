@@ -1,0 +1,309 @@
+[
+  {
+    "description": "The current boot, from /proc/sys/kernel/random/boot_id. Omitted when unreadable.",
+    "header": "X-Boot-Id",
+    "valid": [
+      {
+        "sent": "6f1f4b2c-0d3e-4a5b-9c8d-7e6f5a4b3c2d",
+        "read": "6f1f4b2c-0d3e-4a5b-9c8d-7e6f5a4b3c2d"
+      },
+      {
+        "sent": "6F1F4B2C-0D3E-4A5B-9C8D-7E6F5A4B3C2D",
+        "read": "6f1f4b2c-0d3e-4a5b-9c8d-7e6f5a4b3c2d"
+      }
+    ],
+    "invalid": [
+      "",
+      "not-a-boot-id",
+      "6f1f4b2c0d3e4a5b9c8d7e6f5a4b3c2d",
+      "6f1f4b2c-0d3e-4a5b-9c8d-7e6f5a4b3c2g"
+    ]
+  },
+  {
+    "description": "Whether this host accepts remote reboot (CONNLOG_ALLOW_REMOTE_REBOOT in the root-only agent.conf). Sent by the daemon on every heartbeat; absent from agents that predate the setting.",
+    "header": "X-Remote-Reboot",
+    "valid": [
+      {
+        "sent": "allowed",
+        "read": "allowed"
+      },
+      {
+        "sent": "disabled",
+        "read": "disabled"
+      }
+    ],
+    "invalid": ["", "true", "no", "allowed,disabled"]
+  },
+  {
+    "description": "What became of the last remote reboot request. Sent on every heartbeat until one is accepted, then dropped.",
+    "header": "X-Reboot-State",
+    "valid": [
+      {
+        "sent": "completed",
+        "read": "completed"
+      },
+      {
+        "sent": "failed",
+        "read": "failed"
+      },
+      {
+        "sent": "refused-disabled",
+        "read": "refused-disabled"
+      },
+      {
+        "sent": "refused-unit",
+        "read": "refused-unit"
+      }
+    ],
+    "invalid": ["", "done", "refused", "FAILED!"]
+  },
+  {
+    "description": "Why, in words, with X-Reboot-State. Printable ASCII, trimmed, at most 200 bytes; anything else is replaced by a space.",
+    "header": "X-Reboot-Message",
+    "valid": [
+      {
+        "sent": "host rebooted",
+        "read": "host rebooted"
+      },
+      {
+        "sent": "  CONNLOG_ALLOW_REMOTE_REBOOT=false in /etc/connlog/agent.conf ",
+        "read": "CONNLOG_ALLOW_REMOTE_REBOOT=false in /etc/connlog/agent.conf"
+      },
+      {
+        "sent": "a\tb",
+        "read": "a b"
+      },
+      {
+        "sent": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "read": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+    ],
+    "invalid": ["", "   ", "\t"]
+  },
+  {
+    "description": "The host-side settings in the root-only agent.conf, as on/off values only (never the file). bmc: BMC polling configured; hostname: CONNLOG_EXPOSE_SYSTEM_INFO; postmortem: CONNLOG_SHARE_POSTMORTEM. Sent by the daemon on every heartbeat, keys in this order; absent from older agents. A case marked \"agent\": false is one this agent never sends and the platform must still read (a newer agent's key, other spacing or case).",
+    "header": "X-Host-Settings",
+    "valid": [
+      {
+        "sent": "bmc=off,hostname=off,postmortem=off",
+        "read": {
+          "bmc": false,
+          "hostname": false,
+          "postmortem": false
+        }
+      },
+      {
+        "sent": "bmc=on,hostname=on,postmortem=off",
+        "read": {
+          "bmc": true,
+          "hostname": true,
+          "postmortem": false
+        }
+      },
+      {
+        "sent": "bmc=off,hostname=off,postmortem=on",
+        "read": {
+          "bmc": false,
+          "hostname": false,
+          "postmortem": true
+        }
+      },
+      {
+        "sent": "bmc=on,hostname=on,postmortem=on",
+        "read": {
+          "bmc": true,
+          "hostname": true,
+          "postmortem": true
+        }
+      },
+      {
+        "agent": false,
+        "sent": " hostname=ON , network-map=on ",
+        "read": {
+          "hostname": true
+        }
+      }
+    ],
+    "invalid": ["", "hostname", "hostname=yes", "hostname=on,,bmc=off", "network-map=on"]
+  },
+  {
+    "description": "Whether this host takes part in the network map (CONNLOG_NETWORK_MAP in the root-only agent.conf). Sent by the daemon on every heartbeat; absent from agents that predate the setting.",
+    "header": "X-Network-Map",
+    "valid": [
+      {
+        "sent": "enabled",
+        "read": "enabled"
+      },
+      {
+        "sent": "disabled",
+        "read": "disabled"
+      },
+      {
+        "sent": "Enabled",
+        "read": "enabled"
+      }
+    ],
+    "invalid": ["", "true", "on", "enabled,disabled"]
+  },
+  {
+    "description": "How much this host may find out about its network: CONNLOG_DISCOVERY in the root-only agent.conf, the ceiling the console chooses under. An agent.conf with only CONNLOG_NETWORK_MAP=true reads as peers. Sent by the daemon on every heartbeat, beside X-Network-Map; absent from agents that predate it.",
+    "header": "X-Discovery",
+    "valid": [
+      {
+        "sent": "off",
+        "read": "off"
+      },
+      {
+        "sent": "peers",
+        "read": "peers"
+      },
+      {
+        "sent": "passive",
+        "read": "passive"
+      },
+      {
+        "sent": "active",
+        "read": "active"
+      },
+      {
+        "sent": "Peers",
+        "read": "peers"
+      }
+    ],
+    "invalid": ["", "true", "enabled", "peers,passive", "all"]
+  },
+  {
+    "description": "Whether this host runs the checks ConnLog assigns (CONNLOG_CHECKS in the root-only agent.conf). Sent by the daemon on every heartbeat; absent from agents that predate checks.",
+    "header": "X-Checks",
+    "valid": [
+      {
+        "sent": "enabled",
+        "read": "enabled"
+      },
+      {
+        "sent": "disabled",
+        "read": "disabled"
+      }
+    ],
+    "invalid": ["", "true", "on"]
+  },
+  {
+    "description": "Whether this host is a collector, reading the customer's own equipment through integrations (CONNLOG_COLLECTOR in the root-only agent.conf). Sent by the daemon on every heartbeat; absent from agents that predate integrations.",
+    "header": "X-Collector",
+    "valid": [
+      {
+        "sent": "enabled",
+        "read": "enabled"
+      },
+      {
+        "sent": "disabled",
+        "read": "disabled"
+      }
+    ],
+    "invalid": ["", "true", "on"]
+  },
+  {
+    "description": "How the agent was installed, and so how it is updated: systemd (install.sh; it updates itself from signed releases) docker (the image; a new image is the update, and its settings are the container's environment) or freebsd (the OPNsense and pfSense package; a new package is the update). Sent by the daemon on every heartbeat; absent from agents that predate the image, which are all systemd installs.",
+    "header": "X-Packaging",
+    "valid": [
+      {
+        "sent": "systemd",
+        "read": "systemd"
+      },
+      {
+        "sent": "docker",
+        "read": "docker"
+      },
+      {
+        "sent": "Docker",
+        "read": "docker"
+      },
+      {
+        "sent": "freebsd",
+        "read": "freebsd"
+      }
+    ],
+    "invalid": ["", "podman", "true"]
+  },
+  {
+    "description": "The host's distribution: os-release's ID, lowercase, or pfsense, opnsense or proxmox-ve, which the agent reads from their own files. On every heartbeat from agent 1.23; absent from older agents. Kept for every host: the map draws its mark from it.",
+    "header": "X-Os-Id",
+    "valid": [
+      {
+        "sent": "ubuntu",
+        "read": "ubuntu"
+      },
+      {
+        "sent": "opensuse-leap",
+        "read": "opensuse-leap"
+      },
+      {
+        "sent": "proxmox-ve",
+        "read": "proxmox-ve"
+      },
+      {
+        "sent": "Ubuntu",
+        "read": "ubuntu"
+      }
+    ],
+    "invalid": [
+      "",
+      "ubuntu linux",
+      "-ubuntu",
+      "a-name-much-longer-than-thirty-two-characters",
+      "ubuntu/22"
+    ]
+  },
+  {
+    "description": "What the distribution derives from (os-release ID_LIKE), nearest first, one to four ids: the mark for a derivative without its own. Sent with X-Os-Id where the host has one.",
+    "header": "X-Os-Like",
+    "valid": [
+      {
+        "sent": "debian",
+        "read": "debian"
+      },
+      {
+        "sent": "rhel centos fedora",
+        "read": "rhel centos fedora"
+      },
+      {
+        "sent": "  ubuntu   debian ",
+        "read": "ubuntu debian"
+      }
+    ],
+    "invalid": ["", "rhel,centos", "a b c d e"]
+  },
+  {
+    "description": "The distribution's exact version: 22.04.3, 12.7, 14.1-RELEASE-p5, 24.7.5_3. Sent only while the host shares system info (CONNLOG_EXPOSE_SYSTEM_INFO), as its hostname is; kept only then.",
+    "header": "X-Os-Version",
+    "valid": [
+      {
+        "sent": "22.04.3",
+        "read": "22.04.3"
+      },
+      {
+        "sent": "12.7",
+        "read": "12.7"
+      },
+      {
+        "sent": "14.1-RELEASE-p5",
+        "read": "14.1-RELEASE-p5"
+      },
+      {
+        "sent": "24.7.5_3",
+        "read": "24.7.5_3"
+      },
+      {
+        "sent": "2.7.2-RELEASE",
+        "read": "2.7.2-RELEASE"
+      }
+    ],
+    "invalid": [
+      "",
+      "22.04.3 LTS",
+      ".1",
+      "22.04/../x",
+      "a-version-string-much-longer-than-thirty-two"
+    ]
+  }
+]

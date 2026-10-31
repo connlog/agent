@@ -1,0 +1,439 @@
+{
+  "valid": [
+    {
+      "description": "A host on VLAN 10 with two services, its router known, a site name and one extra port.",
+      "upload": {
+        "version": 1,
+        "addresses": [
+          {
+            "address": "10.0.10.5",
+            "prefixLength": 24
+          },
+          {
+            "address": "fd00:10::5",
+            "prefixLength": 64
+          }
+        ],
+        "tcpListeners": [
+          {
+            "port": 22,
+            "wildcard": true
+          },
+          {
+            "port": 5432,
+            "wildcard": false
+          }
+        ],
+        "gateway": {
+          "address": "10.0.10.1",
+          "mac": "52:54:00:ab:cd:ef"
+        },
+        "site": "hq",
+        "extraPorts": [8443]
+      },
+      "read": {
+        "version": 1,
+        "addresses": [
+          {
+            "address": "10.0.10.5",
+            "prefixLength": 24
+          },
+          {
+            "address": "fd00:10::5",
+            "prefixLength": 64
+          }
+        ],
+        "tcpListeners": [
+          {
+            "port": 22,
+            "wildcard": true
+          },
+          {
+            "port": 5432,
+            "wildcard": false
+          }
+        ],
+        "gateway": {
+          "address": "10.0.10.1",
+          "mac": "52:54:00:ab:cd:ef"
+        },
+        "site": "hq",
+        "extraPorts": [8443]
+      }
+    },
+    {
+      "description": "Nothing optional: no default route, no site name, no extra ports.",
+      "upload": {
+        "version": 1,
+        "addresses": [
+          {
+            "address": "192.168.1.20",
+            "prefixLength": 24
+          }
+        ],
+        "tcpListeners": [],
+        "gateway": null,
+        "site": null,
+        "extraPorts": []
+      },
+      "read": {
+        "version": 1,
+        "addresses": [
+          {
+            "address": "192.168.1.20",
+            "prefixLength": 24
+          }
+        ],
+        "tcpListeners": [],
+        "gateway": null,
+        "site": null,
+        "extraPorts": []
+      }
+    },
+    {
+      "description": "A gateway whose MAC is not in the neighbour table yet.",
+      "upload": {
+        "version": 1,
+        "addresses": [
+          {
+            "address": "10.1.0.9",
+            "prefixLength": 16
+          }
+        ],
+        "tcpListeners": [
+          {
+            "port": 443,
+            "wildcard": true
+          }
+        ],
+        "gateway": {
+          "address": "10.1.0.1",
+          "mac": null
+        },
+        "site": null,
+        "extraPorts": []
+      },
+      "read": {
+        "version": 1,
+        "addresses": [
+          {
+            "address": "10.1.0.9",
+            "prefixLength": 16
+          }
+        ],
+        "tcpListeners": [
+          {
+            "port": 443,
+            "wildcard": true
+          }
+        ],
+        "gateway": {
+          "address": "10.1.0.1",
+          "mac": null
+        },
+        "site": null,
+        "extraPorts": []
+      }
+    },
+    {
+      "description": "A host at the passive level with a VLAN interface: its addresses there carry the VLAN id, the untagged one none, and no interface name is sent.",
+      "upload": {
+        "version": 1,
+        "addresses": [
+          { "address": "10.0.10.5", "prefixLength": 24 },
+          { "address": "10.0.20.5", "prefixLength": 24, "vlan": 20 },
+          { "address": "fd00:20::5", "prefixLength": 64, "vlan": 20 }
+        ],
+        "tcpListeners": [{ "port": 22, "wildcard": true }],
+        "gateway": { "address": "10.0.10.1", "mac": "52:54:00:ab:cd:ef" },
+        "site": null,
+        "extraPorts": []
+      },
+      "read": {
+        "version": 1,
+        "addresses": [
+          { "address": "10.0.10.5", "prefixLength": 24 },
+          { "address": "10.0.20.5", "prefixLength": 24, "vlan": 20 },
+          { "address": "fd00:20::5", "prefixLength": 64, "vlan": 20 }
+        ],
+        "tcpListeners": [{ "port": 22, "wildcard": true }],
+        "gateway": { "address": "10.0.10.1", "mac": "52:54:00:ab:cd:ef" },
+        "site": null,
+        "extraPorts": []
+      }
+    },
+    {
+      "description": "A host at the passive level with its neighbour table: private addresses, their MAC and state, in address order; never an interface or a name.",
+      "upload": {
+        "version": 1,
+        "addresses": [{ "address": "10.0.40.2", "prefixLength": 24 }],
+        "tcpListeners": [],
+        "gateway": { "address": "10.0.40.1", "mac": "52:54:00:ab:cd:ef" },
+        "site": null,
+        "extraPorts": [],
+        "neighbours": [
+          { "address": "10.0.40.1", "mac": "52:54:00:ab:cd:ef", "state": "reachable" },
+          { "address": "10.0.40.12", "mac": "a4:83:e7:01:02:03", "state": "stale" },
+          { "address": "fe80::1", "mac": "52:54:00:ab:cd:ef", "state": "permanent" }
+        ]
+      },
+      "read": {
+        "version": 1,
+        "addresses": [{ "address": "10.0.40.2", "prefixLength": 24 }],
+        "tcpListeners": [],
+        "gateway": { "address": "10.0.40.1", "mac": "52:54:00:ab:cd:ef" },
+        "site": null,
+        "extraPorts": [],
+        "neighbours": [
+          { "address": "10.0.40.1", "mac": "52:54:00:ab:cd:ef", "state": "reachable" },
+          { "address": "10.0.40.12", "mac": "a4:83:e7:01:02:03", "state": "stale" },
+          { "address": "fe80::1", "mac": "52:54:00:ab:cd:ef", "state": "permanent" }
+        ]
+      }
+    },
+    {
+      "description": "A host at the passive level with its path out: towards its gateway, and towards the platform through a firewall and the ISP, one hop silent.",
+      "upload": {
+        "version": 1,
+        "addresses": [{ "address": "10.0.5.20", "prefixLength": 24 }],
+        "tcpListeners": [],
+        "gateway": { "address": "10.0.5.1", "mac": "52:54:00:ab:cd:ef" },
+        "site": null,
+        "extraPorts": [],
+        "path": {
+          "gateway": { "hops": ["10.0.5.1"], "reached": true },
+          "internet": {
+            "hops": ["10.0.5.1", "10.0.0.1", null, "100.64.0.1", "203.0.113.10"],
+            "reached": true
+          }
+        }
+      },
+      "read": {
+        "version": 1,
+        "addresses": [{ "address": "10.0.5.20", "prefixLength": 24 }],
+        "tcpListeners": [],
+        "gateway": { "address": "10.0.5.1", "mac": "52:54:00:ab:cd:ef" },
+        "site": null,
+        "extraPorts": [],
+        "path": {
+          "gateway": { "hops": ["10.0.5.1"], "reached": true },
+          "internet": {
+            "hops": ["10.0.5.1", "10.0.0.1", null, "100.64.0.1", "203.0.113.10"],
+            "reached": true
+          }
+        }
+      }
+    },
+    {
+      "description": "A host the platform asked for its connections: a client of its port 443, and its own connection to a database; no process, no byte count.",
+      "upload": {
+        "version": 1,
+        "addresses": [{ "address": "10.0.10.5", "prefixLength": 24 }],
+        "tcpListeners": [{ "port": 443, "wildcard": true }],
+        "gateway": null,
+        "site": null,
+        "extraPorts": [],
+        "connections": [
+          { "peer": "10.0.10.7", "port": 443, "direction": "in" },
+          { "peer": "10.0.10.9", "port": 5432, "direction": "out" }
+        ]
+      },
+      "read": {
+        "version": 1,
+        "addresses": [{ "address": "10.0.10.5", "prefixLength": 24 }],
+        "tcpListeners": [{ "port": 443, "wildcard": true }],
+        "gateway": null,
+        "site": null,
+        "extraPorts": [],
+        "connections": [
+          { "peer": "10.0.10.7", "port": 443, "direction": "in" },
+          { "peer": "10.0.10.9", "port": 5432, "direction": "out" }
+        ]
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "description": "Unknown version.",
+      "upload": {
+        "version": 2,
+        "addresses": [],
+        "tcpListeners": [],
+        "gateway": null,
+        "site": null,
+        "extraPorts": []
+      }
+    },
+    {
+      "description": "Port 0.",
+      "upload": {
+        "version": 1,
+        "addresses": [],
+        "tcpListeners": [
+          {
+            "port": 0,
+            "wildcard": true
+          }
+        ],
+        "gateway": null,
+        "site": null,
+        "extraPorts": []
+      }
+    },
+    {
+      "description": "IPv4 prefix over 32.",
+      "upload": {
+        "version": 1,
+        "addresses": [
+          {
+            "address": "10.0.0.1",
+            "prefixLength": 33
+          }
+        ],
+        "tcpListeners": [],
+        "gateway": null,
+        "site": null,
+        "extraPorts": []
+      }
+    },
+    {
+      "description": "Uppercase MAC.",
+      "upload": {
+        "version": 1,
+        "addresses": [],
+        "tcpListeners": [],
+        "gateway": {
+          "address": "10.0.0.1",
+          "mac": "52:54:00:AB:CD:EF"
+        },
+        "site": null,
+        "extraPorts": []
+      }
+    },
+    {
+      "description": "Site name with a space.",
+      "upload": {
+        "version": 1,
+        "addresses": [],
+        "tcpListeners": [],
+        "gateway": null,
+        "site": "head office",
+        "extraPorts": []
+      }
+    },
+    {
+      "description": "Seventeen extra ports.",
+      "upload": {
+        "version": 1,
+        "addresses": [],
+        "tcpListeners": [],
+        "gateway": null,
+        "site": null,
+        "extraPorts": [
+          8000, 8001, 8002, 8003, 8004, 8005, 8006, 8007, 8008, 8009, 8010, 8011, 8012, 8013, 8014,
+          8015, 8016
+        ]
+      }
+    },
+    {
+      "description": "An address that is not one.",
+      "upload": {
+        "version": 1,
+        "addresses": [
+          {
+            "address": "10.0.0.256",
+            "prefixLength": 24
+          }
+        ],
+        "tcpListeners": [],
+        "gateway": null,
+        "site": null,
+        "extraPorts": []
+      }
+    },
+    {
+      "description": "VLAN id 0, reserved.",
+      "upload": {
+        "version": 1,
+        "addresses": [{ "address": "10.0.20.5", "prefixLength": 24, "vlan": 0 }],
+        "tcpListeners": [],
+        "gateway": null,
+        "site": null,
+        "extraPorts": []
+      }
+    },
+    {
+      "description": "VLAN id 4095, reserved.",
+      "upload": {
+        "version": 1,
+        "addresses": [{ "address": "10.0.20.5", "prefixLength": 24, "vlan": 4095 }],
+        "tcpListeners": [],
+        "gateway": null,
+        "site": null,
+        "extraPorts": []
+      }
+    },
+    {
+      "description": "A public neighbour: private ranges only.",
+      "upload": {
+        "version": 1,
+        "addresses": [],
+        "tcpListeners": [],
+        "gateway": null,
+        "site": null,
+        "extraPorts": [],
+        "neighbours": [{ "address": "203.0.113.9", "mac": "a4:83:e7:01:02:03", "state": "stale" }]
+      }
+    },
+    {
+      "description": "A neighbour state the platform does not know.",
+      "upload": {
+        "version": 1,
+        "addresses": [],
+        "tcpListeners": [],
+        "gateway": null,
+        "site": null,
+        "extraPorts": [],
+        "neighbours": [
+          { "address": "10.0.40.12", "mac": "a4:83:e7:01:02:03", "state": "incomplete" }
+        ]
+      }
+    },
+    {
+      "description": "A neighbour MAC in capitals.",
+      "upload": {
+        "version": 1,
+        "addresses": [],
+        "tcpListeners": [],
+        "gateway": null,
+        "site": null,
+        "extraPorts": [],
+        "neighbours": [{ "address": "10.0.40.12", "mac": "A4:83:E7:01:02:03", "state": "stale" }]
+      }
+    },
+    {
+      "description": "A hop that is not an IPv4 address.",
+      "upload": {
+        "version": 1,
+        "addresses": [],
+        "tcpListeners": [],
+        "gateway": null,
+        "site": null,
+        "extraPorts": [],
+        "path": { "gateway": { "hops": ["router.lan"], "reached": false }, "internet": null }
+      }
+    },
+    {
+      "description": "A connection to a public peer.",
+      "upload": {
+        "version": 1,
+        "addresses": [],
+        "tcpListeners": [],
+        "gateway": null,
+        "site": null,
+        "extraPorts": [],
+        "connections": [{ "peer": "203.0.113.9", "port": 443, "direction": "out" }]
+      }
+    }
+  ]
+}

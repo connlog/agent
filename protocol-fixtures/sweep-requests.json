@@ -1,0 +1,69 @@
+{
+  "valid": [
+    {
+      "description": "A /24 with four ports, mDNS and SSDP.",
+      "request": {
+        "id": "swp_1",
+        "subnet": "10.0.20.0/24",
+        "ports": [22, 80, 443, 9100],
+        "mdns": true,
+        "ssdp": true
+      },
+      "read": {
+        "id": "swp_1",
+        "subnet": "10.0.20.0/24",
+        "ports": [22, 80, 443, 9100],
+        "mdns": true,
+        "ssdp": true
+      }
+    },
+    {
+      "description": "Ports outside the well-known list and repeats dropped, then all past the eighth; no mDNS or SSDP unless asked.",
+      "request": {
+        "id": "swp_2",
+        "subnet": "192.168.1.0/22",
+        "ports": [22, 22, 31337, 80, 443, 445, 3389, 8080, 9100, 21, 23]
+      },
+      "read": {
+        "id": "swp_2",
+        "subnet": "192.168.1.0/22",
+        "ports": [22, 80, 443, 445, 3389, 8080, 9100, 21],
+        "mdns": false,
+        "ssdp": false
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "description": "An IPv6 subnet: never swept.",
+      "request": {
+        "id": "swp_3",
+        "subnet": "fd00::/64",
+        "ports": []
+      }
+    },
+    {
+      "description": "A prefix past 32.",
+      "request": {
+        "id": "swp_4",
+        "subnet": "10.0.0.0/33",
+        "ports": []
+      }
+    },
+    {
+      "description": "No ports list.",
+      "request": {
+        "id": "swp_5",
+        "subnet": "10.0.0.0/24"
+      }
+    },
+    {
+      "description": "An empty id.",
+      "request": {
+        "id": "",
+        "subnet": "10.0.0.0/24",
+        "ports": []
+      }
+    }
+  ]
+}

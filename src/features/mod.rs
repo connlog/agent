@@ -27,6 +27,7 @@ pub mod quick_actions;
 pub mod reachability;
 pub mod remote_reboot;
 pub mod routing;
+pub mod settings;
 pub mod sweep;
 pub mod trace;
 pub mod vlan;

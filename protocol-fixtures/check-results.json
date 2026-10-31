@@ -1,0 +1,319 @@
+{
+  "valid": [
+    {
+      "description": "One of each kind, up: ping round trip, TCP connect, HTTPS first byte with its certificate, DNS answers.",
+      "upload": {
+        "version": 1,
+        "id": "chk_01J0A",
+        "results": [
+          {
+            "id": "site",
+            "outcome": "up",
+            "reason": null,
+            "ms": 182,
+            "http": {
+              "status": 200,
+              "certDaysLeft": 61,
+              "tlsValid": true
+            }
+          },
+          {
+            "id": "router",
+            "outcome": "up",
+            "reason": null,
+            "ms": 1,
+            "ping": {
+              "sent": 3,
+              "received": 3
+            }
+          },
+          {
+            "id": "db",
+            "outcome": "up",
+            "reason": null,
+            "ms": 2
+          },
+          {
+            "id": "resolver",
+            "outcome": "up",
+            "reason": null,
+            "ms": 14,
+            "dns": {
+              "rcode": "noerror",
+              "answers": ["93.184.215.14"]
+            }
+          }
+        ]
+      },
+      "read": {
+        "version": 1,
+        "id": "chk_01J0A",
+        "results": [
+          {
+            "id": "site",
+            "outcome": "up",
+            "reason": null,
+            "ms": 182,
+            "http": {
+              "status": 200,
+              "certDaysLeft": 61,
+              "tlsValid": true
+            }
+          },
+          {
+            "id": "router",
+            "outcome": "up",
+            "reason": null,
+            "ms": 1,
+            "ping": {
+              "sent": 3,
+              "received": 3
+            }
+          },
+          {
+            "id": "db",
+            "outcome": "up",
+            "reason": null,
+            "ms": 2
+          },
+          {
+            "id": "resolver",
+            "outcome": "up",
+            "reason": null,
+            "ms": 14,
+            "dns": {
+              "rcode": "noerror",
+              "answers": ["93.184.215.14"]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "Down and skipped, each with its reason: an expired certificate, a refused port, a lost ping, a private target on a host below passive, a target checked too recently.",
+      "upload": {
+        "version": 1,
+        "id": "chk_01J0D",
+        "results": [
+          {
+            "id": "site",
+            "outcome": "down",
+            "reason": "tls",
+            "ms": null,
+            "http": {
+              "status": null,
+              "certDaysLeft": -3,
+              "tlsValid": false
+            }
+          },
+          {
+            "id": "db",
+            "outcome": "down",
+            "reason": "refused",
+            "ms": null
+          },
+          {
+            "id": "router",
+            "outcome": "down",
+            "reason": "timeout",
+            "ms": null,
+            "ping": {
+              "sent": 3,
+              "received": 0
+            }
+          },
+          {
+            "id": "nas",
+            "outcome": "skipped",
+            "reason": "not-allowed",
+            "ms": null
+          },
+          {
+            "id": "again",
+            "outcome": "skipped",
+            "reason": "too-soon",
+            "ms": null
+          },
+          {
+            "id": "gone",
+            "outcome": "down",
+            "reason": "no-answer",
+            "ms": 21,
+            "dns": {
+              "rcode": "nxdomain",
+              "answers": []
+            }
+          }
+        ]
+      },
+      "read": {
+        "version": 1,
+        "id": "chk_01J0D",
+        "results": [
+          {
+            "id": "site",
+            "outcome": "down",
+            "reason": "tls",
+            "ms": null,
+            "http": {
+              "status": null,
+              "certDaysLeft": -3,
+              "tlsValid": false
+            }
+          },
+          {
+            "id": "db",
+            "outcome": "down",
+            "reason": "refused",
+            "ms": null
+          },
+          {
+            "id": "router",
+            "outcome": "down",
+            "reason": "timeout",
+            "ms": null,
+            "ping": {
+              "sent": 3,
+              "received": 0
+            }
+          },
+          {
+            "id": "nas",
+            "outcome": "skipped",
+            "reason": "not-allowed",
+            "ms": null
+          },
+          {
+            "id": "again",
+            "outcome": "skipped",
+            "reason": "too-soon",
+            "ms": null
+          },
+          {
+            "id": "gone",
+            "outcome": "down",
+            "reason": "no-answer",
+            "ms": 21,
+            "dns": {
+              "rcode": "nxdomain",
+              "answers": []
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "description": "Up with a reason.",
+      "upload": {
+        "version": 1,
+        "id": "chk_1",
+        "results": [
+          {
+            "id": "a",
+            "outcome": "up",
+            "reason": "timeout",
+            "ms": 1
+          }
+        ]
+      }
+    },
+    {
+      "description": "Down without a reason.",
+      "upload": {
+        "version": 1,
+        "id": "chk_1",
+        "results": [
+          {
+            "id": "a",
+            "outcome": "down",
+            "reason": null,
+            "ms": null
+          }
+        ]
+      }
+    },
+    {
+      "description": "More received than sent.",
+      "upload": {
+        "version": 1,
+        "id": "chk_1",
+        "results": [
+          {
+            "id": "a",
+            "outcome": "up",
+            "reason": null,
+            "ms": 1,
+            "ping": {
+              "sent": 3,
+              "received": 4
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "A check slower than the cap.",
+      "upload": {
+        "version": 1,
+        "id": "chk_1",
+        "results": [
+          {
+            "id": "a",
+            "outcome": "up",
+            "reason": null,
+            "ms": 10001
+          }
+        ]
+      }
+    },
+    {
+      "description": "A DNS answer that is not an address.",
+      "upload": {
+        "version": 1,
+        "id": "chk_1",
+        "results": [
+          {
+            "id": "a",
+            "outcome": "up",
+            "reason": null,
+            "ms": 5,
+            "dns": {
+              "rcode": "noerror",
+              "answers": ["example.com"]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "An HTTP status out of range.",
+      "upload": {
+        "version": 1,
+        "id": "chk_1",
+        "results": [
+          {
+            "id": "a",
+            "outcome": "up",
+            "reason": null,
+            "ms": 5,
+            "http": {
+              "status": 700,
+              "certDaysLeft": null,
+              "tlsValid": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "Unknown version.",
+      "upload": {
+        "version": 2,
+        "id": "chk_1",
+        "results": []
+      }
+    }
+  ]
+}

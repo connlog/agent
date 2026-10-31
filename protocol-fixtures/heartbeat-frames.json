@@ -1,0 +1,102 @@
+[
+  {
+    "description": "A typical interval: CPU measured, peak above average.",
+    "agent": {
+      "uptime_seconds": 86400,
+      "cpu_percent": 12.5,
+      "cpu_peak_percent": 40.25,
+      "memory_used_mb": 2048,
+      "memory_total_mb": 8192,
+      "disk_used_mb": 20480,
+      "disk_total_mb": 102400,
+      "load_1m": 0.42
+    },
+    "frame": "8051010000000000e204b90f000800000020000000500000009001002a002a00",
+    "platform": {
+      "uptime_seconds": 86400,
+      "cpu_percent": 12.5,
+      "cpu_max": 40.25,
+      "memory_used_mb": 2048,
+      "memory_total_mb": 8192,
+      "disk_used_mb": 20480,
+      "disk_total_mb": 102400,
+      "load_1m": 0.42,
+      "load_max": 0.42
+    }
+  },
+  {
+    "description": "The first heartbeat after start: no CPU interval yet, both CPU fields carry the 0xffff sentinel.",
+    "agent": {
+      "uptime_seconds": 5,
+      "cpu_percent": null,
+      "cpu_peak_percent": null,
+      "memory_used_mb": 512,
+      "memory_total_mb": 1024,
+      "disk_used_mb": 1000,
+      "disk_total_mb": 8000,
+      "load_1m": 0.0
+    },
+    "frame": "0500000000000000ffffffff0002000000040000e8030000401f000000000000",
+    "platform": {
+      "uptime_seconds": 5,
+      "cpu_percent": null,
+      "cpu_max": null,
+      "memory_used_mb": 512,
+      "memory_total_mb": 1024,
+      "disk_used_mb": 1000,
+      "disk_total_mb": 8000,
+      "load_1m": 0.0,
+      "load_max": 0.0
+    }
+  },
+  {
+    "description": "Peak unknown: the agent sends the average in both CPU fields.",
+    "agent": {
+      "uptime_seconds": 3600,
+      "cpu_percent": 73.21,
+      "cpu_peak_percent": null,
+      "memory_used_mb": 30000,
+      "memory_total_mb": 65536,
+      "disk_used_mb": 400000,
+      "disk_total_mb": 950000,
+      "load_1m": 3.07
+    },
+    "frame": "100e000000000000991c991c3075000000000100801a0600f07e0e0033013301",
+    "platform": {
+      "uptime_seconds": 3600,
+      "cpu_percent": 73.21,
+      "cpu_max": 73.21,
+      "memory_used_mb": 30000,
+      "memory_total_mb": 65536,
+      "disk_used_mb": 400000,
+      "disk_total_mb": 950000,
+      "load_1m": 3.07,
+      "load_max": 3.07
+    }
+  },
+  {
+    "description": "Out-of-range readings: CPU above 100 clamps to 100, load past the u16 range caps at 655.34 so it never wraps or collides with the sentinel, memory at the u32 maximum.",
+    "agent": {
+      "uptime_seconds": 3155760000,
+      "cpu_percent": 150.0,
+      "cpu_peak_percent": 100.0,
+      "memory_used_mb": 4294967295,
+      "memory_total_mb": 4294967295,
+      "disk_used_mb": 0,
+      "disk_total_mb": 0,
+      "load_1m": 700.0
+    },
+    "frame": "801319bc0000000010271027ffffffffffffffff0000000000000000fefffeff",
+    "platform": {
+      "uptime_seconds": 3155760000,
+      "cpu_percent": 100.0,
+      "cpu_max": 100.0,
+      "memory_used_mb": 4294967295,
+      "memory_total_mb": 4294967295,
+      "disk_used_mb": 0,
+      "disk_total_mb": 0,
+      "load_1m": 655.34,
+      "load_max": 655.34
+    }
+  }
+]

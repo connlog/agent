@@ -9,15 +9,18 @@
 //! `CONNLOG_TOKEN` in the environment. Anything else runs exactly what it ran
 //! before this module existed.
 //!
-//! Every setting goes through the same `install::set_*` functions the
-//! `config` subcommands call, so the menu and the CLI cannot drift. Settings
-//! live in the root-only `/etc/connlog/agent.conf`: without root the menu
-//! shows what it can and offers to reopen itself with sudo. It never prints
-//! the token or the BMC password, and passes nothing to sudo but the binary.
+//! Every setting is one of `features::settings`, the table `config set`
+//! reads, and is written by the same `install::set_agent_conf_values`, so the
+//! menu and the CLI cannot drift. Changes are staged and applied together,
+//! with one restart the agent is watched through (owner, 2026-10-31); a
+//! setting says what it sends before it is turned on. Settings live in the
+//! root-only agent.conf: without root the menu shows what it can and offers
+//! to reopen itself with sudo. It never prints the token, the BMC password
+//! or the BMC's address, and passes nothing to sudo but the binary.
 
 use anyhow::Result;
 use dialoguer::console::{style, Term};
-use dialoguer::{Confirm, Input, Select};
+use dialoguer::{Confirm, Input, Password, Select};
 use std::ffi::OsString;
 use std::io::{self, IsTerminal};
 use std::os::unix::process::CommandExt;
@@ -29,6 +32,7 @@ use std::time::{Duration, SystemTime};
 use crate::config::DiagnosticsFormat;
 use crate::defaults::DEFAULT_ENDPOINT;
 use crate::features::heartbeat_telemetry::{default_state_dir, load_events};
+use crate::features::settings::{switch_word, Kind, LEVELS, SETTINGS};
 use crate::install;
 use crate::platform::SAFE_PATH;
 
@@ -86,39 +90,104 @@ pub fn opens_menu(launch: &Launch) -> bool {
         && !launch.token_in_env
 }
 
-/// The settings the menu toggles, as this host's agent.conf has them. `None`
-/// for all of them without root: the file is not readable.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct HostSettings {
-    remote_reboot: Option<bool>,
-    hostname: Option<bool>,
-    postmortem: Option<bool>,
-    network_map: Option<bool>,
-    checks: Option<bool>,
+/// The settings the menu shows, by their place in `SETTINGS`, in its order.
+/// The BMC's are one item of their own.
+const SHOWN: &[&str] = &[
+    "hostname",
+    "remote-reboot",
+    "postmortem",
+    "discovery",
+    "network-site",
+    "network-map-ports",
+    "probe-public",
+    "checks",
+    "collector",
+];
+const BMC: [&str; 4] = [
+    "bmc-endpoint",
+    "bmc-username",
+    "bmc-password",
+    "bmc-insecure-tls",
+];
+
+fn index(name: &str) -> usize {
+    SETTINGS
+        .iter()
+        .position(|s| s.name == name)
+        .expect("a setting the menu names is in the table")
 }
 
-impl HostSettings {
-    fn from_conf(conf: Option<&str>) -> Self {
-        let Some(conf) = conf else {
-            return Self::default();
-        };
-        Self {
-            remote_reboot: Some(install::conf_allows_remote_reboot(conf)),
-            hostname: Some(install::conf_bool(conf, "CONNLOG_EXPOSE_SYSTEM_INFO").unwrap_or(false)),
-            postmortem: Some(install::conf_bool(conf, "CONNLOG_SHARE_POSTMORTEM").unwrap_or(false)),
-            network_map: Some(super::discovery::conf_ceiling(conf).network_map()),
-            checks: Some(install::conf_bool(conf, super::checks::CONF_CHECKS) == Some(true)),
+/// The settings as the menu shows and changes them: the file as read (`None`
+/// without root, which cannot read it) and the changes staged until Apply.
+#[derive(Debug, Clone, Default)]
+struct Draft {
+    conf: Option<String>,
+    staged: Vec<(usize, String)>,
+}
+
+impl Draft {
+    /// A setting's value in the file.
+    fn saved(&self, at: usize) -> Option<String> {
+        self.conf
+            .as_deref()
+            .and_then(|conf| install::conf_value(conf, SETTINGS[at].key))
+    }
+
+    fn staged(&self, at: usize) -> Option<&str> {
+        self.staged
+            .iter()
+            .find(|(i, _)| *i == at)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// What the menu works from: the staged value, else the file's.
+    fn value(&self, at: usize) -> Option<String> {
+        self.staged(at)
+            .map(str::to_string)
+            .or_else(|| self.saved(at))
+    }
+
+    /// Stage `value`; staging what the file already means drops the change.
+    fn stage(&mut self, at: usize, value: String) {
+        self.staged.retain(|(i, _)| *i != at);
+        if !same(at, self.saved(at).as_deref(), &value) {
+            self.staged.push((at, value));
         }
+    }
+
+    fn bmc_set_up(&self) -> bool {
+        BMC[..3]
+            .iter()
+            .all(|name| self.value(index(name)).is_some_and(|v| !v.is_empty()))
+    }
+
+    fn pairs(&self) -> Vec<(&'static str, &str)> {
+        self.staged
+            .iter()
+            .map(|(i, v)| (SETTINGS[*i].key, v.as_str()))
+            .collect()
+    }
+}
+
+/// Whether `value` means what the file's `saved` does: a switch's word, a
+/// level, else the text; unset is off, the lowest level or empty.
+fn same(at: usize, saved: Option<&str>, value: &str) -> bool {
+    match SETTINGS[at].kind {
+        Kind::Switch { .. } => {
+            saved.and_then(switch_word).unwrap_or(false) == switch_word(value).unwrap_or(false)
+        }
+        Kind::Level => saved.unwrap_or("off").eq_ignore_ascii_case(value),
+        _ => saved.unwrap_or_default() == value,
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Choice {
-    RemoteReboot,
-    Hostname,
-    Postmortem,
-    NetworkMap,
-    Checks,
+    Setting(usize),
+    Bmc,
+    Apply,
+    Discard,
+    CheckSettings,
     Status,
     CheckConfig,
     TestHeartbeat,
@@ -129,48 +198,63 @@ enum Choice {
 
 /// Which choices need root (they read or write agent.conf, or remove the agent).
 fn needs_root(choice: Choice) -> bool {
-    matches!(
-        choice,
-        Choice::RemoteReboot
-            | Choice::Hostname
-            | Choice::Postmortem
-            | Choice::NetworkMap
-            | Choice::Checks
-            | Choice::CheckConfig
-            | Choice::TestHeartbeat
-            | Choice::Uninstall
-    )
+    !matches!(choice, Choice::Status | Choice::Diagnostics | Choice::Quit)
 }
 
-fn setting_label(name: &str, value: Option<bool>) -> String {
-    let value = match value {
-        Some(true) => "on".to_string(),
-        Some(false) => "off".to_string(),
-        None => "needs sudo".to_string(),
-    };
-    format!("{name:<20}{value}")
+fn setting_label(draft: &Draft, at: usize) -> String {
+    let setting = &SETTINGS[at];
+    if draft.conf.is_none() {
+        return format!("{:<20}needs sudo", setting.title);
+    }
+    let saved = setting.shown(draft.saved(at).as_deref());
+    match draft.staged(at) {
+        Some(next) => format!(
+            "{:<20}{saved} → {}",
+            setting.title,
+            setting.shown(Some(next))
+        ),
+        None => format!("{:<20}{saved}", setting.title),
+    }
 }
 
-/// The menu, in order: the five toggles, then the one-off actions.
-fn menu_items(settings: &HostSettings) -> Vec<(Choice, String)> {
-    vec![
-        (
-            Choice::RemoteReboot,
-            setting_label("Remote reboot", settings.remote_reboot),
-        ),
-        (
-            Choice::Hostname,
-            setting_label("Hostname sharing", settings.hostname),
-        ),
-        (
-            Choice::Postmortem,
-            setting_label("Crash reports", settings.postmortem),
-        ),
-        (
-            Choice::NetworkMap,
-            setting_label("Network map", settings.network_map),
-        ),
-        (Choice::Checks, setting_label("Checks", settings.checks)),
+fn bmc_label(draft: &Draft) -> String {
+    let title = "BMC hardware health";
+    if draft.conf.is_none() {
+        return format!("{title:<20}needs sudo");
+    }
+    let mut saved = draft.clone();
+    saved.staged.clear();
+    let word = |set_up: bool| if set_up { "set up" } else { "not set up" };
+    let now = word(saved.bmc_set_up());
+    if BMC.iter().any(|name| draft.staged(index(name)).is_some()) {
+        format!("{title:<20}{now} → {}", word(draft.bmc_set_up()))
+    } else {
+        format!("{title:<20}{now}")
+    }
+}
+
+/// The menu, in order: the settings, Apply and Discard while changes are
+/// staged, then the one-off actions.
+fn menu_items(draft: &Draft) -> Vec<(Choice, String)> {
+    let mut items: Vec<(Choice, String)> = SHOWN
+        .iter()
+        .map(|name| {
+            let at = index(name);
+            (Choice::Setting(at), setting_label(draft, at))
+        })
+        .collect();
+    items.push((Choice::Bmc, bmc_label(draft)));
+    let staged = draft.staged.len();
+    if staged > 0 {
+        let s = if staged == 1 { "" } else { "s" };
+        items.push((
+            Choice::Apply,
+            format!("Apply {staged} change{s} (the agent restarts once)"),
+        ));
+        items.push((Choice::Discard, "Discard changes".to_string()));
+    }
+    items.extend([
+        (Choice::CheckSettings, "Check these settings".to_string()),
         (Choice::Status, "Service status".to_string()),
         (Choice::CheckConfig, "Check config with ConnLog".to_string()),
         (Choice::TestHeartbeat, "Send a test heartbeat".to_string()),
@@ -180,7 +264,8 @@ fn menu_items(settings: &HostSettings) -> Vec<(Choice, String)> {
         ),
         (Choice::Uninstall, "Uninstall the agent".to_string()),
         (Choice::Quit, "Quit".to_string()),
-    ]
+    ]);
+    items
 }
 
 fn is_root() -> bool {
@@ -279,28 +364,33 @@ fn is_interrupt(err: &anyhow::Error) -> bool {
 
 fn menu_loop(term: &Term) -> Result<()> {
     let mut selected = 0;
+    let mut staged = Vec::new();
     loop {
         let root = is_root();
         // Root with no file is a host the agent was never installed on (or
         // was removed from): every setting is at its default, not unknown.
-        let conf = root.then(|| install::read_agent_conf().unwrap_or_default());
-        let settings = HostSettings::from_conf(conf.as_deref());
-        let items = menu_items(&settings);
+        let conf = root.then(|| {
+            install::conf::Host::current()
+                .and_then(install::conf::Host::read)
+                .unwrap_or_default()
+        });
+        let mut draft = Draft {
+            conf,
+            staged: std::mem::take(&mut staged),
+        };
+        let items = menu_items(&draft);
 
         print_header(term, root);
         let labels: Vec<&str> = items.iter().map(|(_, label)| label.as_str()).collect();
-        let Some(index) = Select::new()
+        let picked = Select::new()
             .with_prompt("Choose with the arrow keys, Enter to select, Esc to quit")
             .items(&labels)
-            .default(selected)
-            .interact_on_opt(term)?
-        else {
-            return Ok(());
-        };
-        selected = index;
-        let choice = items[index].0;
+            .default(selected.min(items.len() - 1))
+            .interact_on_opt(term)?;
+        let choice = picked.map_or(Choice::Quit, |i| items[i].0);
+        selected = picked.unwrap_or(selected);
         if choice == Choice::Quit {
-            return Ok(());
+            return leave(&mut draft);
         }
 
         if needs_root(choice) && !root {
@@ -308,11 +398,16 @@ fn menu_loop(term: &Term) -> Result<()> {
             continue;
         }
 
-        if let Err(err) = act(choice, &settings, conf.as_deref()) {
+        let outcome = act(choice, &mut draft);
+        staged = std::mem::take(&mut draft.staged);
+        if let Err(err) = outcome {
             if is_interrupt(&err) {
                 return Err(err);
             }
             println!("{} {err:#}", style("Error:").red().bold());
+        } else if matches!(choice, Choice::Setting(_) | Choice::Bmc | Choice::Discard) {
+            // Staged: back to the list, which shows it.
+            continue;
         }
         if choice == Choice::Uninstall
             && !std::path::Path::new(install::SYSTEMD_SERVICE_PATH).exists()
@@ -321,6 +416,27 @@ fn menu_loop(term: &Term) -> Result<()> {
         }
         pause(term)?;
     }
+}
+
+/// Leaving with staged changes: apply them (one restart) or let them go.
+fn leave(draft: &mut Draft) -> Result<()> {
+    let staged = draft.staged.len();
+    if staged == 0 {
+        return Ok(());
+    }
+    let s = if staged == 1 { "" } else { "s" };
+    let apply = Confirm::new()
+        .with_prompt(format!(
+            "Apply {staged} staged change{s} before leaving? The agent restarts once."
+        ))
+        .default(true)
+        .interact()?;
+    if apply {
+        install::set_agent_conf_values(&draft.pairs())?;
+    } else {
+        println!("Left without changing anything.");
+    }
+    Ok(())
 }
 
 /// Reopen with sudo: replaces this process with `sudo <this binary>`, no
@@ -350,61 +466,118 @@ fn pause(term: &Term) -> Result<()> {
     Ok(())
 }
 
-fn confirm_toggle(name: &str, now: bool) -> Result<bool> {
-    let verb = if now { "off" } else { "on" };
-    Ok(Confirm::new()
-        .with_prompt(format!(
-            "Turn {name} {verb}? The agent restarts to apply it."
-        ))
-        .default(false)
-        .interact()?)
+fn edit(draft: &mut Draft, at: usize) -> Result<()> {
+    let setting = &SETTINGS[at];
+    println!("\n{}\n{}", style(setting.title).bold(), setting.about);
+    match setting.kind {
+        Kind::Switch { .. } => {
+            let on = !draft
+                .value(at)
+                .as_deref()
+                .and_then(switch_word)
+                .unwrap_or(false);
+            if on && !setting.sends.is_empty() {
+                println!("\n{}", setting.sends);
+            }
+            let verb = if on { "on" } else { "off" };
+            if Confirm::new()
+                .with_prompt(format!("Turn {} {verb}?", setting.title.to_lowercase()))
+                .default(false)
+                .interact()?
+            {
+                draft.stage(at, on.to_string());
+            }
+        }
+        Kind::Level => {
+            println!();
+            for (level, sends) in LEVELS {
+                println!("  {level:<8} {sends}");
+            }
+            let now = draft.value(at).unwrap_or_else(|| "off".to_string());
+            let levels: Vec<&str> = LEVELS.iter().map(|(level, _)| *level).collect();
+            let default = levels.iter().position(|l| *l == now).unwrap_or(0);
+            if let Some(i) = Select::new()
+                .with_prompt("Choose a level, Esc to leave it as it is")
+                .items(&levels)
+                .default(default)
+                .interact_opt()?
+            {
+                draft.stage(at, levels[i].to_string());
+            }
+        }
+        _ => {
+            let typed: String = Input::new()
+                .with_prompt(format!("{} (empty clears it)", setting.title))
+                .with_initial_text(draft.value(at).unwrap_or_default())
+                .allow_empty(true)
+                .validate_with(|v: &String| setting.parse(v).map(|_| ()))
+                .interact_text()?;
+            let value = setting.parse(&typed).map_err(anyhow::Error::msg)?;
+            draft.stage(at, value);
+        }
+    }
+    Ok(())
 }
 
-fn act(choice: Choice, settings: &HostSettings, conf: Option<&str>) -> Result<()> {
+/// The BMC's address, user, password (never shown) and certificate choice,
+/// staged together; an empty address clears all of them.
+fn edit_bmc(draft: &mut Draft) -> Result<()> {
+    let [endpoint, user, password, self_signed] = BMC.map(index);
+    println!(
+        "\n{}\n{}",
+        style("BMC hardware health").bold(),
+        SETTINGS[endpoint].sends
+    );
+    let address: String = Input::new()
+        .with_prompt("Its address, such as https://10.0.0.120 (empty turns it off)")
+        .with_initial_text(draft.value(endpoint).unwrap_or_default())
+        .allow_empty(true)
+        .validate_with(|v: &String| SETTINGS[endpoint].parse(v).map(|_| ()))
+        .interact_text()?;
+    if address.trim().is_empty() {
+        for at in [endpoint, user, password] {
+            draft.stage(at, String::new());
+        }
+        return Ok(());
+    }
+    let name: String = Input::new()
+        .with_prompt("User")
+        .with_initial_text(draft.value(user).unwrap_or_default())
+        .interact_text()?;
+    let secret = Password::new()
+        .with_prompt("Password (not shown)")
+        .with_confirmation("Once more", "The two differ; try again")
+        .interact()?;
+    let accept = Confirm::new()
+        .with_prompt("Accept its self-signed certificate? iDRAC and iLO usually have one.")
+        .default(
+            draft
+                .value(self_signed)
+                .as_deref()
+                .and_then(switch_word)
+                .unwrap_or(true),
+        )
+        .interact()?;
+    draft.stage(endpoint, address.trim().to_string());
+    draft.stage(user, name.trim().to_string());
+    draft.stage(password, secret);
+    draft.stage(self_signed, accept.to_string());
+    Ok(())
+}
+
+fn act(choice: Choice, draft: &mut Draft) -> Result<()> {
     match choice {
-        Choice::RemoteReboot => {
-            let now = settings.remote_reboot.unwrap_or(false);
-            if confirm_toggle("remote reboot", now)? {
-                install::set_remote_reboot(!now)?;
-            }
+        Choice::Setting(at) => edit(draft, at)?,
+        Choice::Bmc => edit_bmc(draft)?,
+        Choice::Apply => {
+            install::set_agent_conf_values(&draft.pairs())?;
+            draft.staged.clear();
         }
-        Choice::Hostname => {
-            let now = settings.hostname.unwrap_or(false);
-            if confirm_toggle("hostname sharing", now)? {
-                install::set_hostname_sharing(!now)?;
-            }
-        }
-        Choice::Postmortem => {
-            let now = settings.postmortem.unwrap_or(false);
-            if confirm_toggle("crash reports", now)? {
-                install::set_postmortem_sharing(!now)?;
-            }
-        }
-        Choice::NetworkMap => {
-            let now = settings.network_map.unwrap_or(false);
-            if confirm_toggle("the network map", now)? {
-                // On is peers; a host already allowing more keeps it.
-                let level = if now {
-                    super::discovery::DiscoveryLevel::Off
-                } else {
-                    super::discovery::conf_ceiling(conf.unwrap_or_default())
-                        .max(super::discovery::DiscoveryLevel::Peers)
-                };
-                install::set_network_map(&super::network_map::ConfChoice {
-                    discovery: Some(level),
-                    ..Default::default()
-                })?;
-            }
-        }
-        Choice::Checks => {
-            let now = settings.checks.unwrap_or(false);
-            if confirm_toggle("checks", now)? {
-                install::set_checks(!now)?;
-            }
-        }
+        Choice::Discard => draft.staged.clear(),
+        Choice::CheckSettings => crate::features::settings::run_check()?,
         Choice::Status => install::status()?,
         Choice::CheckConfig | Choice::TestHeartbeat => {
-            let conf = conf.unwrap_or_default();
+            let conf = draft.conf.as_deref().unwrap_or_default();
             let Some(token) = install::conf_value(conf, "CONNLOG_TOKEN") else {
                 anyhow::bail!("No token in /etc/connlog/agent.conf. Is the agent installed?");
             };
@@ -530,37 +703,76 @@ mod tests {
         )));
     }
 
+    fn draft(conf: &str) -> Draft {
+        Draft {
+            conf: Some(conf.to_string()),
+            staged: Vec::new(),
+        }
+    }
+
+    fn label(items: &[(Choice, String)], title: &str) -> String {
+        items
+            .iter()
+            .find(|(_, label)| label.starts_with(title))
+            .map(|(_, label)| label.clone())
+            .unwrap_or_else(|| panic!("no {title} in the menu"))
+    }
+
     #[test]
     fn settings_read_as_the_agent_reads_them() {
-        let conf = "CONNLOG_TOKEN=\"agent_secret\"\nCONNLOG_EXPOSE_SYSTEM_INFO=\"true\"\nCONNLOG_ALLOW_REMOTE_REBOOT=\"false\"\n";
+        let conf = "CONNLOG_TOKEN=\"agent_secret\"\nCONNLOG_EXPOSE_SYSTEM_INFO=\"true\"\nCONNLOG_ALLOW_REMOTE_REBOOT=\"false\"\nCONNLOG_DISCOVERY=\"passive\"\n";
+        let items = menu_items(&draft(conf));
+        assert!(label(&items, "Hostname sharing").ends_with("on"));
+        assert!(label(&items, "Remote reboot").ends_with("off"));
+        assert!(label(&items, "Crash reports").ends_with("off (default)"));
+        assert!(label(&items, "Discovery").ends_with("passive"));
+        assert!(label(&items, "BMC hardware health").ends_with("not set up"));
+        // Nothing staged, nothing to apply.
+        assert!(!items.iter().any(|(choice, _)| *choice == Choice::Apply));
+    }
+
+    #[test]
+    fn changes_are_staged_shown_and_applied_together() {
+        let mut d = draft("CONNLOG_TOKEN=\"agent_x\"\nCONNLOG_DISCOVERY=\"peers\"\n");
+        d.stage(index("discovery"), "active".into());
+        d.stage(index("checks"), "true".into());
+        // What the file already means is no change: unset is off.
+        d.stage(index("postmortem"), "false".into());
+        let items = menu_items(&d);
         assert_eq!(
-            HostSettings::from_conf(Some(conf)),
-            HostSettings {
-                remote_reboot: Some(false),
-                hostname: Some(true),
-                postmortem: Some(false),
-                network_map: Some(false),
-                checks: Some(false),
-            }
+            label(&items, "Discovery"),
+            format!("{:<20}peers → active", "Discovery")
         );
-        assert_eq!(HostSettings::from_conf(None), HostSettings::default());
+        assert!(label(&items, "Checks").ends_with("off (default) → on"));
+        assert!(label(&items, "Crash reports").ends_with("off (default)"));
+        assert_eq!(
+            label(&items, "Apply"),
+            "Apply 2 changes (the agent restarts once)"
+        );
+        assert_eq!(
+            d.pairs(),
+            vec![("CONNLOG_DISCOVERY", "active"), ("CONNLOG_CHECKS", "true")]
+        );
+        // Staging the file's value again drops the change.
+        d.stage(index("discovery"), "peers".into());
+        assert_eq!(d.pairs(), vec![("CONNLOG_CHECKS", "true")]);
     }
 
     #[test]
     fn remote_reboot_reads_off_unless_set_to_true() {
-        for (line, allowed) in [
-            ("", false),
-            ("CONNLOG_ALLOW_REMOTE_REBOOT=maybe\n", false),
-            ("CONNLOG_ALLOW_REMOTE_REBOOT=\"false\"\n", false),
-            ("CONNLOG_ALLOW_REMOTE_REBOOT=\"true\"\n", true),
+        for (line, word) in [
+            ("", "off (default)"),
+            ("CONNLOG_ALLOW_REMOTE_REBOOT=\"false\"\n", "off"),
+            ("CONNLOG_ALLOW_REMOTE_REBOOT=\"true\"\n", "on"),
         ] {
             let conf = format!("CONNLOG_TOKEN=\"agent_x\"\n{line}");
-            assert_eq!(
-                HostSettings::from_conf(Some(&conf)).remote_reboot,
-                Some(allowed),
+            assert!(
+                label(&menu_items(&draft(&conf)), "Remote reboot").ends_with(word),
                 "{line:?}"
             );
         }
+        let odd = draft("CONNLOG_ALLOW_REMOTE_REBOOT=maybe\n");
+        assert!(label(&menu_items(&odd), "Remote reboot").contains("not on or off"));
     }
 
     #[test]
@@ -571,22 +783,30 @@ mod tests {
             "CONNLOG_BMC_USERNAME=\"root\"\n",
             "CONNLOG_BMC_PASSWORD=\"hunter2-bmc\"\n",
         );
-        for settings in [HostSettings::from_conf(Some(conf)), HostSettings::default()] {
-            for (_, label) in menu_items(&settings) {
-                for secret in ["agent_0123456789abcdef", "hunter2-bmc", "10.0.0.120"] {
+        let mut staged = draft(conf);
+        staged.stage(index("bmc-password"), "an0ther-secret".into());
+        for d in [draft(conf), staged, Draft::default()] {
+            for (_, label) in menu_items(&d) {
+                for secret in [
+                    "agent_0123456789abcdef",
+                    "hunter2-bmc",
+                    "an0ther-secret",
+                    "10.0.0.120",
+                ] {
                     assert!(!label.contains(secret), "{label}");
                 }
             }
         }
+        assert!(label(&menu_items(&draft(conf)), "BMC hardware health").ends_with("set up"));
     }
 
     #[test]
     fn without_root_settings_say_so_and_ask_for_sudo() {
-        let items = menu_items(&HostSettings::default());
-        assert!(items[..3]
-            .iter()
-            .all(|(_, label)| label.ends_with("needs sudo")));
-        for (choice, _) in &items {
+        let items = menu_items(&Draft::default());
+        for (choice, label) in &items {
+            if matches!(choice, Choice::Setting(_) | Choice::Bmc) {
+                assert!(label.ends_with("needs sudo"), "{label}");
+            }
             let expected = !matches!(choice, Choice::Status | Choice::Diagnostics | Choice::Quit);
             assert_eq!(needs_root(*choice), expected, "{choice:?}");
         }

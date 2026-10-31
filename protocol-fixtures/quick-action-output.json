@@ -1,0 +1,24 @@
+{
+  "description": "Pieces of a running quick action's output, as the agent posts them to POST /api/agents/actions/output (agent 1.23+) while the action runs, for an action whose output is shown. The platform relays each to the person who ran the action and never stores it; the final result (POST /api/agents/actions/results) still carries all of it. seq orders the pieces of one run from 0.",
+  "chunks": [
+    {
+      "requestId": "6f1c2a7e-0d3b-4e7a-9c1f-2b8d4e6a1c30",
+      "actionId": "disk_usage",
+      "seq": 0,
+      "stdout": "Filesystem      Size  Used Avail Use% Mounted on\n"
+    },
+    {
+      "requestId": "6f1c2a7e-0d3b-4e7a-9c1f-2b8d4e6a1c30",
+      "actionId": "disk_usage",
+      "seq": 1,
+      "stdout": "/dev/sda1        40G   31G  7.2G  82% /\n",
+      "stderr": "df: /run/user/1000/doc: Operation not permitted\n"
+    },
+    {
+      "requestId": "6f1c2a7e-0d3b-4e7a-9c1f-2b8d4e6a1c30",
+      "actionId": "disk_usage",
+      "seq": 2,
+      "stderr": "done with warnings\n"
+    }
+  ]
+}

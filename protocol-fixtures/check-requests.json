@@ -1,0 +1,215 @@
+[
+  {
+    "description": "One of each kind: all four run, in the order given.",
+    "request": {
+      "id": "chk_01J0A",
+      "checks": [
+        {
+          "id": "site",
+          "kind": "http",
+          "url": "https://example.com/health"
+        },
+        {
+          "id": "router",
+          "kind": "ping",
+          "target": "192.168.1.1"
+        },
+        {
+          "id": "db",
+          "kind": "tcp",
+          "target": "db.internal",
+          "port": 5432
+        },
+        {
+          "id": "resolver",
+          "kind": "dns",
+          "name": "example.com",
+          "recordType": "A",
+          "resolver": "1.1.1.1"
+        }
+      ]
+    },
+    "runs": ["site", "router", "db", "resolver"]
+  },
+  {
+    "description": "More than 16 checks: the first 16 run, the rest are dropped unread.",
+    "request": {
+      "id": "chk_01J0B",
+      "checks": [
+        {
+          "id": "c0",
+          "kind": "ping",
+          "target": "10.0.0.1"
+        },
+        {
+          "id": "c1",
+          "kind": "ping",
+          "target": "10.0.0.2"
+        },
+        {
+          "id": "c2",
+          "kind": "ping",
+          "target": "10.0.0.3"
+        },
+        {
+          "id": "c3",
+          "kind": "ping",
+          "target": "10.0.0.4"
+        },
+        {
+          "id": "c4",
+          "kind": "ping",
+          "target": "10.0.0.5"
+        },
+        {
+          "id": "c5",
+          "kind": "ping",
+          "target": "10.0.0.6"
+        },
+        {
+          "id": "c6",
+          "kind": "ping",
+          "target": "10.0.0.7"
+        },
+        {
+          "id": "c7",
+          "kind": "ping",
+          "target": "10.0.0.8"
+        },
+        {
+          "id": "c8",
+          "kind": "ping",
+          "target": "10.0.0.9"
+        },
+        {
+          "id": "c9",
+          "kind": "ping",
+          "target": "10.0.0.10"
+        },
+        {
+          "id": "c10",
+          "kind": "ping",
+          "target": "10.0.0.11"
+        },
+        {
+          "id": "c11",
+          "kind": "ping",
+          "target": "10.0.0.12"
+        },
+        {
+          "id": "c12",
+          "kind": "ping",
+          "target": "10.0.0.13"
+        },
+        {
+          "id": "c13",
+          "kind": "ping",
+          "target": "10.0.0.14"
+        },
+        {
+          "id": "c14",
+          "kind": "ping",
+          "target": "10.0.0.15"
+        },
+        {
+          "id": "c15",
+          "kind": "ping",
+          "target": "10.0.0.16"
+        },
+        {
+          "id": "c16",
+          "kind": "ping",
+          "target": "10.0.0.17"
+        },
+        {
+          "id": "c17",
+          "kind": "ping",
+          "target": "10.0.0.18"
+        },
+        {
+          "id": "c18",
+          "kind": "ping",
+          "target": "10.0.0.19"
+        },
+        {
+          "id": "c19",
+          "kind": "ping",
+          "target": "10.0.0.20"
+        }
+      ]
+    },
+    "runs": [
+      "c0",
+      "c1",
+      "c2",
+      "c3",
+      "c4",
+      "c5",
+      "c6",
+      "c7",
+      "c8",
+      "c9",
+      "c10",
+      "c11",
+      "c12",
+      "c13",
+      "c14",
+      "c15"
+    ]
+  },
+  {
+    "description": "Checks the agent cannot read are dropped, never guessed at: an unknown kind, a URL that is not HTTP, a port 0, a resolver that is not an address, a missing target.",
+    "request": {
+      "id": "chk_01J0C",
+      "checks": [
+        {
+          "id": "a",
+          "kind": "smtp",
+          "target": "mail.example.com"
+        },
+        {
+          "id": "b",
+          "kind": "http",
+          "url": "ftp://example.com/"
+        },
+        {
+          "id": "c",
+          "kind": "tcp",
+          "target": "10.0.0.5",
+          "port": 0
+        },
+        {
+          "id": "d",
+          "kind": "dns",
+          "name": "example.com",
+          "recordType": "A",
+          "resolver": "dns.example.com"
+        },
+        {
+          "id": "e",
+          "kind": "ping"
+        },
+        {
+          "id": "f",
+          "kind": "http",
+          "url": "http://10.0.0.5:8080/"
+        }
+      ]
+    },
+    "runs": ["f"]
+  },
+  {
+    "description": "A request id the platform could not have written: no request at all.",
+    "request": {
+      "id": "not a valid id!",
+      "checks": [
+        {
+          "id": "a",
+          "kind": "ping",
+          "target": "10.0.0.1"
+        }
+      ]
+    },
+    "runs": null
+  }
+]

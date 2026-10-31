@@ -6,6 +6,19 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// The text of a wire-format fixture, one of the files the agent's tests and
+/// the platform's (`@connlog/agent-protocol`) both check against. build.rs
+/// says where they are: `packages/agent-protocol/fixtures` in
+/// connlog/platform, `protocol-fixtures/` in connlog/agent, which mirrors this
+/// crate alone. Tests only: a release build (including `cross`, which mounts
+/// only this crate) never reads them.
+#[cfg(test)]
+macro_rules! protocol_fixture {
+    ($name:literal) => {
+        include_str!(concat!(env!("CONNLOG_PROTOCOL_FIXTURES"), "/", $name))
+    };
+}
+
 // ── Core plumbing (crate root) ──────────────────────────────────
 // The minimum an agent needs to authenticate, resolve where to send
 // heartbeats, speak the wire protocol, and transport them.
@@ -60,9 +73,6 @@ const UNINSTALL_CONFIRM_THRESHOLD: u32 = 3;
 
 /// Consecutive reboot commands required from server before acting
 const REBOOT_CONFIRM_THRESHOLD: u32 = 3;
-
-/// Remote command execution is not a product capability.
-const REMOTE_CONTROL_ENABLED: bool = false;
 
 /// Maximum config fetch failures before using fallback
 const MAX_CONFIG_FETCH_RETRIES: u32 = 3;
@@ -167,7 +177,14 @@ struct QuickActionPollState {
     last_poll_at: Option<SystemTime>,
     next_poll_at: Option<SystemTime>,
     next_due: Option<Instant>,
+    /// Polls failed in a row: each waits twice the last, up to 30 s, so a
+    /// platform that is down is asked twice a minute, not every 5 s, and an
+    /// action is picked up within 30 s of it coming back.
+    failures: u32,
 }
+
+/// The longest a failing poll waits before the next.
+const QUICK_ACTION_POLL_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 impl QuickActionPollState {
     fn new(config: &QuickActionsConfig, registry: &QuickActionsRegistry) -> Self {
@@ -176,6 +193,7 @@ impl QuickActionPollState {
             interval_secs: config.poll_interval_seconds,
             last_poll_at: None,
             next_poll_at: None,
+            failures: 0,
             next_due: None,
         };
         state.sync(config, registry);
@@ -232,6 +250,23 @@ impl QuickActionPollState {
         self.report()
     }
 
+    /// A poll that failed: the next waits longer (twice, up to 30 s).
+    /// True for the first failure of a run of them, the one worth a warning.
+    fn mark_poll_failed(&mut self) -> bool {
+        self.failures = self.failures.saturating_add(1);
+        let wait = Duration::from_secs(self.interval_secs)
+            .saturating_mul(1 << self.failures.min(6))
+            .min(QUICK_ACTION_POLL_MAX_BACKOFF);
+        self.next_due = Some(Instant::now() + wait);
+        self.next_poll_at = SystemTime::now().checked_add(wait);
+        self.failures == 1
+    }
+
+    /// A poll that went through: back to the usual interval.
+    fn mark_poll_succeeded(&mut self) {
+        self.failures = 0;
+    }
+
     fn report(&self) -> QuickActionPollingReport {
         QuickActionPollingReport {
             enabled: self.enabled,
@@ -263,7 +298,8 @@ fn changes_the_host(config: &Config) -> Option<&'static str> {
     match &config.command {
         Some(AgentCommand::Install) => Some("install"),
         Some(AgentCommand::Uninstall) => Some("uninstall"),
-        Some(AgentCommand::Config { .. }) => Some("config"),
+        // `config` works on FreeBSD and, in a container, says what to put in
+        // its environment (`install::conf`).
         Some(AgentCommand::Update) => Some("update"),
         Some(AgentCommand::ApplyStagedUpdate) => Some("apply-staged-update"),
         Some(AgentCommand::RefreshService { .. }) => Some("refresh-service"),
@@ -331,6 +367,10 @@ fn main() -> Result<()> {
                 );
             }
             AgentCommand::Uninstall => return install::uninstall(),
+            AgentCommand::Completions { shell } => {
+                install::completions::print(shell);
+                return Ok(());
+            }
             AgentCommand::Status => return install::status(),
             AgentCommand::RefreshService { restart } => return install::refresh_service(restart),
             AgentCommand::Config { command } => match command {
@@ -380,6 +420,10 @@ fn main() -> Result<()> {
                         ..Default::default()
                     });
                 }
+                LocalConfigCommand::Set { pairs } => return features::settings::run_set(&pairs),
+                LocalConfigCommand::Get { name } => return features::settings::run_get(&name),
+                LocalConfigCommand::Show => return features::settings::run_show(),
+                LocalConfigCommand::Check => return features::settings::run_check(),
             },
             AgentCommand::Update => return update::run_manual_update(),
             AgentCommand::ApplyStagedUpdate => return update::apply_staged_update(),
@@ -645,6 +689,7 @@ fn run_agent_with_shutdown_inner(
     client.set_collector_enabled(collector_enabled);
     let packaging = platform::Packaging::current();
     client.set_packaging(packaging);
+    client.report_os(expose_system_info);
     if packaging == platform::Packaging::Docker {
         info!(
             "Running in Docker: settings are the container's environment (CONNLOG_DISCOVERY, \
@@ -727,12 +772,10 @@ fn run_agent_with_shutdown_inner(
 
     let mut quick_actions = QuickActionsRegistry::load();
     let mut quick_actions_fingerprint = quick_actions.fingerprint();
-    // The manifest is what the dashboard would run; while remote control is
-    // compiled out there is nothing for it to do, and no reason to send
-    // operator-authored action names anywhere.
-    if REMOTE_CONTROL_ENABLED {
-        publish_quick_actions_manifest(&client, &quick_actions);
-    }
+    // What root registered on this host (actions.toml) is what the dashboard
+    // may run (owner, 2026-10-31): its manifest, even an empty one, so actions
+    // removed here leave the dashboard too.
+    publish_quick_actions_manifest(&client, &quick_actions);
     let mut quick_action_polling = QuickActionPollState::new(&config.quick_actions, &quick_actions);
 
     let mut first_heartbeat = true;
@@ -1062,7 +1105,20 @@ fn run_agent_with_shutdown_inner(
                     config.heartbeat_interval_secs,
                 );
                 error!("Heartbeat failed: {} (retry in {}s)", e, backoff);
-                if interruptible_sleep(&stop, backoff).is_err() {
+                // Actions are still asked for meanwhile, at the poll's own
+                // pace: after a platform restart one runs within seconds, not
+                // after this whole backoff.
+                if sleep_with_quick_action_polling(
+                    &stop,
+                    Duration::from_secs(backoff),
+                    &client,
+                    &mut quick_actions,
+                    &mut quick_actions_fingerprint,
+                    &config.quick_actions,
+                    &mut quick_action_polling,
+                )
+                .is_err()
+                {
                     return Ok(());
                 }
             }
@@ -1207,7 +1263,7 @@ fn sleep_with_quick_action_polling(
             return Ok(());
         }
 
-        if REMOTE_CONTROL_ENABLED && quick_action_polling.due(now) {
+        if quick_action_polling.due(now) {
             poll_quick_actions_once(
                 client,
                 quick_actions,
@@ -1218,14 +1274,10 @@ fn sleep_with_quick_action_polling(
             continue;
         }
 
-        let next_wake = if REMOTE_CONTROL_ENABLED {
-            quick_action_polling
-                .next_due()
-                .map(|next_due| std::cmp::min(deadline, next_due))
-                .unwrap_or(deadline)
-        } else {
-            deadline
-        };
+        let next_wake = quick_action_polling
+            .next_due()
+            .map(|next_due| std::cmp::min(deadline, next_due))
+            .unwrap_or(deadline);
         let sleep_for = std::cmp::min(
             Duration::from_millis(500),
             next_wake.saturating_duration_since(now),
@@ -1249,9 +1301,7 @@ fn reload_quick_actions_if_changed(
     if reloaded_fingerprint != *quick_actions_fingerprint {
         *quick_actions = reloaded_quick_actions;
         *quick_actions_fingerprint = reloaded_fingerprint;
-        if REMOTE_CONTROL_ENABLED {
-            publish_quick_actions_manifest(client, quick_actions);
-        }
+        publish_quick_actions_manifest(client, quick_actions);
         return true;
     }
     false
@@ -1275,6 +1325,7 @@ fn poll_quick_actions_once(
     let report = quick_action_polling.mark_poll_started();
     match client.poll_quick_actions(&report) {
         Ok(requests) => {
+            quick_action_polling.mark_poll_succeeded();
             if requests.is_empty() {
                 debug!("Quick action poll completed with no pending requests");
             } else {
@@ -1282,7 +1333,16 @@ fn poll_quick_actions_once(
             }
             run_quick_action_requests(client, quick_actions, &requests);
         }
-        Err(e) => warn!("Quick action poll failed: {}", e),
+        Err(e) => {
+            if quick_action_polling.mark_poll_failed() {
+                warn!(
+                    "Quick action poll failed: {} (asking less often until it works)",
+                    e
+                );
+            } else {
+                debug!("Quick action poll failed again: {}", e);
+            }
+        }
     }
 }
 
@@ -1293,7 +1353,17 @@ fn run_quick_action_requests(
 ) {
     for request in requests {
         info!("Running quick action request {}", request.action_id);
-        let result = quick_actions.execute(request);
+        // Its output goes to whoever watches as it comes; once a piece fails
+        // to go, the rest waits for the result, which carries all of it.
+        let mut relaying = true;
+        let result = quick_actions.execute_streaming(request, &mut |chunk| {
+            if relaying {
+                if let Err(e) = client.send_quick_action_output(&chunk) {
+                    debug!("Quick action output not relayed: {}", e);
+                    relaying = false;
+                }
+            }
+        });
         if let Err(e) = client.send_quick_action_result(&result) {
             warn!("Quick action result send failed: {}", e);
         }
@@ -1873,8 +1943,6 @@ mod jitter_tests {
 
     /// The agent's half of `packages/agent-protocol/fixtures/heartbeat-schedule.json`.
     /// The platform's half is `packages/agent-protocol/src/__tests__/schedule.test.ts`.
-    /// `include_str!` reaches outside the crate only in tests, as
-    /// `http::shared_fixtures` does.
     #[test]
     fn heartbeat_schedule_matches_the_shared_fixture() {
         use crate::heartbeat::{
@@ -1882,10 +1950,9 @@ mod jitter_tests {
             HEARTBEAT_MIN_INTERVAL_SECS,
         };
 
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../packages/agent-protocol/fixtures/heartbeat-schedule.json"
-        ))
-        .expect("schedule fixture must be JSON");
+        let fixture: serde_json::Value =
+            serde_json::from_str(protocol_fixture!("heartbeat-schedule.json"))
+                .expect("schedule fixture must be JSON");
         let field = |name: &str| fixture[name].as_u64().expect(name);
 
         assert_eq!(HEARTBEAT_MIN_INTERVAL_SECS, field("minIntervalSecs"));
@@ -2031,8 +2098,9 @@ mod jitter_tests {
 #[cfg(test)]
 mod packaging_tests {
     use clap::Parser;
+    use std::time::{Duration, Instant};
 
-    use super::{changes_the_host, Config};
+    use super::{changes_the_host, Config, QuickActionPollState, QUICK_ACTION_POLL_MAX_BACKOFF};
 
     fn changes(args: &[&str]) -> Option<&'static str> {
         let mut argv = vec!["connlog-agent"];
@@ -2040,16 +2108,52 @@ mod packaging_tests {
         changes_the_host(&Config::try_parse_from(argv).unwrap())
     }
 
-    /// What Docker refuses: everything that installs, configures or updates
-    /// a systemd install. Running, diagnosing and integrations stay.
+    /// What Docker refuses: everything that installs or updates a systemd
+    /// install. Running, diagnosing and integrations stay, and `config` says
+    /// what to put in the container's environment instead.
+    /// A failing poll waits longer each time, up to 30 s, and one that
+    /// goes through brings back the usual interval.
+    #[test]
+    fn failing_polls_back_off_to_half_a_minute() {
+        let mut state = QuickActionPollState {
+            enabled: true,
+            interval_secs: 5,
+            last_poll_at: None,
+            next_poll_at: None,
+            next_due: None,
+            failures: 0,
+        };
+        let wait = |state: &QuickActionPollState| {
+            state
+                .next_due
+                .unwrap()
+                .saturating_duration_since(Instant::now())
+        };
+        assert!(
+            state.mark_poll_failed(),
+            "the first failure is worth a warning"
+        );
+        assert!(wait(&state) > Duration::from_secs(9) && wait(&state) <= Duration::from_secs(10));
+        assert!(!state.mark_poll_failed());
+        assert!(wait(&state) > Duration::from_secs(19));
+        for _ in 0..10 {
+            state.mark_poll_failed();
+        }
+        assert!(wait(&state) <= QUICK_ACTION_POLL_MAX_BACKOFF);
+        assert!(wait(&state) > Duration::from_secs(29));
+        state.mark_poll_succeeded();
+        assert_eq!(state.failures, 0);
+        assert!(
+            state.mark_poll_failed(),
+            "a new run of failures warns again"
+        );
+    }
+
     #[test]
     fn docker_refuses_only_what_changes_a_systemd_install() {
         assert_eq!(changes(&["install"]), Some("install"));
         assert_eq!(changes(&["--install"]), Some("--install"));
-        assert_eq!(
-            changes(&["config", "set-discovery", "active"]),
-            Some("config")
-        );
+        assert_eq!(changes(&["config", "set-discovery", "active"]), None);
         assert_eq!(changes(&["update"]), Some("update"));
         assert_eq!(changes(&["uninstall"]), Some("uninstall"));
         assert_eq!(changes(&[]), None);

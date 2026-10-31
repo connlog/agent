@@ -6,6 +6,79 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 [`VERSIONING.md`](./VERSIONING.md) for the full policy. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.23.0] — 2026-10-30
+
+### Added
+
+- **What the host runs, exactly.** Every heartbeat now says the host's
+  distribution and what it derives from (`X-Os-Id: rocky`, `X-Os-Like: rhel
+  centos fedora`), read from os-release, and from their own files for
+  OPNsense, pfSense and Proxmox VE, whose os-release says only FreeBSD or
+  Debian. Its exact version (`X-Os-Version: 22.04.3`, Debian's point release
+  from `debian_version`, FreeBSD's patch level) goes only while the host
+  shares system info (`CONNLOG_EXPOSE_SYSTEM_INFO`), as its hostname does. In
+  Docker it is the host's, through `CONNLOG_HOST_ROOT`. Read again at most
+  hourly, so an upgrade without a restart still shows. The console draws the
+  distribution's mark on the map, and says when a host's version is behind
+  its release's latest.
+- **`config set`, `get`, `show` and `check`.** One command for several
+  settings, by name (`config set hostname=on discovery=passive checks=on`):
+  every value checked before anything is written, one restart. A password is
+  never taken on the command line; named without a value it is asked for,
+  hidden, or read from stdin. `show` lists every setting with its value or
+  default (the token shortened); `get` prints one; `check` reads agent.conf as
+  the agent will and says what it would refuse, ignore or misread, with the
+  nearest real name for a misspelt one. The console builds the `config set`
+  line for what someone chooses in a server's settings drawer.
+- **The menu holds every setting.** All four discovery levels, the site and
+  extra ports, public probes, checks, the collector and BMC hardware health
+  (the password asked for twice, never shown), staged and applied with one
+  restart; a setting says what it sends before it is turned on.
+- **Tab completion** for bash, zsh and fish: `connlog-agent completions
+  <shell>`, and `install` puts one where each installed shell looks.
+- **Quick actions are back.** Root registers commands on the host (`action
+  add`, in the root-only `/etc/connlog/actions.toml`) and the console's
+  Actions tab runs them by name; nothing else can be run. They were compiled
+  out since 1.19. A shown action's output now goes out while it runs
+  (`POST /api/agents/actions/output`, every 250 ms, within its cap), so the
+  person who ran it watches it live; the platform keeps none of it. Actions
+  still run as the agent's own user, with a clean environment.
+
+### Fixed
+
+- **A settings change cannot leave the host unwatched.** agent.conf used to be
+  rewritten in place, so a full disk or a crash mid-write could lose the
+  token, and a value the agent refuses at startup (`CONNLOG_CHECKS=maybe`)
+  stopped it while the command said "Restarted". Now the file is written
+  beside the old one and renamed over it, the agent is watched until ConnLog
+  accepts a heartbeat, and if it does not come back the previous file is put
+  back and the agent restarted on it, with its last log lines to say why.
+- **`config` on OPNsense, pfSense and FreeBSD.** A root shell there was taken
+  for a systemd install: the command wrote `/etc/connlog/agent.conf`, which the
+  package never reads, and said the setting was saved. It now writes the
+  package's `/usr/local/etc/connlog/agent.conf` and restarts the service.
+- **`config` in Docker** prints the `-e` flags and Compose lines for the change
+  instead of only refusing.
+- **An action runs within seconds of the platform coming back.** While a
+  heartbeat backed off after a failure (a deploy restarting the platform), the
+  agent stopped asking for actions too, so a run waited out the whole backoff.
+  It now keeps asking at the poll's own pace; a failing poll waits twice as
+  long each time, up to 30 s, and is logged once per run of failures, not
+  every 5 s.
+
+## [1.22.1] — 2026-10-30
+
+### Fixed
+
+- **The release builds.** v1.22.0 was tagged here but never built: its tests
+  read the wire-format fixtures they share with the platform from beside the
+  crate, and this repository carries the crate alone. The fixtures now come
+  with it, as `protocol-fixtures/`; `build.rs` tells the tests where they are,
+  and the check limits are held to one of them (`check-limits.json`) instead of
+  the platform's TypeScript source. connlog/platform refuses any file the crate
+  reads from outside itself. The agent is 1.22.0's: everything listed under
+  1.22.0 ships first in 1.22.1.
+
 ## [1.22.0] — 2026-10-30
 
 ### Added
@@ -1155,6 +1228,8 @@ considered stable; breaking changes from this point on require a major bump.
 
 - Last pre-1.0 release. See git history for prior changes.
 
+[1.23.0]: https://github.com/connlog/agent/compare/v1.22.1...v1.23.0
+[1.22.1]: https://github.com/connlog/agent/compare/v1.22.0...v1.22.1
 [1.22.0]: https://github.com/connlog/agent/compare/v1.21.0...v1.22.0
 [1.21.0]: https://github.com/connlog/agent/compare/v1.20.0...v1.21.0
 [1.20.0]: https://github.com/connlog/agent/compare/v1.19.0...v1.20.0

@@ -1,0 +1,256 @@
+{
+  "valid": [
+    {
+      "description": "A gateway, a host that refused a handshake, a printer over mDNS and a TV over SSDP.",
+      "upload": {
+        "version": 1,
+        "id": "swp_1",
+        "subnet": "10.0.20.0/24",
+        "refused": null,
+        "found": [
+          {
+            "address": "10.0.20.1",
+            "icmp": true,
+            "ports": [53, 443],
+            "mdns": [],
+            "ssdp": null
+          },
+          {
+            "address": "10.0.20.9",
+            "icmp": false,
+            "ports": [],
+            "mdns": [],
+            "ssdp": null
+          },
+          {
+            "address": "10.0.20.40",
+            "icmp": true,
+            "ports": [631],
+            "mdns": ["_ipp._tcp", "_printer._tcp"],
+            "ssdp": null
+          },
+          {
+            "address": "10.0.20.50",
+            "icmp": false,
+            "ports": [],
+            "mdns": [],
+            "ssdp": {
+              "server": "Linux/4.9 UPnP/1.0 Bravia/1.0",
+              "types": ["upnp:rootdevice", "urn:schemas-upnp-org:device:MediaRenderer:1"]
+            }
+          }
+        ]
+      },
+      "read": {
+        "version": 1,
+        "id": "swp_1",
+        "subnet": "10.0.20.0/24",
+        "refused": null,
+        "found": [
+          {
+            "address": "10.0.20.1",
+            "icmp": true,
+            "ports": [53, 443],
+            "mdns": [],
+            "ssdp": null
+          },
+          {
+            "address": "10.0.20.9",
+            "icmp": false,
+            "ports": [],
+            "mdns": [],
+            "ssdp": null
+          },
+          {
+            "address": "10.0.20.40",
+            "icmp": true,
+            "ports": [631],
+            "mdns": ["_ipp._tcp", "_printer._tcp"],
+            "ssdp": null
+          },
+          {
+            "address": "10.0.20.50",
+            "icmp": false,
+            "ports": [],
+            "mdns": [],
+            "ssdp": {
+              "server": "Linux/4.9 UPnP/1.0 Bravia/1.0",
+              "types": ["upnp:rootdevice", "urn:schemas-upnp-org:device:MediaRenderer:1"]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "A subnet the host is not on: refused, nothing found.",
+      "upload": {
+        "version": 1,
+        "id": "swp_6",
+        "subnet": "10.0.30.0/24",
+        "refused": "not-on-subnet",
+        "found": []
+      },
+      "read": {
+        "version": 1,
+        "id": "swp_6",
+        "subnet": "10.0.30.0/24",
+        "refused": "not-on-subnet",
+        "found": []
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "description": "An address outside the swept subnet.",
+      "upload": {
+        "version": 1,
+        "id": "swp_1",
+        "subnet": "10.0.20.0/24",
+        "refused": null,
+        "found": [
+          {
+            "address": "10.0.21.5",
+            "icmp": true,
+            "ports": [],
+            "mdns": [],
+            "ssdp": null
+          }
+        ]
+      }
+    },
+    {
+      "description": "A port outside the well-known list.",
+      "upload": {
+        "version": 1,
+        "id": "swp_1",
+        "subnet": "10.0.20.0/24",
+        "refused": null,
+        "found": [
+          {
+            "address": "10.0.20.5",
+            "icmp": true,
+            "ports": [31337],
+            "mdns": [],
+            "ssdp": null
+          }
+        ]
+      }
+    },
+    {
+      "description": "An SSDP UUID, which names one device.",
+      "upload": {
+        "version": 1,
+        "id": "swp_1",
+        "subnet": "10.0.20.0/24",
+        "refused": null,
+        "found": [
+          {
+            "address": "10.0.20.5",
+            "icmp": false,
+            "ports": [],
+            "mdns": [],
+            "ssdp": {
+              "server": null,
+              "types": ["uuid:1234"]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "An mDNS instance name instead of a service type.",
+      "upload": {
+        "version": 1,
+        "id": "swp_1",
+        "subnet": "10.0.20.0/24",
+        "refused": null,
+        "found": [
+          {
+            "address": "10.0.20.5",
+            "icmp": false,
+            "ports": [],
+            "mdns": ["Johns-iPhone"],
+            "ssdp": null
+          }
+        ]
+      }
+    },
+    {
+      "description": "Refused, yet something found.",
+      "upload": {
+        "version": 1,
+        "id": "swp_1",
+        "subnet": "10.0.20.0/24",
+        "refused": "not-active",
+        "found": [
+          {
+            "address": "10.0.20.1",
+            "icmp": true,
+            "ports": [53, 443],
+            "mdns": [],
+            "ssdp": null
+          },
+          {
+            "address": "10.0.20.9",
+            "icmp": false,
+            "ports": [],
+            "mdns": [],
+            "ssdp": null
+          },
+          {
+            "address": "10.0.20.40",
+            "icmp": true,
+            "ports": [631],
+            "mdns": ["_ipp._tcp", "_printer._tcp"],
+            "ssdp": null
+          },
+          {
+            "address": "10.0.20.50",
+            "icmp": false,
+            "ports": [],
+            "mdns": [],
+            "ssdp": {
+              "server": "Linux/4.9 UPnP/1.0 Bravia/1.0",
+              "types": ["upnp:rootdevice", "urn:schemas-upnp-org:device:MediaRenderer:1"]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "A subnet larger than a /22.",
+      "upload": {
+        "version": 1,
+        "id": "swp_1",
+        "subnet": "10.0.0.0/21",
+        "refused": null,
+        "found": []
+      }
+    },
+    {
+      "description": "The same address twice.",
+      "upload": {
+        "version": 1,
+        "id": "swp_1",
+        "subnet": "10.0.20.0/24",
+        "refused": null,
+        "found": [
+          {
+            "address": "10.0.20.1",
+            "icmp": true,
+            "ports": [53, 443],
+            "mdns": [],
+            "ssdp": null
+          },
+          {
+            "address": "10.0.20.1",
+            "icmp": true,
+            "ports": [53, 443],
+            "mdns": [],
+            "ssdp": null
+          }
+        ]
+      }
+    }
+  ]
+}

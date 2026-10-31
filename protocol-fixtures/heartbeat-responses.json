@@ -1,0 +1,210 @@
+[
+  {
+    "description": "A steady-state answer: nothing pending.",
+    "response": {
+      "ok": true,
+      "server_time": "2026-09-22T12:00:00.000Z",
+      "expected_interval_seconds": 60,
+      "uninstall": false,
+      "reboot": false,
+      "update": null
+    }
+  },
+  {
+    "description": "Config changed and a signed update is available.",
+    "response": {
+      "ok": true,
+      "server_time": "2026-09-22T12:00:00.000Z",
+      "expected_interval_seconds": 30,
+      "uninstall": false,
+      "reboot": false,
+      "update": {
+        "available": true,
+        "latest_version": "1.20.0",
+        "download_url": "https://connlog.com/api/agents/updates/x86_64/binary",
+        "signature_url": "https://connlog.com/api/agents/updates/x86_64/signature",
+        "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        "force_update": false
+      },
+      "config_outdated": true,
+      "latest_config_version": 9
+    }
+  },
+  {
+    "description": "Up to date: the update field says so without download details.",
+    "response": {
+      "ok": true,
+      "server_time": "2026-09-22T12:00:00.000Z",
+      "expected_interval_seconds": 60,
+      "uninstall": false,
+      "reboot": false,
+      "update": {
+        "available": false,
+        "latest_version": "1.19.0",
+        "download_url": null,
+        "signature_url": null,
+        "sha256": null
+      }
+    }
+  },
+  {
+    "description": "A pending remote uninstall.",
+    "response": {
+      "ok": true,
+      "server_time": "2026-09-22T12:00:00.000Z",
+      "expected_interval_seconds": 60,
+      "uninstall": true,
+      "reboot": false,
+      "update": null
+    }
+  },
+  {
+    "description": "A pending reboot and a queued quick action.",
+    "response": {
+      "ok": true,
+      "server_time": "2026-09-22T12:00:00.000Z",
+      "expected_interval_seconds": 60,
+      "uninstall": false,
+      "reboot": true,
+      "update": null,
+      "quick_actions": [
+        {
+          "request_id": "qa_01",
+          "action_id": "restart-service"
+        }
+      ]
+    }
+  },
+  {
+    "description": "Back from an outage: the platform asks for the flight recorder's records between its last heartbeat and this one (unix seconds). Agents before the recorder ignore it.",
+    "response": {
+      "ok": true,
+      "server_time": "2026-09-23T12:00:00.000Z",
+      "expected_interval_seconds": 60,
+      "uninstall": false,
+      "reboot": false,
+      "update": null,
+      "history_request": {
+        "since": 1790000000,
+        "until": 1790000600
+      }
+    }
+  },
+  {
+    "description": "The network map: the platform wants a fresh inventory, and has probes for this host to run once.",
+    "response": {
+      "ok": true,
+      "server_time": "2026-10-28T12:00:00.000Z",
+      "expected_interval_seconds": 60,
+      "uninstall": false,
+      "reboot": false,
+      "update": null,
+      "inventory_request": true,
+      "probe_request": {
+        "id": "prb_01HZX3",
+        "targets": [
+          { "address": "10.0.20.7", "ports": [5432, 22], "icmp": true },
+          { "address": "fd00:10::7", "ports": [443], "icmp": false }
+        ]
+      }
+    }
+  },
+  {
+    "description": "The console allows this host the passive level: it adds what it already knows about its network (VLAN ids), as far as its own ceiling allows.",
+    "response": {
+      "ok": true,
+      "server_time": "2026-10-30T12:00:00.000Z",
+      "expected_interval_seconds": 60,
+      "uninstall": false,
+      "reboot": false,
+      "update": null,
+      "discovery": "passive"
+    }
+  },
+  {
+    "description": "Checks for this host to run once and report: a website, a router, a database port and a resolver.",
+    "response": {
+      "ok": true,
+      "server_time": "2026-10-30T12:00:00.000Z",
+      "expected_interval_seconds": 60,
+      "uninstall": false,
+      "reboot": false,
+      "update": null,
+      "check_request": {
+        "id": "chk_01J0A",
+        "checks": [
+          { "id": "site", "kind": "http", "url": "https://example.com/health" },
+          { "id": "router", "kind": "ping", "target": "192.168.1.1" },
+          { "id": "db", "kind": "tcp", "target": "db.internal", "port": 5432 },
+          {
+            "id": "resolver",
+            "kind": "dns",
+            "name": "example.com",
+            "recordType": "A",
+            "resolver": "1.1.1.1"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "description": "The platform takes this host's observed connections, and names the other opted-in hosts on its site with a probe request.",
+    "response": {
+      "ok": true,
+      "server_time": "2026-10-30T12:00:00.000Z",
+      "expected_interval_seconds": 60,
+      "uninstall": false,
+      "reboot": false,
+      "update": null,
+      "connections": true,
+      "probe_request": {
+        "id": "prb_01J0P",
+        "targets": [{ "address": "10.0.10.7", "ports": [443], "icmp": false }],
+        "peers": ["10.0.10.7", "10.0.10.9"]
+      }
+    }
+  },
+  {
+    "description": "The platform takes this collector's integration reports (Phase 10); an agent that is no collector ignores it.",
+    "response": {
+      "ok": true,
+      "server_time": "2026-10-30T12:00:00.000Z",
+      "expected_interval_seconds": 60,
+      "uninstall": false,
+      "reboot": false,
+      "update": null,
+      "integrations": true
+    }
+  },
+  {
+    "description": "The workspace collects device names (T10.2): a collector's firewall leases carry their hostnames; an agent that does not know the field ignores it.",
+    "response": {
+      "ok": true,
+      "server_time": "2026-10-30T12:00:00.000Z",
+      "expected_interval_seconds": 60,
+      "uninstall": false,
+      "reboot": false,
+      "update": null,
+      "integrations": true,
+      "device_names": true
+    }
+  },
+  {
+    "description": "A subnet to sweep (T12.1), run only by a host at active; an agent that does not know the field ignores it.",
+    "response": {
+      "ok": true,
+      "server_time": "2026-10-30T12:00:00.000Z",
+      "expected_interval_seconds": 60,
+      "uninstall": false,
+      "reboot": false,
+      "update": null,
+      "sweep_request": {
+        "id": "swp_1",
+        "subnet": "10.0.20.0/24",
+        "ports": [22, 80, 443, 9100],
+        "mdns": true,
+        "ssdp": true
+      }
+    }
+  }
+]

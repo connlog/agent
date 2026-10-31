@@ -119,10 +119,13 @@ installer again); the agent never replaces its own binary there, and `install`, 
 
 Run `sudo connlog-agent` with no arguments in a terminal for an interactive menu: arrow keys to
 move, Enter to choose, Esc or Ctrl-C to leave. It shows the service state and the last accepted
-heartbeat, turns remote reboot, hostname sharing and crash reports on or off (through the same
-code as the `config` commands below, so the agent restarts to apply each change), checks the
-config, sends a test heartbeat, shows heartbeat diagnostics and uninstalls behind a typed
-confirmation. It never shows the token or the BMC password. Without `sudo` it shows the status and
+heartbeat and every setting with its value: hostname sharing, remote reboot, crash reports, the
+discovery level, the site and extra map ports, public probes, checks, the collector and BMC
+hardware health (address, user, a password asked for twice and never shown). Changes are staged
+and applied together, through the same code as `config set` below, so the agent restarts once;
+a setting says what it sends before it is turned on. It also checks the settings and the config,
+sends a test heartbeat, shows heartbeat diagnostics and uninstalls behind a typed confirmation.
+It never shows the token, the BMC password or the BMC's address. Without `sudo` it shows the status and
 offers to reopen itself with `sudo`. The menu opens only for a bare command typed into a
 terminal: with any argument, without a terminal, under systemd (`INVOCATION_ID`) or with
 `CONNLOG_TOKEN` set, `connlog-agent` does exactly what it did before, so the service still starts
@@ -140,6 +143,28 @@ journalctl -u connlog-agent -f
 # Refresh the installed systemd unit from the current binary
 sudo connlog-agent refresh-service --restart
 
+# Every setting at once: each value is checked first, then agent.conf is written in one go
+# (beside the file, then renamed), the agent restarted once and watched until ConnLog accepts a
+# heartbeat. If it does not come back, the previous file is put back and the agent restarted on
+# it. Works the same on OPNsense, pfSense and FreeBSD; in Docker it prints the -e flags instead.
+sudo connlog-agent config set hostname=on discovery=passive checks=on
+# A password is never typed on the command line: name it without a value to be asked for it
+sudo connlog-agent config set bmc-endpoint=https://10.0.0.120 bmc-username=root bmc-password
+# Clear a setting with an empty value
+sudo connlog-agent config set network-site=
+
+# Every setting, its value or default and what it does (the token shortened)
+sudo connlog-agent config show
+# One value, for scripts
+sudo connlog-agent config get discovery
+# What the agent would refuse (and so not start), ignore or misread: misspelt names with the
+# nearest real one, switch words it does not take, settings set twice. Non-zero on a problem.
+sudo connlog-agent config check
+
+# Tab completion (install already puts it where bash, zsh and fish look)
+connlog-agent completions bash > ~/.local/share/bash-completion/completions/connlog-agent
+
+# The commands for one setting each still work:
 # Share this machine's hostname with ConnLog (creates /etc/connlog/agent.conf if needed), and stop
 sudo connlog-agent config enable-hostname
 sudo connlog-agent config disable-hostname
@@ -363,6 +388,13 @@ commands on the agent host. They are stored in `/etc/connlog/actions.toml`,
 reloaded by the running service, and published to the dashboard on the next
 heartbeat.
 
+In the console they are the server's **Actions** tab. Run sends only the
+action's name; a shown action's output appears there as it comes (agent 1.23+),
+to the person who ran it, and ConnLog keeps none of it. Members run low and
+medium risk actions; high risk is for owners and admins, who type the server's
+name to confirm. `sudo connlog-agent action add` with no arguments asks for
+everything it needs.
+
 Action requests are picked up independently from the normal metrics heartbeat.
 The platform sends a `quickActions` config block and the agent polls
 `/api/agents/actions/pending` every 5 seconds by default, clamped to 2..60
@@ -487,6 +519,8 @@ heartbeat (`X-Network-Map: disabled`).
 | `load_1m`         | 1-minute load average               |
 | `hostname`        | System hostname, only with the opt-in (`CONNLOG_EXPOSE_SYSTEM_INFO=true`) |
 | `os`              | Operating system                    |
+| `os_id`, `os_like` | Its distribution and what that derives from, as os-release says (`ubuntu`, `debian`; `pfsense`, `opnsense` and `proxmox-ve` read from their own files) (headers) |
+| `os_version`      | Its exact version (`22.04.3`), only with the opt-in (`CONNLOG_EXPOSE_SYSTEM_INFO=true`) (header) |
 | `arch`            | CPU architecture                    |
 | `uptime_seconds`  | System uptime                       |
 | `machine_id`      | SHA-256 hash of `/etc/machine-id` (header), never the raw value |

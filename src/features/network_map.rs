@@ -811,10 +811,8 @@ mod tests {
     /// space." can never be produced by this agent.
     #[test]
     fn the_invalid_fixture_site_is_refused() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../../packages/agent-protocol/fixtures/inventory-uploads.json"
-        ))
-        .unwrap();
+        let fixture: serde_json::Value =
+            serde_json::from_str(protocol_fixture!("inventory-uploads.json")).unwrap();
         let mut sites = 0;
         for case in fixture["invalid"].as_array().unwrap() {
             if let Some(site) = case["upload"]["site"].as_str() {

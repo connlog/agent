@@ -1,5 +1,6 @@
 //! Platform-gated path constants and OS shims.
 
+pub mod os_release;
 pub mod signals;
 pub mod unix;
 pub use unix::*;
@@ -44,11 +45,14 @@ impl Packaging {
 
     /// `CONNLOG_PACKAGING=docker` (the image sets it) or `freebsd` (the
     /// package's rc.d script does). Anything else, or nothing, is the systemd
-    /// install every agent before them was.
+    /// install every agent before them was; except on FreeBSD, where the
+    /// package is the only install and a root shell running `config` is not
+    /// told so by the rc script.
     pub fn from_env_value(value: Option<&str>) -> Self {
         match value.map(str::trim) {
             Some(v) if v.eq_ignore_ascii_case("docker") => Packaging::Docker,
             Some(v) if v.eq_ignore_ascii_case("freebsd") => Packaging::Freebsd,
+            _ if cfg!(target_os = "freebsd") => Packaging::Freebsd,
             _ => Packaging::Systemd,
         }
     }
@@ -75,12 +79,16 @@ mod tests {
 
     #[test]
     fn only_the_images_word_is_docker() {
-        assert_eq!(Packaging::from_env_value(None), Packaging::Systemd);
-        assert_eq!(Packaging::from_env_value(Some("")), Packaging::Systemd);
-        assert_eq!(
-            Packaging::from_env_value(Some("podman")),
+        // Unsaid is the systemd install, except on FreeBSD, where the package
+        // is the only one.
+        let unsaid = if cfg!(target_os = "freebsd") {
+            Packaging::Freebsd
+        } else {
             Packaging::Systemd
-        );
+        };
+        assert_eq!(Packaging::from_env_value(None), unsaid);
+        assert_eq!(Packaging::from_env_value(Some("")), unsaid);
+        assert_eq!(Packaging::from_env_value(Some("podman")), unsaid);
         assert_eq!(Packaging::from_env_value(Some("docker")), Packaging::Docker);
         assert_eq!(
             Packaging::from_env_value(Some(" Docker\n")),

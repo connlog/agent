@@ -410,8 +410,7 @@ pub(crate) mod tests {
         assert_eq!(kept[0].fields[5], 512);
     }
 
-    const UPLOADS: &str =
-        include_str!("../../../../../packages/agent-protocol/fixtures/history-uploads.json");
+    const UPLOADS: &str = protocol_fixture!("history-uploads.json");
 
     /// The agent's half of `history-uploads.json`: each fixture's records
     /// encode to exactly its bytes.

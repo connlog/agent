@@ -589,10 +589,8 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::atomic::AtomicUsize;
 
-    const REQUESTS: &str =
-        include_str!("../../../../packages/agent-protocol/fixtures/probe-requests.json");
-    const RESULTS: &str =
-        include_str!("../../../../packages/agent-protocol/fixtures/probe-results.json");
+    const REQUESTS: &str = protocol_fixture!("probe-requests.json");
+    const RESULTS: &str = protocol_fixture!("probe-results.json");
 
     fn pairs(value: &Value) -> Vec<(String, Option<u16>)> {
         value

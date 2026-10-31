@@ -352,6 +352,15 @@ pub enum AgentCommand {
         command: IntegrationCommand,
     },
 
+    /// Print tab completion for a shell: bash, zsh or fish
+    #[command(
+        long_about = "Print a tab-completion script for bash, zsh or fish. `install` already puts one where each shell installed here looks; this is for another shell or place.\n\nExamples:\n  connlog-agent completions bash > ~/.local/share/bash-completion/completions/connlog-agent\n  connlog-agent completions zsh > \"${fpath[1]}/_connlog-agent\""
+    )]
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+
     /// Diagnostic tools
     Diagnostics {
         #[command(subcommand)]
@@ -464,6 +473,39 @@ pub enum LocalConfigCommand {
         #[arg(value_enum)]
         level: DiscoveryLevel,
     },
+
+    /// Change one or more settings at once: name=value
+    #[command(
+        long_about = "Change one or more settings in agent.conf, then restart the agent once and wait for its first heartbeat. Every value is checked before anything is written; if the agent does not come back on the new settings, the previous file is put back.\n\n`connlog-agent config show` lists the names. Switches take on or off. A password is never typed on the command line: name it without a value to be asked for it, or pipe it in.\n\nExamples:\n  sudo connlog-agent config set hostname=on discovery=passive checks=on\n  sudo connlog-agent config set network-site=hq network-map-ports=443,8443\n  sudo connlog-agent config set bmc-endpoint=https://10.0.0.120 bmc-username=root bmc-password"
+    )]
+    Set {
+        #[arg(value_name = "NAME=VALUE", required = true)]
+        pairs: Vec<String>,
+    },
+
+    /// Print one setting's value
+    #[command(
+        long_about = "Print one setting's value as the agent reads it, for scripts: on or off for a switch, set or not set for a password.\n\nExample:\n  sudo connlog-agent config get discovery"
+    )]
+    Get {
+        /// One of the names `config show` lists; tab completes them.
+        #[arg(value_parser = clap::builder::PossibleValuesParser::new(
+            crate::features::settings::SETTINGS.iter().map(|s| s.name)
+        ))]
+        name: String,
+    },
+
+    /// List every setting, its value and what it does
+    #[command(
+        long_about = "List every setting in agent.conf (in Docker: the container's environment) with its value or default and what it does. The token is shortened and a password is never shown.\n\nExample:\n  sudo connlog-agent config show"
+    )]
+    Show,
+
+    /// Find settings the agent would refuse, ignore or misread
+    #[command(
+        long_about = "Read agent.conf as the agent will and say what it would refuse (and so not start), ignore or read differently: misspelt names, with the nearest real one; values a switch does not take; settings set twice. Exits non-zero when the agent would not start or not report.\n\nExample:\n  sudo connlog-agent config check"
+    )]
+    Check,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]

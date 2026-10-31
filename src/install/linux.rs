@@ -245,6 +245,11 @@ pub fn install(
     // Copy binary to /usr/local/bin
     install_binary()?;
 
+    // Tab completion where each installed shell looks; never a reason to stop.
+    if let Err(e) = super::completions::install() {
+        println!("  Tab completion not installed: {e:#}");
+    }
+
     // Create systemd service
     create_systemd_service()?;
 
@@ -302,6 +307,7 @@ pub fn uninstall() -> Result<()> {
     let _ = fs::remove_file("/usr/local/bin/connlog-agent.old");
     let _ = fs::remove_file("/usr/local/bin/connlog-agent.new");
     let _ = fs::remove_file("/usr/local/bin/connlog-agent");
+    super::completions::uninstall();
     println!("  Removed binary");
 
     // Note: We don't remove the system user for safety
@@ -480,13 +486,13 @@ fn systemd_needs_daemon_reload() -> Option<bool> {
     }
 }
 
-fn is_root() -> bool {
+pub(super) fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
 /// A system tool with a fixed `PATH`, so a root-run install never resolves
 /// `systemctl` or `useradd` through whatever the caller's shell put first.
-fn system_command(program: &str) -> Command {
+pub(super) fn system_command(program: &str) -> Command {
     let mut command = Command::new(program);
     command.env("PATH", SAFE_PATH);
     command
@@ -544,7 +550,7 @@ fn create_system_user() -> Result<()> {
     Ok(())
 }
 
-fn create_config_dir() -> Result<()> {
+pub(super) fn create_config_dir() -> Result<()> {
     fs::create_dir_all("/etc/connlog").context("Failed to create /etc/connlog directory")?;
 
     let chown_status = system_command("chown")
@@ -572,7 +578,7 @@ fn create_config_dir() -> Result<()> {
 /// Escape a value for systemd EnvironmentFile double-quoted context.
 /// Prevents shell injection through crafted token or URL values. Control
 /// characters are refused earlier by `validate_env_value`; this only quotes.
-fn escape_env_value(s: &str) -> String {
+pub(super) fn escape_env_value(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('$', "\\$")
@@ -639,7 +645,7 @@ fn write_config(
         ));
     }
 
-    write_agent_conf(&config)?;
+    super::conf::Host::Systemd.write(&config)?;
     println!("  Wrote config to /etc/connlog/agent.conf (600 root:root)");
     Ok(())
 }
@@ -682,30 +688,20 @@ pub fn set_collector(enabled: bool) -> Result<()> {
 /// no other user does (T10.0). Written beside it and renamed into place, so
 /// the agent never reads half a file.
 pub fn write_integration_file(dir: &Path, name: &str, contents: &str) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     fs::create_dir_all(dir).with_context(|| format!("Failed to create {}", dir.display()))?;
     restrict(dir, 0o750)?;
-    let path = dir.join(format!("{name}.conf"));
-    let tmp = dir.join(format!(".{name}.conf.new"));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)
-        .with_context(|| format!("Failed to write {}", tmp.display()))?;
-    file.write_all(contents.as_bytes())?;
-    file.sync_all()?;
-    restrict(&tmp, 0o640)?;
-    fs::rename(&tmp, &path).with_context(|| format!("Failed to write {}", path.display()))?;
-    Ok(())
+    super::conf::replace_file(
+        &dir.join(format!("{name}.conf")),
+        contents,
+        0o640,
+        super::conf::Owner::RootAndService,
+    )
 }
 
 /// `root:connlog-agent` and `mode`. In the Docker image the agent's own
 /// unprivileged user writes and reads them and there is no service
 /// account's group: its owner and `mode` without the group's bits.
-fn restrict(path: &Path, mode: u32) -> Result<()> {
+pub(super) fn restrict(path: &Path, mode: u32) -> Result<()> {
     if crate::platform::Packaging::current() == crate::platform::Packaging::Docker {
         return fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o700))
             .with_context(|| format!("Failed to set {} permissions", path.display()));
@@ -762,12 +758,6 @@ fn conf_remote_reboot(conf: &str) -> Option<bool> {
     conf_bool(conf, "CONNLOG_ALLOW_REMOTE_REBOOT")
 }
 
-/// Whether this host's `agent.conf` lets the dashboard reboot it, as the
-/// agent and the root hook read it: only an explicit true.
-pub fn conf_allows_remote_reboot(conf: &str) -> bool {
-    conf_remote_reboot(conf) == Some(true)
-}
-
 /// The installed `agent.conf`, when this process may read it (root only).
 pub fn read_agent_conf() -> Option<String> {
     fs::read_to_string(AGENT_CONF_PATH).ok()
@@ -809,101 +799,20 @@ pub fn conf_bool(conf: &str, key: &str) -> Option<bool> {
     }
 }
 
-/// Create `/etc/connlog/agent.conf` if missing, upsert `key`, and restart the
-/// service so systemd reloads the EnvironmentFile. Token, URL and BMC keys are
-/// left as they are.
+/// Set `key` in this host's agent.conf and restart the agent on it (see
+/// `conf::set`: written atomically, rolled back if the agent does not come
+/// back). Token, URL and BMC keys are left as they are.
 fn set_agent_conf_value(key: &str, value: &str) -> Result<()> {
     set_agent_conf_values(&[(key, value)])
 }
 
-/// `set_agent_conf_value` for several keys at once, with one restart.
-fn set_agent_conf_values(pairs: &[(&str, &str)]) -> Result<()> {
-    if !is_root() {
-        anyhow::bail!("This command requires root. Please run with sudo.");
+/// `set_agent_conf_value` for several keys at once, with one restart. In a
+/// container there is no file to set: it says what to put in the environment.
+pub fn set_agent_conf_values(pairs: &[(&str, &str)]) -> Result<()> {
+    match super::conf::Host::current() {
+        Some(host) => super::conf::set(host, pairs),
+        None => anyhow::bail!("{}", super::conf::docker_hint(pairs)),
     }
-
-    if !Path::new("/etc/connlog").exists() {
-        create_config_dir()?;
-    }
-
-    let path = Path::new("/etc/connlog/agent.conf");
-    let created = !path.exists();
-    let existing = if created {
-        String::new()
-    } else {
-        fs::read_to_string(path).context("Failed to read /etc/connlog/agent.conf")?
-    };
-    let mut next = existing;
-    for (key, value) in pairs {
-        validate_env_value(key, value)?;
-        next = upsert_env_line(&next, key, value);
-    }
-    write_agent_conf(&next)?;
-
-    if created {
-        println!("  Created /etc/connlog/agent.conf (600 root:root)");
-    }
-    for (key, value) in pairs {
-        println!("  Set {key}={value}");
-    }
-
-    restart_agent_service()
-}
-
-fn write_agent_conf(contents: &str) -> Result<()> {
-    let path = Path::new("/etc/connlog/agent.conf");
-    fs::write(path, contents).context("Failed to write /etc/connlog/agent.conf")?;
-
-    let mut perms = fs::metadata(path)
-        .context("Failed to read /etc/connlog/agent.conf metadata")?
-        .permissions();
-    perms.set_mode(0o600);
-    fs::set_permissions(path, perms)
-        .context("Failed to set /etc/connlog/agent.conf permissions")?;
-    Ok(())
-}
-
-/// Replace or append `KEY="value"` in a systemd EnvironmentFile body.
-/// Duplicate keys are collapsed to a single assignment.
-fn upsert_env_line(existing: &str, key: &str, value: &str) -> String {
-    let assignment = format!("{}=\"{}\"\n", key, escape_env_value(value));
-    let prefix = format!("{key}=");
-    let mut found = false;
-    let mut out = String::new();
-    for line in existing.lines() {
-        if line.trim_start().starts_with(&prefix) {
-            if !found {
-                out.push_str(&assignment);
-                found = true;
-            }
-        } else {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    if !found {
-        out.push_str(&assignment);
-    }
-    out
-}
-
-fn restart_agent_service() -> Result<()> {
-    if !Path::new(SYSTEMD_SERVICE_PATH).exists() {
-        println!(
-            "  Agent service is not installed. The setting is saved; start the agent to apply it."
-        );
-        return Ok(());
-    }
-
-    let status = system_command("systemctl")
-        .args(["restart", "connlog-agent"])
-        .status()
-        .context("Failed to restart connlog-agent")?;
-    if !status.success() {
-        anyhow::bail!("Failed to restart connlog-agent. Try: sudo systemctl restart connlog-agent");
-    }
-    println!("  Restarted connlog-agent");
-    Ok(())
 }
 
 fn install_binary() -> Result<()> {
@@ -1101,7 +1010,7 @@ mod tests {
         assert_eq!(conf_value(conf, "CONNLOG_EXPOSE_SYSTEM_INFO"), None);
         // What the writer escapes comes back as it was.
         let secret = "p\"$`\\w";
-        let written = upsert_env_line("", "CONNLOG_BMC_PASSWORD", secret);
+        let written = super::super::conf::Host::Systemd.upsert("", "CONNLOG_BMC_PASSWORD", secret);
         assert_eq!(
             conf_value(&written, "CONNLOG_BMC_PASSWORD").as_deref(),
             Some(secret)
@@ -1150,46 +1059,6 @@ mod tests {
         ] {
             assert_eq!(conf_remote_reboot(conf), expected, "{conf:?}");
         }
-    }
-
-    #[test]
-    fn upsert_creates_file_body_when_empty() {
-        assert_eq!(
-            upsert_env_line("", "CONNLOG_EXPOSE_SYSTEM_INFO", "true"),
-            "CONNLOG_EXPOSE_SYSTEM_INFO=\"true\"\n"
-        );
-    }
-
-    #[test]
-    fn upsert_appends_without_touching_token() {
-        let existing =
-            "CONNLOG_TOKEN=\"agent_abc\"\nCONNLOG_PLATFORM_URL=\"https://connlog.com\"\n";
-        let next = upsert_env_line(existing, "CONNLOG_EXPOSE_SYSTEM_INFO", "true");
-        assert!(next.contains("CONNLOG_TOKEN=\"agent_abc\""));
-        assert!(next.contains("CONNLOG_PLATFORM_URL=\"https://connlog.com\""));
-        assert!(next.contains("CONNLOG_EXPOSE_SYSTEM_INFO=\"true\""));
-        assert_eq!(
-            next.matches("CONNLOG_EXPOSE_SYSTEM_INFO=").count(),
-            1,
-            "must not duplicate the key"
-        );
-    }
-
-    #[test]
-    fn upsert_replaces_existing_false_value() {
-        let existing = "CONNLOG_TOKEN=\"agent_abc\"\nCONNLOG_EXPOSE_SYSTEM_INFO=\"false\"\n";
-        let next = upsert_env_line(existing, "CONNLOG_EXPOSE_SYSTEM_INFO", "true");
-        assert!(next.contains("CONNLOG_EXPOSE_SYSTEM_INFO=\"true\""));
-        assert!(!next.contains("false"));
-        assert!(next.contains("CONNLOG_TOKEN=\"agent_abc\""));
-    }
-
-    #[test]
-    fn upsert_collapses_duplicate_keys() {
-        let existing = "CONNLOG_EXPOSE_SYSTEM_INFO=false\nCONNLOG_TOKEN=\"t\"\nCONNLOG_EXPOSE_SYSTEM_INFO=true\n";
-        let next = upsert_env_line(existing, "CONNLOG_EXPOSE_SYSTEM_INFO", "true");
-        assert_eq!(next.matches("CONNLOG_EXPOSE_SYSTEM_INFO=").count(), 1);
-        assert!(next.contains("CONNLOG_TOKEN=\"t\""));
     }
 
     // ── The ExecStopPost hook, run ───────────────────────────────

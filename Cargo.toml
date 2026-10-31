@@ -1,6 +1,6 @@
 [package]
 name = "connlog-agent"
-version = "1.22.0"
+version = "1.23.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/connlog/agent"
@@ -28,9 +28,14 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 aes = "0.8"
 cfb-mode = "0.8"
 # Arrow-key menus for `connlog-agent` run by hand in a terminal
-# (`features::menu`). Default features off: no editor (tempfile) and no
-# password prompts (zeroize); Select, Confirm and Input are all it uses.
-dialoguer = { version = "0.12", default-features = false }
+# (`features::menu`), and the hidden prompt for the BMC password
+# (`features::settings`), which is never typed on a command line. Default
+# features off but `password` (zeroize, a few KB): no editor (tempfile).
+dialoguer = { version = "0.12", default-features = false, features = ["password"] }
+# `connlog-agent completions bash|zsh|fish`, which install writes where each
+# shell looks (owner, 2026-10-31): static scripts from the clap definition,
+# no runtime of its own. With it the release binary is 6.8 MiB of the 12.
+clap_complete = "4.6"
 
 # Unix-only: geteuid() etc.
 [target.'cfg(unix)'.dependencies]

@@ -13,8 +13,9 @@ Its only job is to send authenticated heartbeats to the ConnLog platform every
 ~60 seconds, carrying a small set of system metrics (CPU, memory, disk, load
 average, uptime).
 
-It does nothing else. There is no log shipping, no remote command execution,
-no service discovery. The one optional outbound connection besides the
+It does nothing else but run the quick actions root registered on the host
+(below). There is no log shipping, no command the platform can send, no
+service discovery. The one optional outbound connection besides the
 platform is to this machine's own BMC (iDRAC/iLO/OpenBMC over Redfish), when
 the operator configures one, for hardware health. Host reboot and removal of
 the agent can be requested from the dashboard; each is confirmed on three
@@ -159,6 +160,8 @@ send_heartbeat()
                 X-Remote-Reboot: allowed | disabled (daemon only)
                 X-Host-Settings: bmc=on|off,hostname=on|off,postmortem=on|off
                                  (daemon only; on/off values, never the file)
+                X-Os-Id, X-Os-Like (the distribution; daemon only, 1.23+)
+                X-Os-Version (only with CONNLOG_EXPOSE_SYSTEM_INFO)
                 X-Network-Map: enabled | disabled (daemon only)
                 X-Reboot-State, X-Reboot-Message (only while a report is queued)
 
@@ -168,7 +171,7 @@ On OK response:
   ├─ Clear the queued reboot report (the platform has it)
   ├─ Check response.reboot          — accumulate, act after 3 consecutive;
   │                                    refused at once when the host disables it
-  ├─ Ignore response.quick_actions  — never execute remote commands
+  ├─ Ignore response.quick_actions  — actions are claimed by their own poll
   ├─ Check response.update          — try_apply_update() (see Update flow)
   ├─ Check response.config_outdated — fetch new config if true
   ├─ Hand inventory_request / probe_request to the network map
@@ -395,11 +398,29 @@ even inside a continued line.
 7. `systemctl daemon-reload && systemctl enable && systemctl start`
 
 Hostname sharing is off by default. `install --expose-system-info` writes
-`CONNLOG_EXPOSE_SYSTEM_INFO=true` into the same file. After install, root can
-run `connlog-agent config enable-hostname`: create `/etc/connlog` and
-`agent.conf` if missing, upsert that flag without touching token/URL/BMC keys,
-then `systemctl restart connlog-agent`. The running service cannot write the
-file (`ProtectSystem=strict`, 0600 root-only).
+`CONNLOG_EXPOSE_SYSTEM_INFO=true` into the same file. After install, root
+changes settings with `connlog-agent config` (`set name=value ...`, or one
+`enable-`/`disable-` command per setting, all through `install::conf::set`):
+
+1. Check every value against `features::settings`, the one table of settings,
+   before anything is written; a password is never taken on the command line.
+2. Create `/etc/connlog` and `agent.conf` if missing; upsert the keys (an empty
+   value removes its line) without touching token, URL or BMC keys; nothing is
+   written or restarted when the file already says it.
+3. Write the file beside itself (`.agent.conf.new`, 0600 from creation),
+   fsync, rename over `agent.conf`: never half a file.
+4. `systemctl restart connlog-agent`, then watch for up to 45 s: the agent's
+   own heartbeat log (`heartbeat-telemetry.jsonl`) showing a heartbeat means it
+   is back (a failed one blames the network and keeps the settings); a failed
+   unit or a restart systemd counted means it is not.
+5. Not back: put the previous file back (or remove the new one), restart on
+   it, and print the journal's last lines.
+
+On FreeBSD the same steps write `/usr/local/etc/connlog/agent.conf` (unquoted
+`NAME=value`, 0640 root:connlog) and restart through `service`; there a crash
+loop is unseen (`daemon -r`), so no heartbeat within 45 s means not back. In
+Docker `config` changes nothing and prints the `-e` flags instead. The running
+service cannot write the file (`ProtectSystem=strict`, 0600 root-only).
 
 ### Uninstall (`uninstall`)
 
@@ -688,7 +709,8 @@ Binary frame (v1), 32 bytes, little-endian:
 | 30     | 2    | load_max × 100 (u16 LE)    |
 
 Identity metadata travels in HTTP headers (`X-Agent-Version`, `X-Hostname`,
-`X-OS`, `X-Arch`, `X-Machine-Id`, `X-Cpu-Core-Count`, etc.). There is no JSON
+`X-OS`, `X-Arch`, `X-Os-Id`, `X-Os-Like`, `X-Os-Version`, `X-Machine-Id`,
+`X-Cpu-Core-Count`, etc.). There is no JSON
 fallback. Every optional header's accepted values are in
 `packages/agent-protocol/fixtures/heartbeat-headers.json`, which the agent
 (`http::shared_fixtures`) and the platform (`@connlog/agent-protocol`) both
@@ -772,3 +794,30 @@ In rough priority order:
    localhost/private-network URLs outside debug builds. Loosening it (e.g.
    widening `TRUSTED_ENDPOINT_DOMAINS`) requires the same scrutiny as a new
    trusted root of authority.
+
+## Quick actions (owner, 2026-10-31)
+
+Root registers the commands the console may run (`connlog-agent action add`,
+kept in the root-only `/etc/connlog/actions.toml`): an id, a label, a risk, a
+time limit (at most 60 s), whether its output is shown, and the argv, run
+without a shell. The console can ask for an action by its id and nothing else;
+no command, argument or environment ever comes from the platform.
+
+1. On start and whenever the file changes, the agent publishes the manifest
+   (ids and labels, never the argv) to `POST /api/agents/actions/manifest`,
+   an empty one when no action is left.
+2. It polls `GET /api/agents/actions/pending` every few seconds while it has
+   actions, and runs what it claims as its own user (`connlog-agent`), with
+   a clean environment (no token, no BMC password), a fixed `PATH`, no stdin,
+   the action's time limit and its output cap (at most 64 KB).
+3. A shown action's output goes out as it comes: `POST
+   /api/agents/actions/output` every 250 ms with what the pipes gave, never a
+   UTF-8 character cut in two, `seq` to order the pieces
+   (`quick-action-output.json`). A piece that fails stops the relay for that
+   run; a 3 s timeout keeps a slow platform from holding the action.
+4. The result (`POST /api/agents/actions/results`) carries the exit code, the
+   time taken and, for a shown action, all the output. The platform relays
+   output to whoever ran the action and stores none of it.
+
+`CONNLOG_QUICK_ACTIONS_ENABLED=false` turns every action off; with no actions
+registered there is nothing to poll for.

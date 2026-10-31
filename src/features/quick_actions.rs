@@ -5,6 +5,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -132,6 +133,99 @@ pub struct QuickActionResultPayload {
     pub stderr: Option<String>,
 }
 
+/// Output of a running action, sent as it comes (owner, 2026-10-31) to
+/// `POST /api/agents/actions/output`, so the person who ran it sees it live.
+/// Only for an action whose output is shown; the platform relays it and never
+/// stores it, and the final result still carries all of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuickActionOutputPayload {
+    pub request_id: String,
+    pub action_id: String,
+    /// 0, 1, 2…: the order to show the chunks in.
+    pub seq: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdout: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<String>,
+}
+
+/// Where a pipe reader hands what it keeps: its stream (0 stdout, 1 stderr) and the bytes.
+type OutputTap = (usize, mpsc::Sender<(usize, Vec<u8>)>);
+
+/// How often a running action's output is sent on.
+const OUTPUT_EVERY: Duration = Duration::from_millis(250);
+
+/// A running action's output on its way out: what the pipes gave since the
+/// last chunk, within the action's output budget, and never a UTF-8
+/// character cut in two (its first bytes wait for the rest).
+struct Relay<'a> {
+    request: &'a QuickActionRequest,
+    budget: usize,
+    seq: u32,
+    pending: [Vec<u8>; 2],
+    last: Instant,
+}
+
+impl<'a> Relay<'a> {
+    fn new(request: &'a QuickActionRequest, budget: usize) -> Self {
+        Self {
+            request,
+            budget,
+            seq: 0,
+            pending: [Vec::new(), Vec::new()],
+            last: Instant::now(),
+        }
+    }
+
+    /// Take what the readers sent, keeping within the budget.
+    fn take(&mut self, rx: &mpsc::Receiver<(usize, Vec<u8>)>) {
+        while let Ok((stream, bytes)) = rx.try_recv() {
+            let keep = bytes.len().min(self.budget);
+            self.budget -= keep;
+            self.pending[stream].extend_from_slice(&bytes[..keep]);
+        }
+    }
+
+    /// Send what is pending, if it is time (or `last`, everything).
+    fn flush(&mut self, last: bool, on_output: &mut dyn FnMut(QuickActionOutputPayload)) {
+        if !last && self.last.elapsed() < OUTPUT_EVERY {
+            return;
+        }
+        self.last = Instant::now();
+        let [stdout, stderr] = [0, 1].map(|i| whole_characters(&mut self.pending[i], last));
+        if stdout.is_none() && stderr.is_none() {
+            return;
+        }
+        on_output(QuickActionOutputPayload {
+            request_id: self.request.request_id.clone(),
+            action_id: self.request.action_id.clone(),
+            seq: self.seq,
+            stdout,
+            stderr,
+        });
+        self.seq += 1;
+    }
+}
+
+/// The text in `pending` up to its last whole UTF-8 character, leaving an
+/// unfinished one for the next chunk; at the `last` chunk, all of it.
+fn whole_characters(pending: &mut Vec<u8>, last: bool) -> Option<String> {
+    let whole = match std::str::from_utf8(pending) {
+        Ok(_) => pending.len(),
+        // An invalid sequence (not a cut one) goes out as it is, replaced.
+        Err(e) if e.error_len().is_some() || last => pending.len(),
+        Err(e) => e.valid_up_to(),
+    };
+    if whole == 0 {
+        return None;
+    }
+    let rest = pending.split_off(whole);
+    let text = String::from_utf8_lossy(pending).into_owned();
+    *pending = rest;
+    Some(text)
+}
+
 #[derive(Debug, Default)]
 struct ActionBuilder {
     label: Option<String>,
@@ -213,6 +307,16 @@ impl QuickActionsRegistry {
     }
 
     pub fn execute(&self, request: &QuickActionRequest) -> QuickActionResultPayload {
+        self.execute_streaming(request, &mut |_| {})
+    }
+
+    /// `execute`, handing each piece of a shown action's output to
+    /// `on_output` while it runs.
+    pub fn execute_streaming(
+        &self,
+        request: &QuickActionRequest,
+        on_output: &mut dyn FnMut(QuickActionOutputPayload),
+    ) -> QuickActionResultPayload {
         let Some(action) = self.actions.get(&request.action_id) else {
             return QuickActionResultPayload {
                 request_id: request.request_id.clone(),
@@ -239,7 +343,7 @@ impl QuickActionsRegistry {
             };
         }
 
-        run_action(request, action)
+        run_action(request, action, on_output)
     }
 
     pub fn action(&self, action_id: &str) -> Option<&QuickAction> {
@@ -954,7 +1058,11 @@ pub fn command_looks_risky(argv: &[String]) -> bool {
             .any(|arg| matches!(arg.as_str(), "sh" | "bash"))
 }
 
-fn run_action(request: &QuickActionRequest, action: &QuickAction) -> QuickActionResultPayload {
+fn run_action(
+    request: &QuickActionRequest,
+    action: &QuickAction,
+    on_output: &mut dyn FnMut(QuickActionOutputPayload),
+) -> QuickActionResultPayload {
     let start = Instant::now();
     // A clean environment: the service process holds CONNLOG_TOKEN (and any
     // BMC password) from the EnvironmentFile, and an action that merely runs
@@ -987,14 +1095,20 @@ fn run_action(request: &QuickActionRequest, action: &QuickAction) -> QuickAction
         }
     };
 
-    let stdout_handle = child
-        .stdout
-        .take()
-        .map(|stdout| thread::spawn(move || read_limited(stdout, HARD_MAX_OUTPUT_BYTES)));
-    let stderr_handle = child
-        .stderr
-        .take()
-        .map(|stderr| thread::spawn(move || read_limited(stderr, HARD_MAX_OUTPUT_BYTES)));
+    // A shown action's output also goes out as it comes: each reader hands
+    // what it keeps to the relay, which this loop sends on.
+    let shown = matches!(action.output_mode, OutputMode::Ephemeral);
+    let (tx, rx) = mpsc::channel::<(usize, Vec<u8>)>();
+    let stdout_tx = shown.then(|| (0, tx.clone()));
+    let stderr_tx = shown.then(|| (1, tx.clone()));
+    drop(tx);
+    let stdout_handle = child.stdout.take().map(|stdout| {
+        thread::spawn(move || read_limited(stdout, HARD_MAX_OUTPUT_BYTES, stdout_tx))
+    });
+    let stderr_handle = child.stderr.take().map(|stderr| {
+        thread::spawn(move || read_limited(stderr, HARD_MAX_OUTPUT_BYTES, stderr_tx))
+    });
+    let mut relay = Relay::new(request, action.max_output_bytes);
 
     let timeout = Duration::from_secs(action.timeout_seconds);
     let mut timed_out = false;
@@ -1007,6 +1121,8 @@ fn run_action(request: &QuickActionRequest, action: &QuickAction) -> QuickAction
                     let _ = child.kill();
                     break child.wait().ok();
                 }
+                relay.take(&rx);
+                relay.flush(false, on_output);
                 thread::sleep(Duration::from_millis(50));
             }
             Err(_) => break None,
@@ -1019,6 +1135,9 @@ fn run_action(request: &QuickActionRequest, action: &QuickAction) -> QuickAction
     let (stderr_bytes, stderr_reader_truncated) = stderr_handle
         .and_then(|handle| handle.join().ok())
         .unwrap_or_default();
+    // The readers are done: what they sent last goes out now.
+    relay.take(&rx);
+    relay.flush(true, on_output);
 
     let exit_code = status.and_then(|s| s.code());
     let mut status_text = if timed_out {
@@ -1062,7 +1181,9 @@ fn run_action(request: &QuickActionRequest, action: &QuickAction) -> QuickAction
     }
 }
 
-fn read_limited<R: Read>(mut reader: R, limit: usize) -> (Vec<u8>, bool) {
+/// Read a pipe to its end, keeping at most `limit` bytes; what is kept also
+/// goes to `relay`, tagged with its stream, when there is one.
+fn read_limited<R: Read>(mut reader: R, limit: usize, relay: Option<OutputTap>) -> (Vec<u8>, bool) {
     let mut output = Vec::new();
     let mut truncated = false;
     let mut buffer = [0u8; 4096];
@@ -1077,6 +1198,9 @@ fn read_limited<R: Read>(mut reader: R, limit: usize) -> (Vec<u8>, bool) {
             let available = limit - output.len();
             let take = available.min(read);
             output.extend_from_slice(&buffer[..take]);
+            if let Some((stream, tx)) = &relay {
+                let _ = tx.send((*stream, buffer[..take].to_vec()));
+            }
             if take < read {
                 truncated = true;
             }
@@ -1144,6 +1268,106 @@ exec = ["df", "-h"]
         assert_eq!(manifest.actions[0].action_id, "disk_usage");
         assert_eq!(manifest.actions[0].output_mode, "ephemeral");
         assert_eq!(manifest.actions[0].max_output_bytes, 8192);
+    }
+
+    fn streamed(
+        registry: &QuickActionsRegistry,
+        id: &str,
+    ) -> (Vec<QuickActionOutputPayload>, QuickActionResultPayload) {
+        let mut chunks = Vec::new();
+        let result = registry.execute_streaming(&request(id), &mut |chunk| chunks.push(chunk));
+        (chunks, result)
+    }
+
+    #[test]
+    fn a_shown_actions_output_goes_out_as_it_comes_in_order() {
+        let registry = parse_config(
+            r#"
+[quick_actions.talk]
+label = "Talk"
+output_mode = "ephemeral"
+exec = ["sh", "-c", "printf one; sleep 0.4; printf two; printf oops >&2"]
+"#,
+        )
+        .expect("config parses");
+
+        let (chunks, result) = streamed(&registry, "talk");
+
+        assert!(chunks.len() >= 2, "{chunks:?}");
+        assert_eq!(
+            chunks.iter().map(|c| c.seq).collect::<Vec<_>>(),
+            (0..chunks.len() as u32).collect::<Vec<_>>()
+        );
+        let out: String = chunks.iter().filter_map(|c| c.stdout.clone()).collect();
+        let err: String = chunks.iter().filter_map(|c| c.stderr.clone()).collect();
+        assert_eq!(out, "onetwo");
+        assert_eq!(err, "oops");
+        assert_eq!(result.stdout.as_deref(), Some("onetwo"));
+        assert!(chunks.iter().all(
+            |c| c.request_id == "00000000-0000-0000-0000-000000000001" && c.action_id == "talk"
+        ));
+    }
+
+    #[test]
+    fn streaming_keeps_to_the_output_budget_and_hidden_output_never_leaves() {
+        let registry = parse_config(
+            r#"
+[quick_actions.loud]
+label = "Loud"
+output_mode = "ephemeral"
+max_output_bytes = 16
+exec = ["sh", "-c", "printf 0123456789abcdefghij"]
+
+[quick_actions.quiet]
+label = "Quiet"
+output_mode = "hidden"
+exec = ["printf", "secret"]
+"#,
+        )
+        .expect("config parses");
+
+        let (chunks, _) = streamed(&registry, "loud");
+        let sent: usize = chunks
+            .iter()
+            .map(|c| c.stdout.as_deref().unwrap_or("").len())
+            .sum();
+        assert_eq!(sent, 16);
+
+        let (chunks, result) = streamed(&registry, "quiet");
+        assert!(chunks.is_empty());
+        assert!(result.stdout.is_none());
+    }
+
+    #[test]
+    fn a_character_cut_between_chunks_waits_for_the_rest() {
+        let mut pending = "né".as_bytes()[..2].to_vec(); // "n" and the first byte of "é"
+        assert_eq!(whole_characters(&mut pending, false).as_deref(), Some("n"));
+        assert_eq!(pending, vec![0xC3]);
+        pending.push(0xA9);
+        assert_eq!(whole_characters(&mut pending, false).as_deref(), Some("é"));
+        assert!(pending.is_empty());
+        // The last chunk sends what is left, replaced if it never finished.
+        let mut cut = vec![b'x', 0xC3];
+        assert_eq!(
+            whole_characters(&mut cut, true).as_deref(),
+            Some("x\u{FFFD}")
+        );
+    }
+
+    #[test]
+    fn output_chunks_are_what_the_platform_reads() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(protocol_fixture!("quick-action-output.json")).unwrap();
+        for case in fixture["chunks"].as_array().unwrap() {
+            let chunk = QuickActionOutputPayload {
+                request_id: case["requestId"].as_str().unwrap().to_string(),
+                action_id: case["actionId"].as_str().unwrap().to_string(),
+                seq: case["seq"].as_u64().unwrap() as u32,
+                stdout: case["stdout"].as_str().map(str::to_string),
+                stderr: case["stderr"].as_str().map(str::to_string),
+            };
+            assert_eq!(serde_json::to_value(&chunk).unwrap(), *case);
+        }
     }
 
     #[test]

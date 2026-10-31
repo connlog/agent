@@ -1,0 +1,24 @@
+{
+  "description": "The settings `connlog-agent config set` takes (agent 1.23+), by the name a person types, with the agent.conf line each one writes. The agent's features::settings holds the same table; the console builds its one-line command from this one. The BMC password and what install writes (the token, the platform URL) are left out: the console never puts a secret in a command.",
+  "sinceAgentVersion": "1.23.0",
+  "settings": [
+    { "name": "hostname", "key": "CONNLOG_EXPOSE_SYSTEM_INFO", "kind": "switch" },
+    { "name": "remote-reboot", "key": "CONNLOG_ALLOW_REMOTE_REBOOT", "kind": "switch" },
+    { "name": "postmortem", "key": "CONNLOG_SHARE_POSTMORTEM", "kind": "switch" },
+    {
+      "name": "discovery",
+      "key": "CONNLOG_DISCOVERY",
+      "kind": "level",
+      "values": ["off", "peers", "passive", "active"]
+    },
+    { "name": "network-site", "key": "CONNLOG_NETWORK_SITE", "kind": "site" },
+    { "name": "network-map-ports", "key": "CONNLOG_NETWORK_MAP_PORTS", "kind": "ports" },
+    { "name": "probe-public", "key": "CONNLOG_PROBE_PUBLIC", "kind": "switch" },
+    { "name": "checks", "key": "CONNLOG_CHECKS", "kind": "switch" },
+    { "name": "collector", "key": "CONNLOG_COLLECTOR", "kind": "switch" },
+    { "name": "bmc-endpoint", "key": "CONNLOG_BMC_ENDPOINT", "kind": "address" },
+    { "name": "bmc-username", "key": "CONNLOG_BMC_USERNAME", "kind": "text" },
+    { "name": "bmc-poll-interval", "key": "CONNLOG_BMC_POLL_INTERVAL_SECS", "kind": "seconds" },
+    { "name": "bmc-insecure-tls", "key": "CONNLOG_BMC_INSECURE_TLS", "kind": "switch" }
+  ]
+}

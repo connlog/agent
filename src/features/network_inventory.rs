@@ -782,10 +782,8 @@ docker0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0
     /// valid upload describes, the agent sends exactly that upload.
     #[test]
     fn serialises_every_fixture_upload_exactly() {
-        let fixture: Value = serde_json::from_str(include_str!(
-            "../../../../packages/agent-protocol/fixtures/inventory-uploads.json"
-        ))
-        .unwrap();
+        let fixture: Value =
+            serde_json::from_str(protocol_fixture!("inventory-uploads.json")).unwrap();
         let valid = fixture["valid"].as_array().unwrap();
         assert!(!valid.is_empty());
         for case in valid {

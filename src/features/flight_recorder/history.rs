@@ -499,8 +499,7 @@ mod tests {
         assert!(text.contains("No records yet"));
     }
 
-    const CLASSIFICATION: &str =
-        include_str!("../../../../../packages/agent-protocol/fixtures/outage-classification.json");
+    const CLASSIFICATION: &str = protocol_fixture!("outage-classification.json");
 
     /// A record from the wire field order of `history-uploads.json`.
     fn from_fields(f: &[u64]) -> Stored {

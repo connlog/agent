@@ -606,10 +606,8 @@ mod tests {
 
     #[test]
     fn writes_the_report_the_shared_fixture_holds() {
-        let fixtures: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../../../packages/agent-protocol/fixtures/integration-reports.json"
-        ))
-        .unwrap();
+        let fixtures: serde_json::Value =
+            serde_json::from_str(protocol_fixture!("integration-reports.json")).unwrap();
         let expected = fixtures["valid"]
             .as_array()
             .unwrap()

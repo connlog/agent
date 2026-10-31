@@ -19,7 +19,9 @@ agent-vX.Y.Z tag on a canary commit here
        │          connlog/agent has no vX.Y.Z yet
        ├─ one commit on connlog/agent's canary: apps/agent at the tag,
        │  byte for byte (less the AGENTS.md/CLAUDE.md symlinks into
-       │  law-and-order/), as a fast-forward; never a force push
+       │  law-and-order/), with packages/agent-protocol/fixtures as
+       │  protocol-fixtures/ for its tests, as a fast-forward; never a
+       │  force push
        └─ tag vX.Y.Z there
             └─ connlog/agent's Release workflow (apps/agent/.github/
                workflows/release.yml, carried by the mirror)
@@ -70,6 +72,11 @@ pre-release versions as update targets. The mirror workflow refuses one.
 
 ### 2. Bump the version and changelog, in a pull request
 
+Every pull request that changes the agent already raises its version
+(`law-and-order/agent.md`, checked by `pnpm agent:check`), so `canary`
+usually holds a version no release has used yet: then this step is only the
+changelog's date, and the release is that version.
+
 On a branch from `canary`:
 
 - `apps/agent/Cargo.toml`: `version = "X.Y.Z"`.
@@ -97,11 +104,13 @@ hours; the platform must already accept what the new agent sends.
 ### 4. Verify, then tag
 
 From a phone or anywhere without a checkout: **Actions → Agent release →
-Run workflow**, branch `canary`, version `X.Y.Z`. The run checks that
-`canary`'s `apps/agent/Cargo.toml` says X.Y.Z, creates `agent-vX.Y.Z` on that
-commit, and goes on to step 5 by itself. Re-running a failed run is safe: it
-accepts a tag it already made on the same commit and a mirror that already
-holds the same tree, and refuses anything else.
+Run workflow**, branch `canary`, version `X.Y.Z` (or empty: the version
+`Cargo.toml` says). The run checks that `canary`'s `apps/agent/Cargo.toml` says
+X.Y.Z, creates `agent-vX.Y.Z` on that commit, and goes on to step 5 by itself.
+Re-running a failed run is safe: it accepts a tag it already made on the same
+commit and a mirror that already holds the same tree, and refuses anything
+else. But a re-run replays the commit it first ran on: after a version bump,
+start a new run, or it still reads the old version.
 
 From a checkout:
 

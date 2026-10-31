@@ -1,0 +1,119 @@
+{
+  "valid": [
+    {
+      "description": "Two ports open and refused, an ICMP echo, a filtered port, a public address the host would not try.",
+      "upload": {
+        "version": 1,
+        "id": "prb_01HZX3",
+        "results": [
+          {
+            "address": "10.0.20.7",
+            "port": 5432,
+            "outcome": "open",
+            "rttMs": 3
+          },
+          {
+            "address": "10.0.20.7",
+            "port": 22,
+            "outcome": "refused",
+            "rttMs": null
+          },
+          {
+            "address": "10.0.20.7",
+            "port": null,
+            "outcome": "open",
+            "rttMs": 1
+          },
+          {
+            "address": "10.0.30.9",
+            "port": 443,
+            "outcome": "timeout",
+            "rttMs": null
+          },
+          {
+            "address": "203.0.113.10",
+            "port": 443,
+            "outcome": "skipped",
+            "rttMs": null
+          }
+        ]
+      },
+      "read": {
+        "version": 1,
+        "id": "prb_01HZX3",
+        "results": [
+          {
+            "address": "10.0.20.7",
+            "port": 5432,
+            "outcome": "open",
+            "rttMs": 3
+          },
+          {
+            "address": "10.0.20.7",
+            "port": 22,
+            "outcome": "refused",
+            "rttMs": null
+          },
+          {
+            "address": "10.0.20.7",
+            "port": null,
+            "outcome": "open",
+            "rttMs": 1
+          },
+          {
+            "address": "10.0.30.9",
+            "port": 443,
+            "outcome": "timeout",
+            "rttMs": null
+          },
+          {
+            "address": "203.0.113.10",
+            "port": 443,
+            "outcome": "skipped",
+            "rttMs": null
+          }
+        ]
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "description": "Unknown outcome.",
+      "upload": {
+        "version": 1,
+        "id": "prb_1",
+        "results": [
+          {
+            "address": "10.0.0.1",
+            "port": 22,
+            "outcome": "filtered",
+            "rttMs": null
+          }
+        ]
+      }
+    },
+    {
+      "description": "An id with a slash.",
+      "upload": {
+        "version": 1,
+        "id": "prb/1",
+        "results": []
+      }
+    },
+    {
+      "description": "A round trip of over a minute.",
+      "upload": {
+        "version": 1,
+        "id": "prb_1",
+        "results": [
+          {
+            "address": "10.0.0.1",
+            "port": 22,
+            "outcome": "open",
+            "rttMs": 60001
+          }
+        ]
+      }
+    }
+  ]
+}

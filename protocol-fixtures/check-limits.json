@@ -1,0 +1,7 @@
+{
+  "description": "What one check request may ask and how a check runs. The agent's features::checks compiles these in; the platform's checks.ts refuses a request that asks for more.",
+  "maxPerRequest": 16,
+  "timeoutMs": 10000,
+  "pingCount": 3,
+  "dnsMaxAnswers": 16
+}
