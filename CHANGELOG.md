@@ -6,6 +6,15 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 [`VERSIONING.md`](./VERSIONING.md) for the full policy. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.23.1] — 2026-11-02
+
+### Changed
+
+- **Release only.** v1.23.0 was tagged here and mirrored, but its release was
+  never published, and a released tag is never moved. 1.23.1 is the same
+  agent under a new version: everything listed under 1.23.0 ships first in
+  1.23.1.
+
 ## [1.23.0] — 2026-10-30
 
 ### Added
@@ -1228,6 +1237,7 @@ considered stable; breaking changes from this point on require a major bump.
 
 - Last pre-1.0 release. See git history for prior changes.
 
+[1.23.1]: https://github.com/connlog/agent/compare/v1.23.0...v1.23.1
 [1.23.0]: https://github.com/connlog/agent/compare/v1.22.1...v1.23.0
 [1.22.1]: https://github.com/connlog/agent/compare/v1.22.0...v1.22.1
 [1.22.0]: https://github.com/connlog/agent/compare/v1.21.0...v1.22.0
