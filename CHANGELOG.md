@@ -6,6 +6,18 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 [`VERSIONING.md`](./VERSIONING.md) for the full policy. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.23.2] — 2026-11-02
+
+### Changed
+
+- **Release only: Linux, without FreeBSD.** No release was published after
+  1.21.0: v1.22.0 to v1.23.1 were tagged and mirrored, but the FreeBSD job in
+  the release workflow failed every time, and every build waits on it. That
+  job and the FreeBSD package build are out of the release for now; FreeBSD
+  (OPNsense, pfSense) comes back as a release of its own. 1.23.2 is the same
+  agent as 1.23.1 and the first release since 1.21.0: everything listed under
+  1.22.0 to 1.23.1 ships first here, on Linux (x86_64, aarch64).
+
 ## [1.23.1] — 2026-11-02
 
 ### Changed
@@ -1237,6 +1249,7 @@ considered stable; breaking changes from this point on require a major bump.
 
 - Last pre-1.0 release. See git history for prior changes.
 
+[1.23.2]: https://github.com/connlog/agent/compare/v1.23.1...v1.23.2
 [1.23.1]: https://github.com/connlog/agent/compare/v1.23.0...v1.23.1
 [1.23.0]: https://github.com/connlog/agent/compare/v1.22.1...v1.23.0
 [1.22.1]: https://github.com/connlog/agent/compare/v1.22.0...v1.22.1

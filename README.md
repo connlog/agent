@@ -74,6 +74,9 @@ readable by the agent's user only.
 
 ### Run on OPNsense, pfSense or FreeBSD
 
+> Not in the current releases: since v1.23.2 the releases are Linux only, and the FreeBSD package
+> comes back as a release of its own. Until then the command below finds no package to install.
+
 On a firewall (amd64), as root in its shell:
 
 ```sh

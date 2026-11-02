@@ -3145,7 +3145,7 @@ SOFTWARE.
 
 ### MIT License
 
-Used by: connlog-agent 1.23.1
+Used by: connlog-agent 1.23.2
 
 ```text
 MIT License

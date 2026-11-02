@@ -14,8 +14,14 @@ env:
 # The checks gate the build. They run here, in this public repository (no
 # Actions minutes are billed for one), and nowhere else: connlog/platform
 # runs no CI (owner, 2026-10-30; canary is its check), so this is where the
-# signing-key refusal, the size budget, cargo deny and the FreeBSD build
-# (OPNsense and pfSense run the agent there) are proved before a release.
+# signing-key refusal, the size budget and cargo deny are proved before a
+# release.
+#
+# FreeBSD (OPNsense, pfSense) is not built here for now (owner, 2026-11-02):
+# its job in this gate failed on every tag from v1.22.0 to v1.23.1, so no
+# release was published after v1.21.0, Linux included. It comes back as a
+# release of its own once it passes; the two jobs it had (the FreeBSD 14
+# checks and the package build) are in this file's history at v1.23.1.
 jobs:
   checks:
     name: fmt + clippy + test, size budget, signing-key refusal
@@ -83,38 +89,9 @@ jobs:
           command: check
           arguments: --all-features
 
-  freebsd:
-    # A real FreeBSD VM on this Linux runner (there is no FreeBSD runner):
-    # clippy and the tests, then the firewall readers against the VM's own
-    # kernel with a VLAN interface and a static ARP entry (T13.5b).
-    name: FreeBSD 14
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: clippy and test in FreeBSD 14
-        uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
-        with:
-          release: '14.3'
-          copyback: false
-          prepare: |
-            pkg install -y curl
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal -c clippy
-          run: |
-            . "$HOME/.cargo/env"
-            cargo clippy --all-targets -- -D warnings
-            cargo test --all-targets
-            parent=$(route -n get default | awk '/interface:/ { print $2 }')
-            ifconfig vlan0 create vlan 20 vlandev "$parent" inet 10.99.20.1/24 up
-            arp -s 10.99.20.7 02:00:00:00:00:07
-            cargo test --all-targets -- --ignored freebsd_
-
   build:
     name: Build ${{ matrix.target }}
-    needs: [checks, deny, freebsd]
+    needs: [checks, deny]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -210,60 +187,6 @@ jobs:
             target/${{ matrix.target }}/release/connlog-agent-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz.sha256
             target/${{ matrix.target }}/release/connlog-agent-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}
 
-  # The FreeBSD binary and its package (OPNsense, pfSense; T13.5d), built in a
-  # FreeBSD VM: the binary links the base system's libc, so it is built where
-  # that libc is. With the signing public key, like the Linux builds; signed
-  # with them by the next job (the package as a file of its own, so install.sh
-  # can verify it before `pkg add`).
-  build-freebsd:
-    name: Build FreeBSD amd64 and its package
-    needs: [checks, deny, freebsd]
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Build and package in FreeBSD 14
-        uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
-        env:
-          CONNLOG_SIGNING_PUBLIC_KEY: ${{ secrets.CONNLOG_SIGNING_PUBLIC_KEY }}
-          VERSION: ${{ github.ref_name }}
-        with:
-          release: '14.3'
-          envs: 'CONNLOG_SIGNING_PUBLIC_KEY VERSION'
-          prepare: |
-            pkg install -y curl
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-          run: |
-            set -e
-            . "$HOME/.cargo/env"
-            case "$VERSION" in v[0-9]*.[0-9]*.[0-9]*) ;; *) echo "bad tag $VERSION"; exit 1 ;; esac
-            cargo build --release
-            reported=$(target/release/connlog-agent --version | awk '{print $NF}')
-            [ "v$reported" = "$VERSION" ] || { echo "binary reports v$reported, tag is $VERSION"; exit 1; }
-            mkdir -p dist
-            cp target/release/connlog-agent "dist/connlog-agent-${VERSION}-freebsd-x86_64"
-            sh packaging/freebsd/build-pkg.sh target/release/connlog-agent "$reported" pkgout
-            cp pkgout/connlog-agent-*.pkg "dist/connlog-agent-${VERSION}-freebsd-x86_64.pkg"
-            # The package installs and its service starts (no token: it
-            # stops at the missing settings, which is the point checked).
-            pkg add "dist/connlog-agent-${VERSION}-freebsd-x86_64.pkg"
-            pw usershow connlog
-            test "$(stat -f %Lp /usr/local/etc/connlog)" = 750
-            sysrc -f /etc/rc.conf.d/connlog_agent connlog_agent_enable=YES
-            if service connlog_agent start 2>err.log; then
-              echo "started without settings"; exit 1
-            fi
-            grep -q "agent.conf is missing" err.log
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: connlog-agent-freebsd-x86_64
-          path: dist/
-
   # ── Sign & Publish ──────────────────────────────────────────
   # This job runs in the protected "release" environment.
   # Configure it in GitHub → Settings → Environments → release:
@@ -271,7 +194,7 @@ jobs:
   #   ✓ Restrict to tags matching v*
   sign-and-release:
     name: Sign & Create Release
-    needs: [build, build-freebsd]
+    needs: build
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -318,8 +241,6 @@ jobs:
           subject-path: |
             artifacts/**/connlog-agent-${{ github.ref_name }}-linux-x86_64
             artifacts/**/connlog-agent-${{ github.ref_name }}-linux-aarch64
-            artifacts/**/connlog-agent-${{ github.ref_name }}-freebsd-x86_64
-            artifacts/**/connlog-agent-${{ github.ref_name }}-freebsd-x86_64.pkg
             artifacts/**/*.tar.gz
 
       - name: Create or update release
@@ -338,7 +259,6 @@ jobs:
           ### Supported platforms
           - Linux x86_64 (\`connlog-agent-${VERSION}-linux-x86_64\`)
           - Linux aarch64 (\`connlog-agent-${VERSION}-linux-aarch64\`)
-          - FreeBSD amd64, and its package for OPNsense and pfSense (\`connlog-agent-${VERSION}-freebsd-x86_64.pkg\`)
           - Docker, both architectures (\`ghcr.io/connlog/agent:${VERSION#v}\`, published once this release is)
 
           ### Auto-update
