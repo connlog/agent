@@ -242,6 +242,20 @@ pub struct Config {
     )]
     pub probe_public: Option<bool>,
 
+    /// Let a sweep reach a private subnet this host is not on, through its
+    /// gateway, when the console asks for one by name (CONNLOG_SWEEP_ROUTED).
+    /// Off unless set to true: without it the agent sweeps its own subnets
+    /// and no other.
+    #[arg(
+        long = "sweep-routed",
+        env = "CONNLOG_SWEEP_ROUTED",
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new(),
+        global = true,
+        hide = true
+    )]
+    pub sweep_routed: Option<bool>,
+
     // ── BMC hardware-health (Dell iDRAC / HPE iLO / OpenBMC via Redfish) ──
     //
     // All three of endpoint/username/password must be set to enable the
@@ -815,6 +829,7 @@ impl fmt::Debug for Config {
             .field("network_site", &self.network_site)
             .field("network_map_ports", &self.network_map_ports)
             .field("probe_public", &self.probe_public)
+            .field("sweep_routed", &self.sweep_routed)
             .finish()
     }
 }

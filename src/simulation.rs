@@ -1618,7 +1618,7 @@ fn a_sweep_below_active_is_refused_without_a_packet() {
         ) -> Vec<(std::net::Ipv4Addr, Vec<u8>)> {
             panic!("no multicast below active")
         }
-        fn answered_arp(&self) -> Vec<std::net::Ipv4Addr> {
+        fn answered_arp(&self) -> Vec<(std::net::Ipv4Addr, String)> {
             panic!("nothing read below active")
         }
     }

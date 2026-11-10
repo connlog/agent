@@ -1,5 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::mpsc;
+use std::time::Duration;
 use sysinfo::{Disks, System};
 
 pub struct SystemMetrics {
@@ -169,7 +171,7 @@ fn cpu_interval_percent(prev: &CpuCounters, curr: &CpuCounters) -> (f64, f64) {
 /// Call `new()` once at startup, then `collect()` on each sample interval.
 pub struct MetricsCollector {
     sys: System,
-    disks: Disks,
+    disks: DiskReader,
     /// Cached identity values (never change during process lifetime)
     hostname: String,
     os: String,
@@ -205,7 +207,7 @@ impl MetricsCollector {
 
         sys.refresh_memory();
 
-        let disks = Disks::new_with_refreshed_list();
+        let disks = DiskReader::start();
 
         let hostname = hostname::get()
             .context("Failed to get hostname")?
@@ -291,59 +293,15 @@ impl MetricsCollector {
             ((avg, avg), cores)
         };
 
-        // Memory + disks don't need the two-step dance.
+        // Memory needs no two-step dance. The disks are read on a thread of
+        // their own (`DiskReader`): a mount that does not answer must not
+        // stop the heartbeat.
         self.sys.refresh_memory();
-        self.disks.refresh();
+        let (disk_total_mb, disk_used_mb) = self.disks.read();
 
         let uptime_seconds = System::uptime();
         let memory_total_mb = self.sys.total_memory() / 1024 / 1024;
         let memory_used_mb = self.sys.used_memory() / 1024 / 1024;
-
-        // Aggregate all "real" disks. Linux mounts the same physical device
-        // under many paths (overlayfs, bind mounts, snap loop devices, docker
-        // layers, etc.) — naive summing double/triple counts space. We
-        // dedupe by device name and skip pseudo / virtual filesystems so the
-        // numbers match what `df -h` shows for actual storage.
-        let (disk_total_mb, disk_used_mb) = {
-            use std::collections::HashSet;
-            let mut total = 0u64;
-            let mut used = 0u64;
-            let mut seen: HashSet<String> = HashSet::new();
-
-            let host_root = crate::platform::host_root();
-            for disk in self.disks.list() {
-                let fs = disk.file_system().to_string_lossy().to_lowercase();
-                let mount = disk.mount_point().to_string_lossy().to_string();
-                if !counts_as_storage(&fs, &mount, host_root.as_deref()) {
-                    continue;
-                }
-                // Dedupe by device name (e.g. /dev/nvme0n1p2). Same physical
-                // device mounted at multiple paths = count only once.
-                let name = disk.name().to_string_lossy().to_string();
-                let dedupe_key = if name.is_empty() { mount.clone() } else { name };
-                if !seen.insert(dedupe_key) {
-                    continue;
-                }
-
-                let dt = disk.total_space() / 1024 / 1024;
-                let da = disk.available_space() / 1024 / 1024;
-                total += dt;
-                used += dt.saturating_sub(da);
-            }
-
-            if total == 0 {
-                // Fallback: first disk only — better than reporting zero.
-                if let Some(disk) = self.disks.list().first() {
-                    let t = disk.total_space() / 1024 / 1024;
-                    let a = disk.available_space() / 1024 / 1024;
-                    (t, t.saturating_sub(a))
-                } else {
-                    (0, 0)
-                }
-            } else {
-                (total, used)
-            }
-        };
 
         let load_1m = read_load_1m();
 
@@ -361,6 +319,132 @@ impl MetricsCollector {
             disk_total_mb,
             load_1m,
         }
+    }
+}
+
+/// How long a heartbeat waits for the disks to be read before it goes out
+/// with the numbers of the last read.
+const DISK_WAIT: Duration = Duration::from_secs(3);
+
+/// The host's disk totals, read on a thread of their own.
+///
+/// Reading a mount asks its filesystem (`statvfs`), and a network mount
+/// whose server is gone (NFS, CIFS) does not answer: the call blocks for
+/// minutes or for good. It used to be made on the heartbeat thread, so a
+/// healthy host with one dead mount stopped beating and read Down. Now the
+/// heartbeat asks, waits a moment, and otherwise sends what was read last;
+/// while a read is stuck no other is started, so nothing piles up behind it.
+struct DiskReader {
+    ask: mpsc::Sender<()>,
+    answers: mpsc::Receiver<(u64, u64)>,
+    /// (total, used) in MiB, as last read.
+    last: Option<(u64, u64)>,
+    /// A read was asked for and has not answered yet.
+    waiting: bool,
+    wait: Duration,
+}
+
+impl DiskReader {
+    fn start() -> Self {
+        let mut disks: Option<Disks> = None;
+        Self::with(DISK_WAIT, move || {
+            // Listed on this thread too: listing reads every mount once.
+            match disks.as_mut() {
+                Some(disks) => disks.refresh(),
+                None => disks = Some(Disks::new_with_refreshed_list()),
+            }
+            disks.as_ref().map_or((0, 0), disk_usage)
+        })
+    }
+
+    fn with(wait: Duration, mut read: impl FnMut() -> (u64, u64) + Send + 'static) -> Self {
+        let (ask, asked) = mpsc::channel::<()>();
+        let (answer, answers) = mpsc::channel();
+        // A thread that cannot start leaves `ask` with no receiver: every
+        // read then answers with nothing, at once.
+        let _ = std::thread::Builder::new()
+            .name("disks".into())
+            .spawn(move || {
+                for () in asked {
+                    let usage = panic::catch_unwind(AssertUnwindSafe(&mut read)).unwrap_or((0, 0));
+                    if answer.send(usage).is_err() {
+                        return;
+                    }
+                }
+            });
+        Self {
+            ask,
+            answers,
+            last: None,
+            waiting: false,
+            wait,
+        }
+    }
+
+    /// (total, used) in MiB: fresh if the read answers in time, else as last
+    /// read; zeros until one has.
+    fn read(&mut self) -> (u64, u64) {
+        // An earlier read that was slow may have answered since.
+        while let Ok(usage) = self.answers.try_recv() {
+            self.last = Some(usage);
+            self.waiting = false;
+        }
+        if !self.waiting && self.ask.send(()).is_ok() {
+            self.waiting = true;
+            if let Ok(usage) = self.answers.recv_timeout(self.wait) {
+                self.last = Some(usage);
+                self.waiting = false;
+            }
+        }
+        self.last.unwrap_or((0, 0))
+    }
+}
+
+/// The host's storage, (total, used) in MiB.
+///
+/// Aggregates all "real" disks. Linux mounts the same physical device under
+/// many paths (overlayfs, bind mounts, snap loop devices, docker layers,
+/// etc.) and naive summing double or triple counts space. Deduped by device
+/// name, pseudo and virtual filesystems skipped, so the numbers match what
+/// `df -h` shows for actual storage.
+fn disk_usage(disks: &Disks) -> (u64, u64) {
+    use std::collections::HashSet;
+    let mut total = 0u64;
+    let mut used = 0u64;
+    let mut seen: HashSet<String> = HashSet::new();
+
+    let host_root = crate::platform::host_root();
+    for disk in disks.list() {
+        let fs = disk.file_system().to_string_lossy().to_lowercase();
+        let mount = disk.mount_point().to_string_lossy().to_string();
+        if !counts_as_storage(&fs, &mount, host_root.as_deref()) {
+            continue;
+        }
+        // Dedupe by device name (e.g. /dev/nvme0n1p2). Same physical
+        // device mounted at multiple paths = count only once.
+        let name = disk.name().to_string_lossy().to_string();
+        let dedupe_key = if name.is_empty() { mount.clone() } else { name };
+        if !seen.insert(dedupe_key) {
+            continue;
+        }
+
+        let dt = disk.total_space() / 1024 / 1024;
+        let da = disk.available_space() / 1024 / 1024;
+        total += dt;
+        used += dt.saturating_sub(da);
+    }
+
+    if total == 0 {
+        // Fallback: first disk only — better than reporting zero.
+        if let Some(disk) = disks.list().first() {
+            let t = disk.total_space() / 1024 / 1024;
+            let a = disk.available_space() / 1024 / 1024;
+            (t, t.saturating_sub(a))
+        } else {
+            (0, 0)
+        }
+    } else {
+        (total, used)
     }
 }
 
@@ -457,6 +541,49 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_disk_read_that_does_not_answer_costs_a_moment_and_no_more() {
+        // The first read answers; the second blocks, as a dead mount does.
+        let (release, held) = mpsc::channel::<()>();
+        let mut calls = 0;
+        let mut reader = DiskReader::with(Duration::from_millis(100), move || {
+            calls += 1;
+            if calls == 2 {
+                let _ = held.recv();
+            }
+            (1000, 100 * calls)
+        });
+        assert_eq!(reader.read(), (1000, 100));
+
+        let started = std::time::Instant::now();
+        assert_eq!(reader.read(), (1000, 100), "the last read stands");
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        // While it is stuck no further read is asked for, and none is waited on.
+        let started = std::time::Instant::now();
+        assert_eq!(reader.read(), (1000, 100));
+        assert!(started.elapsed() < Duration::from_millis(80));
+
+        // The mount comes back: its answer is taken, and reads go on.
+        release.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            reader.read(),
+            (1000, 300),
+            "the stuck read's answer, then a fresh one"
+        );
+    }
+
+    #[test]
+    fn disk_totals_are_zero_until_a_read_has_answered() {
+        let (_never, held) = mpsc::channel::<()>();
+        let mut reader = DiskReader::with(Duration::from_millis(50), move || {
+            let _ = held.recv();
+            (1, 1)
+        });
+        assert_eq!(reader.read(), (0, 0));
+    }
 
     #[test]
     fn storage_is_real_filesystems_on_the_host() {

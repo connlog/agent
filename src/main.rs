@@ -71,6 +71,11 @@ const MAX_UNAUTHORIZED_ATTEMPTS: u32 = 50;
 /// Consecutive uninstall commands required from server before acting
 const UNINSTALL_CONFIRM_THRESHOLD: u32 = 3;
 
+/// How long the agent waits before asking again after a 410, while it is
+/// being confirmed. Long enough for a mistake on the platform to be undone,
+/// short enough that a server removed on purpose is gone within two minutes.
+const DECOMMISSION_RECHECK_SECS: u64 = 30;
+
 /// Consecutive reboot commands required from server before acting
 const REBOOT_CONFIRM_THRESHOLD: u32 = 3;
 
@@ -690,6 +695,12 @@ fn run_agent_with_shutdown_inner(
     let packaging = platform::Packaging::current();
     client.set_packaging(packaging);
     client.report_os(expose_system_info);
+    // Set up; from here it is shared with the thread that runs quick actions,
+    // and everything that still changes on it does so behind its own locks.
+    let client = Arc::new(client);
+    let action_runner = ActionRunner::start(Arc::clone(&client));
+    // From here the loop either turns or is restarted (systemd installs only).
+    platform::watchdog::arm();
     if packaging == platform::Packaging::Docker {
         info!(
             "Running in Docker: settings are the container's environment (CONNLOG_DISCOVERY, \
@@ -782,6 +793,7 @@ fn run_agent_with_shutdown_inner(
     let mut consecutive_unauthorized = 0u32;
     let mut consecutive_errors = 0u32;
     let mut consecutive_uninstall_commands = 0u32;
+    let mut consecutive_decommissioned = 0u32;
     let mut consecutive_reboot_commands = 0u32;
     let mut reboot_refusal_logged = false;
     let mut history_answers = HistoryAnswers::default();
@@ -833,6 +845,7 @@ fn run_agent_with_shutdown_inner(
 
                 // Reset error counters on success
                 consecutive_unauthorized = 0;
+                consecutive_decommissioned = 0;
                 consecutive_errors = 0;
                 endpoint_assignment.note_heartbeat_outcome(true);
 
@@ -1023,11 +1036,11 @@ fn run_agent_with_shutdown_inner(
                 if sleep_with_quick_action_polling(
                     &stop,
                     next_heartbeat_sleep(config.heartbeat_interval_secs, cycle_started.elapsed()),
-                    &client,
                     &mut quick_actions,
                     &mut quick_actions_fingerprint,
                     &config.quick_actions,
                     &mut quick_action_polling,
+                    &action_runner,
                 )
                 .is_err()
                 {
@@ -1035,6 +1048,7 @@ fn run_agent_with_shutdown_inner(
                 }
             }
             Err(ApiError::Unauthorized) => {
+                consecutive_decommissioned = 0;
                 consecutive_unauthorized += 1;
                 warn!(
                     "Unauthorized (401) - attempt {}/{}",
@@ -1068,9 +1082,25 @@ fn run_agent_with_shutdown_inner(
                 }
             }
             Err(ApiError::Decommissioned) => {
-                warn!("Agent has been decommissioned (410 Gone). Self-uninstalling...");
-                trigger_self_uninstall("Agent was decommissioned by the server");
-                return Ok(());
+                // Removing the install cannot be undone from the console, so a
+                // 410 is confirmed like an uninstall command is: the same
+                // answer on consecutive heartbeats. One 410 from a deploy gone
+                // wrong, or a workspace disabled and re-enabled by mistake,
+                // would otherwise take the agent off every host that beat in
+                // that window.
+                consecutive_decommissioned += 1;
+                warn!(
+                    "Agent decommissioned by the server (410 Gone), {}/{}",
+                    consecutive_decommissioned, UNINSTALL_CONFIRM_THRESHOLD
+                );
+                if consecutive_decommissioned >= UNINSTALL_CONFIRM_THRESHOLD {
+                    warn!("Decommission confirmed. Self-uninstalling...");
+                    trigger_self_uninstall("Agent was decommissioned by the server");
+                    return Ok(());
+                }
+                if interruptible_sleep(&stop, DECOMMISSION_RECHECK_SECS).is_err() {
+                    return Ok(());
+                }
             }
             Err(ApiError::Disabled) => {
                 // 423 Locked: the agent has been DISABLED in ConnLog.
@@ -1111,11 +1141,11 @@ fn run_agent_with_shutdown_inner(
                 if sleep_with_quick_action_polling(
                     &stop,
                     Duration::from_secs(backoff),
-                    &client,
                     &mut quick_actions,
                     &mut quick_actions_fingerprint,
                     &config.quick_actions,
                     &mut quick_action_polling,
+                    &action_runner,
                 )
                 .is_err()
                 {
@@ -1234,6 +1264,7 @@ fn heartbeat_error_backoff_secs(
 fn interruptible_sleep(stop: &Arc<AtomicBool>, total_secs: u64) -> Result<(), ()> {
     let deadline = Instant::now() + Duration::from_secs(total_secs);
     while Instant::now() < deadline {
+        platform::watchdog::alive();
         if stop.load(Ordering::SeqCst) {
             return Err(());
         }
@@ -1245,11 +1276,11 @@ fn interruptible_sleep(stop: &Arc<AtomicBool>, total_secs: u64) -> Result<(), ()
 fn sleep_with_quick_action_polling(
     stop: &Arc<AtomicBool>,
     total: Duration,
-    client: &ApiClient,
     quick_actions: &mut QuickActionsRegistry,
     quick_actions_fingerprint: &mut String,
     quick_actions_config: &QuickActionsConfig,
     quick_action_polling: &mut QuickActionPollState,
+    runner: &ActionRunner,
 ) -> Result<(), ()> {
     let deadline = Instant::now() + total;
 
@@ -1257,6 +1288,7 @@ fn sleep_with_quick_action_polling(
         if stop.load(Ordering::SeqCst) {
             return Err(());
         }
+        platform::watchdog::alive();
 
         let now = Instant::now();
         if now >= deadline {
@@ -1265,11 +1297,12 @@ fn sleep_with_quick_action_polling(
 
         if quick_action_polling.due(now) {
             poll_quick_actions_once(
-                client,
+                &runner.client,
                 quick_actions,
                 quick_actions_fingerprint,
                 quick_actions_config,
                 quick_action_polling,
+                runner,
             );
             continue;
         }
@@ -1313,6 +1346,7 @@ fn poll_quick_actions_once(
     quick_actions_fingerprint: &mut String,
     quick_actions_config: &QuickActionsConfig,
     quick_action_polling: &mut QuickActionPollState,
+    runner: &ActionRunner,
 ) {
     if reload_quick_actions_if_changed(client, quick_actions, quick_actions_fingerprint) {
         quick_action_polling.sync(quick_actions_config, quick_actions);
@@ -1331,7 +1365,7 @@ fn poll_quick_actions_once(
             } else {
                 info!("Quick action poll claimed {} request(s)", requests.len());
             }
-            run_quick_action_requests(client, quick_actions, &requests);
+            runner.run(quick_actions, requests);
         }
         Err(e) => {
             if quick_action_polling.mark_poll_failed() {
@@ -1342,6 +1376,58 @@ fn poll_quick_actions_once(
             } else {
                 debug!("Quick action poll failed again: {}", e);
             }
+        }
+    }
+}
+
+/// Runs the quick actions a poll claimed, on a thread of its own.
+///
+/// They used to run where they were claimed, on the heartbeat thread, in
+/// the sleep between two beats: an action may take up to its timeout (60 s
+/// by default), and on a plan that beats every 10 s the host missed beats
+/// and read Down while it ran. The loop now only hands the requests over.
+/// One thread, so actions still run one at a time, in the order claimed; the
+/// registry travels with each batch, so an action runs as it was registered
+/// when it was claimed.
+struct ActionRunner {
+    /// The daemon's client, which the poll that claims the requests uses too.
+    client: Arc<ApiClient>,
+    jobs: std::sync::mpsc::Sender<(QuickActionsRegistry, Vec<QuickActionRequest>)>,
+}
+
+impl ActionRunner {
+    fn start(client: Arc<ApiClient>) -> Self {
+        let (jobs, claimed) =
+            std::sync::mpsc::channel::<(QuickActionsRegistry, Vec<QuickActionRequest>)>();
+        let for_actions = Arc::clone(&client);
+        let spawned = thread::Builder::new()
+            .name("quick-actions".into())
+            .spawn(move || {
+                let client = for_actions;
+                for (registry, requests) in claimed {
+                    // A panic in one batch costs that batch, not every action after it.
+                    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_quick_action_requests(&client, &registry, &requests);
+                    }));
+                    if ran.is_err() {
+                        error!("A quick action panicked; later ones still run");
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            // Without the thread the sends below fail and say so per request.
+            error!("Quick actions cannot run: no thread for them ({e})");
+        }
+        Self { client, jobs }
+    }
+
+    fn run(&self, registry: &QuickActionsRegistry, requests: Vec<QuickActionRequest>) {
+        if requests.is_empty() {
+            return;
+        }
+        let count = requests.len();
+        if self.jobs.send((registry.clone(), requests)).is_err() {
+            warn!("{count} quick action request(s) not run: the runner is gone");
         }
     }
 }

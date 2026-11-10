@@ -6,6 +6,98 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 [`VERSIONING.md`](./VERSIONING.md) for the full policy. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.24.0] — 2026-11-10
+
+### Added
+
+- **A sweep's answers carry the MAC.** Each address that answered is sent
+  with the MAC this host's neighbour table holds for it once the sweep is
+  over (`found[].mac`, left out when there is none). The console makes it a
+  device on the map at once; before, an answer waited for the next inventory
+  to be paired with a MAC, up to 15 minutes later, and on a busy subnet the
+  kernel had sometimes dropped the entry by then. No new data: the same
+  neighbour table is already sent with the inventory from `passive` up, and
+  a sweep runs only at `active`.
+
+- **A router's networks and ARP table over SNMP.** A switch or router read
+  by an SNMP integration is also asked for its own addresses with their
+  masks (`ipAddrTable`) and its ARP table (`ipNetToPhysicalTable`, else
+  `ipNetToMediaTable`): `switch.networks` and `switch.arp`, private IPv4
+  only, left out where the device has none. The console names a lane from
+  each network and draws what the ARP table holds as devices, so a VLAN that
+  no server is on, behind a layer-3 switch and no firewall integration,
+  shows with what is on it.
+
+- **A sweep of a subnet this host is not on, where its root allows it.** A
+  new setting, `sweep-routed` (`CONNLOG_SWEEP_ROUTED`, off by default):
+  `sudo connlog-agent config set sweep-routed=on`. With it, a subnet listed
+  in ConnLog to be swept from this host by name (`routed` on the request) is
+  swept through its gateway when the host has no address on it: an echo and
+  handshakes to the picked well-known ports, at the same rate, RFC 1918
+  space only, a /22 at most. Nothing is asked over multicast there and no
+  MAC is read. Without the setting the agent answers `routed-off` and sends
+  nothing; a subnet outside private space is `not-private`. A subnet the
+  host is on is swept as before, whatever the setting.
+- **A watchdog on the loop.** On a systemd install the agent asks systemd to
+  restart it if its loop stops for 20 minutes (`WATCHDOG_USEC`, sent by the
+  agent; the unit gains only `NotifyAccess=main`). It is armed only where
+  systemd hears the request, so an older systemd, a container or FreeBSD
+  runs as before, without one.
+
+### Fixed
+
+- **A quick action can no longer hold the agent.** An action that left a
+  process running with its output still open (a daemon it started, `cmd &`
+  in a script) kept the agent waiting for that output to close, and a
+  timeout did not help, because only the action itself was killed. An action
+  now runs in its own process group, a timeout ends the whole group, and
+  once the action has exited its output is read for at most two more
+  seconds.
+- **Quick actions run beside the heartbeat, not in its place.** Actions ran
+  on the thread that sends heartbeats, in the sleep between two: one that
+  took a minute cost a host on a 10 s plan its beats, and it read Down while
+  the action ran. They now run on a thread of their own, one at a time, in
+  the order they were claimed.
+- **A mount that does not answer no longer stops the heartbeat.** Disk
+  totals were read on the heartbeat thread, and a network mount whose server
+  is gone blocks that read for minutes or for good. They are read on their
+  own thread: a heartbeat waits three seconds for them, then goes out with
+  the last numbers read.
+
+## [1.23.3] — 2026-11-10
+
+### Security
+
+- **SNMPv3: an answer has to be as secure as the request.** A reply was
+  checked for a MAC only when it said it carried one, so a reply claiming no
+  security at all, with the right message id, was read as the switch's own:
+  anyone on the path could write a switch's report. A Response now has to be
+  authenticated (and encrypted, with a privacy password); only a Report may
+  come without.
+- **Checks: an IPv4 address written as IPv6 is judged as IPv4.**
+  `::ffff:127.0.0.1`, `::ffff:169.254.169.254` and `::ffff:10.x.x.x` passed as
+  public targets, so a check could be pointed at loopback, a metadata service
+  or the LAN on a host that does not allow private targets.
+- **The update step's failure note never follows a link.** Root wrote
+  `/var/lib/connlog/update-failed` with a plain write in a directory the
+  service account owns: a link left there was written through, as root. The
+  note is now a new file or nothing, and the staged signature is read with a
+  cap like the staged binary.
+
+### Fixed
+
+- **Sweeps stay on the wire the host is on.** A host on a /24 asked for the
+  /22 around it swept the other three /24s through its gateway; a subnet
+  wider than the interface's own is now refused as `not-on-subnet`.
+- **A 410 is confirmed before the agent removes itself.** One 410 answer
+  uninstalled at once; it now takes three in a row, 30 seconds apart, as an
+  uninstall command already does.
+- **A DNS check ends after 5 seconds in all.** Each datagram that was not the
+  answer restarted the wait, so a resolver that kept sending them held the
+  checks thread and every later request was dropped as busy.
+- **Integration answers are read up to 8 MiB.** A device that kept sending a
+  body was buffered whole in the agent's process.
+
 ## [1.23.2] — 2026-11-02
 
 ### Changed

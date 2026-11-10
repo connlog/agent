@@ -3,6 +3,7 @@
 pub mod os_release;
 pub mod signals;
 pub mod unix;
+pub mod watchdog;
 pub use unix::*;
 
 /// How this agent was installed, and so how it is updated and configured

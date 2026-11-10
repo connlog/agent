@@ -16,6 +16,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Lets the agent be heard by systemd, and nothing more: with it the agent
+# asks for a watchdog on itself (platform/watchdog.rs), so a loop that stops
+# turning is restarted. Deliberately no WatchdogSec= here: that would arm
+# the watchdog even where the agent's messages do not arrive.
+NotifyAccess=main
 User=connlog-agent
 Group=connlog-agent
 EnvironmentFile=/etc/connlog/agent.conf

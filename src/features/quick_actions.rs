@@ -1067,15 +1067,20 @@ fn run_action(
     // A clean environment: the service process holds CONNLOG_TOKEN (and any
     // BMC password) from the EnvironmentFile, and an action that merely runs
     // `env` must not be able to read them back into the dashboard.
-    let mut child = match Command::new(&action.exec[0])
+    let mut command = Command::new(&action.exec[0]);
+    command
         .args(&action.exec[1..])
         .env_clear()
         .env("PATH", crate::platform::SAFE_PATH)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    // Its own process group, so a timeout ends what the action started and
+    // not only the action: killing the direct child alone left a shell's
+    // children running, still holding the pipes this function reads.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
             return QuickActionResultPayload {
@@ -1102,12 +1107,20 @@ fn run_action(
     let stdout_tx = shown.then(|| (0, tx.clone()));
     let stderr_tx = shown.then(|| (1, tx.clone()));
     drop(tx);
-    let stdout_handle = child.stdout.take().map(|stdout| {
-        thread::spawn(move || read_limited(stdout, HARD_MAX_OUTPUT_BYTES, stdout_tx))
-    });
-    let stderr_handle = child.stderr.take().map(|stderr| {
-        thread::spawn(move || read_limited(stderr, HARD_MAX_OUTPUT_BYTES, stderr_tx))
-    });
+    let stdout_kept = Kept::default();
+    let stderr_kept = Kept::default();
+    if let Some(stdout) = child.stdout.take() {
+        let kept = stdout_kept.clone();
+        thread::spawn(move || read_limited(stdout, HARD_MAX_OUTPUT_BYTES, stdout_tx, &kept));
+    } else {
+        stdout_kept.finish();
+    }
+    if let Some(stderr) = child.stderr.take() {
+        let kept = stderr_kept.clone();
+        thread::spawn(move || read_limited(stderr, HARD_MAX_OUTPUT_BYTES, stderr_tx, &kept));
+    } else {
+        stderr_kept.finish();
+    }
     let mut relay = Relay::new(request, action.max_output_bytes);
 
     let timeout = Duration::from_secs(action.timeout_seconds);
@@ -1118,7 +1131,7 @@ fn run_action(
             Ok(None) => {
                 if start.elapsed() >= timeout {
                     timed_out = true;
-                    let _ = child.kill();
+                    kill_group(&mut child);
                     break child.wait().ok();
                 }
                 relay.take(&rx);
@@ -1129,13 +1142,22 @@ fn run_action(
         }
     };
 
-    let (stdout_bytes, stdout_reader_truncated) = stdout_handle
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default();
-    let (stderr_bytes, stderr_reader_truncated) = stderr_handle
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default();
-    // The readers are done: what they sent last goes out now.
+    // The action is over; its pipes close when the last process holding them
+    // exits. That is normally at once, but something the action left running
+    // (a daemon it started, `cmd &` in a script) keeps them open for as long
+    // as it lives. Joining the readers waited for that, on the heartbeat
+    // thread: the host read Down until the leftover process ended. They get
+    // a moment to drain what is already written, and what they have kept by
+    // then is the output; a reader still blocked ends by itself later.
+    let drained = Instant::now() + READER_GRACE;
+    while !(stdout_kept.done() && stderr_kept.done()) && Instant::now() < drained {
+        relay.take(&rx);
+        relay.flush(false, on_output);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let (stdout_bytes, stdout_reader_truncated) = stdout_kept.snapshot();
+    let (stderr_bytes, stderr_reader_truncated) = stderr_kept.snapshot();
+    // What the readers sent last goes out now.
     relay.take(&rx);
     relay.flush(true, on_output);
 
@@ -1181,35 +1203,77 @@ fn run_action(
     }
 }
 
-/// Read a pipe to its end, keeping at most `limit` bytes; what is kept also
-/// goes to `relay`, tagged with its stream, when there is one.
-fn read_limited<R: Read>(mut reader: R, limit: usize, relay: Option<OutputTap>) -> (Vec<u8>, bool) {
-    let mut output = Vec::new();
-    let mut truncated = false;
-    let mut buffer = [0u8; 4096];
+/// How long the readers get to drain the pipes once the action has exited.
+const READER_GRACE: Duration = Duration::from_secs(2);
 
-    loop {
-        let read = match reader.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(_) => break,
-        };
-        if output.len() < limit {
-            let available = limit - output.len();
-            let take = available.min(read);
-            output.extend_from_slice(&buffer[..take]);
-            if let Some((stream, tx)) = &relay {
-                let _ = tx.send((*stream, buffer[..take].to_vec()));
-            }
-            if take < read {
-                truncated = true;
-            }
-        } else {
-            truncated = true;
-        }
+/// What a reader has kept of one stream so far, shared with `run_action` so
+/// it can take it without waiting for the pipe to close.
+#[derive(Clone, Default)]
+struct Kept(std::sync::Arc<std::sync::Mutex<KeptState>>);
+
+#[derive(Default)]
+struct KeptState {
+    bytes: Vec<u8>,
+    truncated: bool,
+    done: bool,
+}
+
+impl Kept {
+    fn with<T>(&self, f: impl FnOnce(&mut KeptState) -> T) -> T {
+        f(&mut self.0.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
-    (output, truncated)
+    fn finish(&self) {
+        self.with(|state| state.done = true);
+    }
+
+    fn done(&self) -> bool {
+        self.with(|state| state.done)
+    }
+
+    fn snapshot(&self) -> (Vec<u8>, bool) {
+        self.with(|state| (state.bytes.clone(), state.truncated))
+    }
+}
+
+/// Ends the action and everything it started: its process group on unix
+/// (the child leads one, see `run_action`), the child alone elsewhere.
+fn kill_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: a signal to the group this function's caller created; a
+        // group that is already gone answers ESRCH, which changes nothing.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+}
+
+/// Read a pipe to its end, keeping at most `limit` bytes in `kept`; what is
+/// kept also goes to `relay`, tagged with its stream, when there is one.
+fn read_limited<R: Read>(mut reader: R, limit: usize, relay: Option<OutputTap>, kept: &Kept) {
+    let mut buffer = [0u8; 4096];
+    loop {
+        let read = match reader.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        let taken = kept.with(|state| {
+            let take = limit.saturating_sub(state.bytes.len()).min(read);
+            state.bytes.extend_from_slice(&buffer[..take]);
+            if take < read {
+                state.truncated = true;
+            }
+            take
+        });
+        if taken > 0 {
+            if let Some((stream, tx)) = &relay {
+                let _ = tx.send((*stream, buffer[..taken].to_vec()));
+            }
+        }
+    }
+    kept.finish();
 }
 
 fn bound_output(
@@ -1408,6 +1472,55 @@ exec = ["printf", "abcdef"]
         assert_eq!(result.status, "success");
         assert_eq!(result.stdout.as_deref(), Some("abcd"));
         assert!(result.truncated);
+    }
+
+    #[test]
+    fn an_action_that_leaves_a_process_holding_its_output_still_returns() {
+        // The shell exits at once; the sleep it started keeps stdout open.
+        let registry = parse_config(
+            r#"
+[quick_actions.leftover]
+label = "Leftover"
+output_mode = "ephemeral"
+timeout_seconds = 20
+exec = ["sh", "-c", "echo started; sleep 30 &"]
+"#,
+        )
+        .expect("config parses");
+
+        let result = registry.execute(&request("leftover"));
+
+        assert_eq!(result.status, "success");
+        assert_eq!(result.stdout.as_deref(), Some("started\n"));
+        assert!(
+            result.duration_ms < 10_000,
+            "waited {} ms for a pipe the leftover process holds",
+            result.duration_ms
+        );
+    }
+
+    #[test]
+    fn a_timeout_ends_what_the_action_started_too() {
+        // The shell waits on a child that outlives any timeout and holds the pipes.
+        let registry = parse_config(
+            r#"
+[quick_actions.stuck]
+label = "Stuck"
+output_mode = "ephemeral"
+timeout_seconds = 1
+exec = ["sh", "-c", "sleep 300 & wait"]
+"#,
+        )
+        .expect("config parses");
+
+        let result = registry.execute(&request("stuck"));
+
+        assert_eq!(result.status, "timeout");
+        assert!(
+            result.duration_ms < 2_000,
+            "the group was not killed: the readers ran out their grace ({} ms)",
+            result.duration_ms
+        );
     }
 
     #[test]

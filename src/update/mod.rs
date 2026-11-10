@@ -538,7 +538,9 @@ fn apply_staged_update_inner() -> Result<Option<String>> {
             staged.len()
         );
     }
-    let sig = fs::read(STAGED_SIGNATURE).context("Failed to read the staged signature")?;
+    // Bounded like the binary: the service account owns this directory, and
+    // a link to an endless file here would otherwise be read whole, as root.
+    let sig = read_bounded(STAGED_SIGNATURE, 64).context("Failed to read the staged signature")?;
     if sig.len() != 64 {
         anyhow::bail!("staged signature has {} bytes, expected 64", sig.len());
     }
@@ -782,23 +784,42 @@ fn note_apply_failure(version: &str, err: &anyhow::Error) {
         unix_now_secs(),
         reason
     );
-    if let Err(write_err) = fs::write(UPDATE_FAILED_NOTE, note) {
+    if let Err(write_err) = write_note(Path::new(UPDATE_FAILED_NOTE), &note) {
         eprintln!(
             "ConnLog: could not record the failed update in {}: {}",
             UPDATE_FAILED_NOTE, write_err
         );
-        return;
     }
-    #[cfg(unix)]
-    {
-        // The state directory belongs to the service account; the note is
-        // root's, so make it readable for the agent that checks it.
-        if let Ok(meta) = fs::metadata(UPDATE_FAILED_NOTE) {
-            let mut perms = meta.permissions();
-            perms.set_mode(0o644);
-            let _ = fs::set_permissions(UPDATE_FAILED_NOTE, perms);
-        }
+}
+
+/// Writes root's note into the state directory, which the service account
+/// owns: a new file or nothing. `fs::write` followed whatever was at the
+/// path, so the account could leave a link there, ask for an update and have
+/// root overwrite the link's target (and make it world-readable) with text
+/// partly its own, the marker's `version=`.
+///
+/// The old note is unlinked (a link is removed, never followed) and the new
+/// one created with `O_EXCL | O_NOFOLLOW`; a link put back in between makes
+/// the create fail, and a note that is not written only costs a repeated
+/// download. Mode 0644: the agent that reads it is not root.
+fn write_note(path: &Path, note: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
     }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    file.write_all(note.as_bytes())?;
+    // The mode asked for is cut by root's umask; the reader is another user.
+    file.set_permissions(fs::Permissions::from_mode(0o644))
 }
 
 /// The reason a recent apply of `version` failed, if the note is younger than
@@ -1330,5 +1351,33 @@ mod tests {
             result.is_ok(),
             "uppercase hex from platform must be accepted: {upper_hex}"
         );
+    }
+
+    #[test]
+    fn roots_note_replaces_a_link_and_never_writes_through_it() {
+        let dir = std::env::temp_dir().join(format!("connlog-note-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        fs::write(&victim, "untouched").unwrap();
+        let note = dir.join("update-failed");
+        std::os::unix::fs::symlink(&victim, &note).unwrap();
+
+        write_note(&note, "version=1.2.3\n").unwrap();
+
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "untouched");
+        assert!(!fs::symlink_metadata(&note)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_to_string(&note).unwrap(), "version=1.2.3\n");
+        assert_eq!(
+            fs::metadata(&note).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        // And over an earlier note, as on a second failed update.
+        write_note(&note, "version=1.2.4\n").unwrap();
+        assert_eq!(fs::read_to_string(&note).unwrap(), "version=1.2.4\n");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

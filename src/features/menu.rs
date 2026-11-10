@@ -100,6 +100,7 @@ const SHOWN: &[&str] = &[
     "network-site",
     "network-map-ports",
     "probe-public",
+    "sweep-routed",
     "checks",
     "collector",
 ];

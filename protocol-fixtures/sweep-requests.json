@@ -31,6 +31,25 @@
         "mdns": false,
         "ssdp": false
       }
+    },
+    {
+      "description": "A subnet asked of one host by name, which may not be on it (agents from 1.24.0): `routed`. An older agent ignores the word and refuses a subnet it is not on.",
+      "request": {
+        "id": "swp_r",
+        "subnet": "10.0.30.0/24",
+        "ports": [22, 443],
+        "mdns": true,
+        "ssdp": true,
+        "routed": true
+      },
+      "read": {
+        "id": "swp_r",
+        "subnet": "10.0.30.0/24",
+        "ports": [22, 443],
+        "mdns": true,
+        "ssdp": true,
+        "routed": true
+      }
     }
   ],
   "invalid": [

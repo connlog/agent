@@ -175,7 +175,7 @@ step 2.
 
 Nothing to do. The platform's update proxy re-checks GitHub releases every
 ~10 minutes (`ARTIFACT_TTL_MS` in
-`apps/web/src/features/agents/server/agent-update-cache.ts`); agents
+`apps/web/src/features/servers/server/agent-update-cache.ts`); agents
 learn about the update in their next heartbeat response, verify the Ed25519
 signature against the compiled-in public key, and swap binaries via the
 systemd `ExecStopPost` hook. Downgrades and unsigned binaries are rejected

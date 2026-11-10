@@ -721,6 +721,197 @@
           }
         ]
       }
+    },
+    {
+      "description": "The same switch as a router: the networks it has an address in and its ARP table (agents from 1.24.0). A report without either reads as before.",
+      "upload": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "core",
+            "kind": "snmp",
+            "error": null,
+            "switch": {
+              "name": "sw-core",
+              "address": "10.0.0.2",
+              "ports": [
+                {
+                  "index": 1,
+                  "name": "ge-0/0/1",
+                  "description": "uplink to fw",
+                  "up": true,
+                  "speedMbps": 1000,
+                  "vlan": 1,
+                  "tagged": [20]
+                },
+                {
+                  "index": 2,
+                  "name": "ge-0/0/2",
+                  "description": null,
+                  "up": false,
+                  "speedMbps": null,
+                  "vlan": 20,
+                  "tagged": []
+                },
+                {
+                  "index": 3,
+                  "name": "Port 3",
+                  "description": null,
+                  "up": true,
+                  "speedMbps": null,
+                  "vlan": 1,
+                  "tagged": []
+                }
+              ],
+              "vlans": [
+                {
+                  "id": 1,
+                  "name": "default"
+                },
+                {
+                  "id": 20,
+                  "name": "IoT"
+                }
+              ],
+              "neighbours": [
+                {
+                  "port": 1,
+                  "chassisId": "00:1b:00:00:00:01",
+                  "portId": "igb1",
+                  "portDescription": "LAN",
+                  "systemName": "fw.lan"
+                }
+              ],
+              "macs": [
+                {
+                  "mac": "00:1b:00:00:00:01",
+                  "port": 1,
+                  "vlan": 1
+                },
+                {
+                  "mac": "a4:83:e7:01:02:03",
+                  "port": 2,
+                  "vlan": 20
+                }
+              ],
+              "arp": [
+                {
+                  "address": "10.0.0.1",
+                  "mac": "00:1b:00:00:00:01"
+                },
+                {
+                  "address": "10.0.20.57",
+                  "mac": "a4:83:e7:01:02:03"
+                }
+              ],
+              "networks": [
+                {
+                  "cidr": "10.0.0.2/24",
+                  "port": 1
+                },
+                {
+                  "cidr": "10.0.20.1/24",
+                  "port": 2
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "read": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "core",
+            "kind": "snmp",
+            "error": null,
+            "switch": {
+              "name": "sw-core",
+              "address": "10.0.0.2",
+              "ports": [
+                {
+                  "index": 1,
+                  "name": "ge-0/0/1",
+                  "description": "uplink to fw",
+                  "up": true,
+                  "speedMbps": 1000,
+                  "vlan": 1,
+                  "tagged": [20]
+                },
+                {
+                  "index": 2,
+                  "name": "ge-0/0/2",
+                  "description": null,
+                  "up": false,
+                  "speedMbps": null,
+                  "vlan": 20,
+                  "tagged": []
+                },
+                {
+                  "index": 3,
+                  "name": "Port 3",
+                  "description": null,
+                  "up": true,
+                  "speedMbps": null,
+                  "vlan": 1,
+                  "tagged": []
+                }
+              ],
+              "vlans": [
+                {
+                  "id": 1,
+                  "name": "default"
+                },
+                {
+                  "id": 20,
+                  "name": "IoT"
+                }
+              ],
+              "neighbours": [
+                {
+                  "port": 1,
+                  "chassisId": "00:1b:00:00:00:01",
+                  "portId": "igb1",
+                  "portDescription": "LAN",
+                  "systemName": "fw.lan"
+                }
+              ],
+              "macs": [
+                {
+                  "mac": "00:1b:00:00:00:01",
+                  "port": 1,
+                  "vlan": 1
+                },
+                {
+                  "mac": "a4:83:e7:01:02:03",
+                  "port": 2,
+                  "vlan": 20
+                }
+              ],
+              "arp": [
+                {
+                  "address": "10.0.0.1",
+                  "mac": "00:1b:00:00:00:01"
+                },
+                {
+                  "address": "10.0.20.57",
+                  "mac": "a4:83:e7:01:02:03"
+                }
+              ],
+              "networks": [
+                {
+                  "cidr": "10.0.0.2/24",
+                  "port": 1
+                },
+                {
+                  "cidr": "10.0.20.1/24",
+                  "port": 2
+                }
+              ]
+            }
+          }
+        ]
+      }
     }
   ],
   "invalid": [
@@ -1308,6 +1499,200 @@
               "nodes": [],
               "bridges": [],
               "guests": []
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "An ARP entry at a public address.",
+      "upload": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "core",
+            "kind": "snmp",
+            "error": null,
+            "switch": {
+              "name": "sw-core",
+              "address": "10.0.0.2",
+              "ports": [
+                {
+                  "index": 1,
+                  "name": "ge-0/0/1",
+                  "description": "uplink to fw",
+                  "up": true,
+                  "speedMbps": 1000,
+                  "vlan": 1,
+                  "tagged": [20]
+                },
+                {
+                  "index": 2,
+                  "name": "ge-0/0/2",
+                  "description": null,
+                  "up": false,
+                  "speedMbps": null,
+                  "vlan": 20,
+                  "tagged": []
+                },
+                {
+                  "index": 3,
+                  "name": "Port 3",
+                  "description": null,
+                  "up": true,
+                  "speedMbps": null,
+                  "vlan": 1,
+                  "tagged": []
+                }
+              ],
+              "vlans": [
+                {
+                  "id": 1,
+                  "name": "default"
+                },
+                {
+                  "id": 20,
+                  "name": "IoT"
+                }
+              ],
+              "neighbours": [
+                {
+                  "port": 1,
+                  "chassisId": "00:1b:00:00:00:01",
+                  "portId": "igb1",
+                  "portDescription": "LAN",
+                  "systemName": "fw.lan"
+                }
+              ],
+              "macs": [
+                {
+                  "mac": "00:1b:00:00:00:01",
+                  "port": 1,
+                  "vlan": 1
+                },
+                {
+                  "mac": "a4:83:e7:01:02:03",
+                  "port": 2,
+                  "vlan": 20
+                }
+              ],
+              "arp": [
+                {
+                  "address": "203.0.113.1",
+                  "mac": "00:1b:00:00:00:01"
+                },
+                {
+                  "address": "10.0.20.57",
+                  "mac": "a4:83:e7:01:02:03"
+                }
+              ],
+              "networks": [
+                {
+                  "cidr": "10.0.0.2/24",
+                  "port": 1
+                },
+                {
+                  "cidr": "10.0.20.1/24",
+                  "port": 2
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "A network that is not an address with its prefix length.",
+      "upload": {
+        "version": 1,
+        "integrations": [
+          {
+            "name": "core",
+            "kind": "snmp",
+            "error": null,
+            "switch": {
+              "name": "sw-core",
+              "address": "10.0.0.2",
+              "ports": [
+                {
+                  "index": 1,
+                  "name": "ge-0/0/1",
+                  "description": "uplink to fw",
+                  "up": true,
+                  "speedMbps": 1000,
+                  "vlan": 1,
+                  "tagged": [20]
+                },
+                {
+                  "index": 2,
+                  "name": "ge-0/0/2",
+                  "description": null,
+                  "up": false,
+                  "speedMbps": null,
+                  "vlan": 20,
+                  "tagged": []
+                },
+                {
+                  "index": 3,
+                  "name": "Port 3",
+                  "description": null,
+                  "up": true,
+                  "speedMbps": null,
+                  "vlan": 1,
+                  "tagged": []
+                }
+              ],
+              "vlans": [
+                {
+                  "id": 1,
+                  "name": "default"
+                },
+                {
+                  "id": 20,
+                  "name": "IoT"
+                }
+              ],
+              "neighbours": [
+                {
+                  "port": 1,
+                  "chassisId": "00:1b:00:00:00:01",
+                  "portId": "igb1",
+                  "portDescription": "LAN",
+                  "systemName": "fw.lan"
+                }
+              ],
+              "macs": [
+                {
+                  "mac": "00:1b:00:00:00:01",
+                  "port": 1,
+                  "vlan": 1
+                },
+                {
+                  "mac": "a4:83:e7:01:02:03",
+                  "port": 2,
+                  "vlan": 20
+                }
+              ],
+              "arp": [
+                {
+                  "address": "10.0.0.1",
+                  "mac": "00:1b:00:00:00:01"
+                },
+                {
+                  "address": "10.0.20.57",
+                  "mac": "a4:83:e7:01:02:03"
+                }
+              ],
+              "networks": [
+                {
+                  "cidr": "10.0.0.2",
+                  "port": 1
+                },
+                {
+                  "cidr": "10.0.20.1/24",
+                  "port": 2
+                }
+              ]
             }
           }
         ]

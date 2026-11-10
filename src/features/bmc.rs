@@ -1301,7 +1301,7 @@ mod tests {
     //
     // Pins the JSON shape consumed by the platform's
     // `hardwareHealthReportSchema` in
-    // `../connlog-platform/src/features/agents/server/services/hardware-health.service.ts`.
+    // `apps/web/src/features/servers/server/services/hardware-health.service.ts`.
     // Change both sides in the same PR or ingestion breaks.
 
     #[test]

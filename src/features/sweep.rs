@@ -7,8 +7,9 @@
 //! The agent bounds what it does, whatever it is told. Compiled in, not
 //! configuration:
 //!
-//! - an IPv4 subnet this host has an address in, at most a /22 (1,022
-//!   addresses); IPv6 is never swept;
+//! - an IPv4 subnet this host has an address in, no wider than that
+//!   interface's own subnet and at most a /22 (1,022 addresses); IPv6 is
+//!   never swept;
 //! - at most 64 addresses started a second, at most 32 in flight;
 //! - per address, an ICMP echo (an unprivileged ping socket, skipped where
 //!   the kernel does not allow one) and TCP handshakes to at most 8 ports,
@@ -71,6 +72,9 @@ pub struct SweepRequest {
     pub ports: Vec<u16>,
     pub mdns: bool,
     pub ssdp: bool,
+    /// Asked of this host by name for a subnet it may not be on: swept
+    /// through its gateway where the host allows that (`run_with`).
+    pub routed: bool,
 }
 
 impl SweepRequest {
@@ -98,6 +102,7 @@ impl SweepRequest {
             ports,
             mdns: value.get("mdns").and_then(Value::as_bool) == Some(true),
             ssdp: value.get("ssdp").and_then(Value::as_bool) == Some(true),
+            routed: value.get("routed").and_then(Value::as_bool) == Some(true),
         })
     }
 
@@ -116,6 +121,11 @@ pub enum Refusal {
     NotOnSubnet,
     /// Larger than a /22.
     TooLarge,
+    /// A subnet the host is not on, asked for by name, on a host that does
+    /// not allow sweeps beyond its own subnets (CONNLOG_SWEEP_ROUTED).
+    RoutedOff,
+    /// A subnet the host is not on that is outside RFC 1918: never swept.
+    NotPrivate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -131,6 +141,14 @@ pub struct Found {
     pub ports: Vec<u16>,
     pub mdns: Vec<String>,
     pub ssdp: Option<Ssdp>,
+    /// Its MAC, lowercase `aa:bb:cc:dd:ee:ff`, where this host's neighbour
+    /// table holds one for the address once the sweep is over. It is what
+    /// makes the answer a device on the map at once: without it the platform
+    /// had to wait for the next inventory to pair the address with a MAC,
+    /// and a busy subnet's table may have dropped the entry by then. Left
+    /// out when unknown, so an answer without it reads as it always did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -167,9 +185,13 @@ pub fn targets(
     }
     let m = mask(request.prefix);
     let base = u32::from(request.network) & m;
+    // On the subnet means on-link for all of it: an address inside the asked
+    // range, on an interface whose own subnet is at least as wide. Matching
+    // on the request's mask alone let a host on a /24 be asked for the /22
+    // around it, and it swept three subnets it is not on through its gateway.
     let local = own
         .iter()
-        .find(|(ip, _)| u32::from(*ip) & m == base)
+        .find(|(ip, prefix)| u32::from(*ip) & m == base && *prefix <= request.prefix)
         .map(|(ip, _)| *ip)
         .ok_or(Refusal::NotOnSubnet)?;
     let last = base | !m;
@@ -202,8 +224,8 @@ pub trait Asker: Sync {
     /// handshakes (T13.5c): every one made the kernel ask, so a device that
     /// answered ARP is there even when it drops the echo and every port.
     /// What a host without ping (an unprivileged agent on a firewall) finds
-    /// devices by.
-    fn answered_arp(&self) -> Vec<Ipv4Addr>;
+    /// devices by, each with its MAC.
+    fn answered_arp(&self) -> Vec<(Ipv4Addr, String)>;
 }
 
 /// What one address said to the echo and the handshakes.
@@ -232,6 +254,7 @@ fn probe_address(prober: &dyn Prober, address: Ipv4Addr, ports: &[u16]) -> Optio
         ports: open,
         mdns: Vec::new(),
         ssdp: None,
+        mac: None,
     })
 }
 
@@ -387,13 +410,65 @@ fn found_at(found: &mut BTreeMap<Ipv4Addr, Found>, ip: Ipv4Addr) -> &mut Found {
         ports: Vec::new(),
         mdns: Vec::new(),
         ssdp: None,
+        mac: None,
     })
 }
 
-/// Run a request at `level`, from a host with the IPv4 addresses `own`.
+/// RFC 1918: the only space swept through a gateway. Not shared address
+/// space (100.64/10: a carrier's other customers), not link-local.
+fn rfc1918(ip: Ipv4Addr) -> bool {
+    let [a, b, ..] = ip.octets();
+    a == 10 || (a == 172 && (16..=31).contains(&b)) || (a == 192 && b == 168)
+}
+
+/// Every address of a subnet the host is not on, for a routed sweep: only
+/// where the host allows one, only RFC 1918, a /22 at most as ever.
+pub fn routed_targets(request: &SweepRequest, allowed: bool) -> Result<Vec<Ipv4Addr>, Refusal> {
+    if request.prefix < MIN_PREFIX {
+        return Err(Refusal::TooLarge);
+    }
+    if !allowed {
+        return Err(Refusal::RoutedOff);
+    }
+    let m = mask(request.prefix);
+    let base = u32::from(request.network) & m;
+    let last = base | !m;
+    if !(rfc1918(Ipv4Addr::from(base)) && rfc1918(Ipv4Addr::from(last))) {
+        return Err(Refusal::NotPrivate);
+    }
+    let (first, end) = if request.prefix >= 31 {
+        (base, last)
+    } else {
+        (base + 1, last - 1)
+    };
+    Ok((first..=end).map(Ipv4Addr::from).collect())
+}
+
+/// Run a request at `level`, from a host with the IPv4 addresses `own`,
+/// that does not allow sweeps beyond its own subnets.
+#[cfg(test)]
 pub fn run(
     request: &SweepRequest,
     level: DiscoveryLevel,
+    own: &[(Ipv4Addr, u8)],
+    prober: &dyn Prober,
+    asker: &dyn Asker,
+) -> SweepResults {
+    run_with(request, level, false, own, prober, asker)
+}
+
+/// Run a request at `level`, from a host with the IPv4 addresses `own`.
+///
+/// A subnet the host is on is swept as ever. One it is not on is swept only
+/// when the request says it was asked of this host by name (`routed`) and
+/// the host's root allows it (`routed_allowed`, CONNLOG_SWEEP_ROUTED): the
+/// echo and the handshakes then go through the gateway. Nothing is asked
+/// over multicast there, which does not cross a router, and no MAC is read:
+/// the neighbour table holds the gateway's for all of it.
+pub fn run_with(
+    request: &SweepRequest,
+    level: DiscoveryLevel,
+    routed_allowed: bool,
     own: &[(Ipv4Addr, u8)],
     prober: &dyn Prober,
     asker: &dyn Asker,
@@ -411,6 +486,18 @@ pub fn run(
     }
     let (local, addresses) = match targets(request, own) {
         Ok(planned) => planned,
+        Err(Refusal::NotOnSubnet) if request.routed => {
+            match routed_targets(request, routed_allowed) {
+                Ok(addresses) => {
+                    results.found = sweep_addresses(prober, &addresses, &request.ports);
+                    results
+                        .found
+                        .sort_by_key(|f| f.address.parse::<Ipv4Addr>().ok());
+                }
+                Err(refusal) => results.refused = Some(refusal),
+            }
+            return results;
+        }
         Err(refusal) => {
             results.refused = Some(refusal);
             return results;
@@ -422,11 +509,6 @@ pub fn run(
         .into_iter()
         .filter_map(|f| Some((f.address.parse().ok()?, f)))
         .collect();
-    for ip in asker.answered_arp() {
-        if inside(&ip) {
-            found_at(&mut found, ip);
-        }
-    }
     if request.mdns {
         for (ip, packet) in asker.ask(local, MDNS, &mdns_query(), LISTEN) {
             let services = mdns_services(&packet);
@@ -457,6 +539,13 @@ pub fn run(
                     }
                 }
             }
+        }
+    }
+    // Read last: the handshakes and the announcements above are what put
+    // these entries in the kernel's table.
+    for (ip, mac) in asker.answered_arp() {
+        if inside(&ip) {
+            found_at(&mut found, ip).mac = Some(mac);
         }
     }
     results.found = found.into_values().collect();
@@ -516,10 +605,10 @@ impl Asker for SystemAsker {
         out
     }
 
-    fn answered_arp(&self) -> Vec<Ipv4Addr> {
+    fn answered_arp(&self) -> Vec<(Ipv4Addr, String)> {
         crate::features::neighbours::neighbours()
             .into_iter()
-            .filter_map(|n| n.address.parse().ok())
+            .filter_map(|n| Some((n.address.parse().ok()?, n.mac)))
             .collect()
     }
 }
@@ -594,6 +683,18 @@ mod tests {
             ),
             Err(Refusal::TooLarge)
         );
+        // A /24 host asked for the /22 around it: three of those four /24s
+        // are behind its gateway, not on its wire.
+        assert_eq!(
+            targets(&request("10.0.20.0/22", json!([])), &OWN),
+            Err(Refusal::NotOnSubnet)
+        );
+        // A host on a /16 asked for the /22 around its address: all on-link.
+        assert!(targets(
+            &request("10.0.20.0/22", json!([])),
+            &[(Ipv4Addr::new(10, 0, 20, 2), 16)]
+        )
+        .is_ok());
         let own = [(Ipv4Addr::new(10, 0, 0, 2), 22)];
         assert_eq!(
             targets(&request("10.0.0.0/22", json!([])), &own)
@@ -692,7 +793,7 @@ mod tests {
             }
         }
 
-        fn answered_arp(&self) -> Vec<Ipv4Addr> {
+        fn answered_arp(&self) -> Vec<(Ipv4Addr, String)> {
             Vec::new()
         }
     }
@@ -712,12 +813,12 @@ mod tests {
             Link.ask(local, group, query, wait)
         }
 
-        fn answered_arp(&self) -> Vec<Ipv4Addr> {
+        fn answered_arp(&self) -> Vec<(Ipv4Addr, String)> {
             vec![
-                Ipv4Addr::new(10, 0, 20, 60),
-                Ipv4Addr::new(10, 0, 20, 1),
-                Ipv4Addr::new(10, 0, 20, 2),
-                Ipv4Addr::new(192, 168, 1, 9),
+                (Ipv4Addr::new(10, 0, 20, 60), "00:11:32:aa:bb:60".into()),
+                (Ipv4Addr::new(10, 0, 20, 1), "3c:ec:ef:00:00:01".into()),
+                (Ipv4Addr::new(10, 0, 20, 2), "52:54:00:00:00:02".into()),
+                (Ipv4Addr::new(192, 168, 1, 9), "00:11:32:aa:bb:09".into()),
             ]
         }
     }
@@ -772,6 +873,81 @@ mod tests {
     }
 
     #[test]
+    fn sweeps_a_subnet_it_is_not_on_only_when_asked_by_name_and_allowed() {
+        let hosts = Hosts(HashMap::from([
+            (Ipv4Addr::new(10, 0, 30, 7), (true, vec![443], vec![])),
+            (Ipv4Addr::new(10, 0, 30, 9), (false, vec![], vec![22])),
+        ]));
+        let mut asked = request("10.0.30.0/24", json!([22, 443]));
+        let active = DiscoveryLevel::Active;
+
+        // Not asked of this host by name: refused as ever, whatever it allows.
+        let plain = run_with(&asked, active, true, &OWN, &hosts, &LinkWithArp);
+        assert_eq!(plain.refused, Some(Refusal::NotOnSubnet));
+
+        asked.routed = true;
+        let off = run_with(&asked, active, false, &OWN, &hosts, &LinkWithArp);
+        assert_eq!(off.refused, Some(Refusal::RoutedOff));
+        assert!(off.found.is_empty());
+
+        let swept = run_with(&asked, active, true, &OWN, &hosts, &LinkWithArp);
+        assert_eq!(swept.refused, None);
+        let found: Vec<(&str, bool, &[u16], bool)> = swept
+            .found
+            .iter()
+            .map(|f| {
+                (
+                    f.address.as_str(),
+                    f.icmp,
+                    f.ports.as_slice(),
+                    f.mac.is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("10.0.30.7", true, &[443][..], false),
+                ("10.0.30.9", false, &[][..], false),
+            ],
+            "what answered through the gateway: no MAC, nothing over multicast"
+        );
+
+        // Below active nothing is sent, routed or not.
+        let passive = run_with(
+            &asked,
+            DiscoveryLevel::Passive,
+            true,
+            &OWN,
+            &hosts,
+            &LinkWithArp,
+        );
+        assert_eq!(passive.refused, Some(Refusal::NotActive));
+    }
+
+    #[test]
+    fn a_routed_sweep_is_of_private_space_a_22_at_most() {
+        let mut public = request("203.0.113.0/24", json!([]));
+        public.routed = true;
+        assert_eq!(routed_targets(&public, true), Err(Refusal::NotPrivate));
+        let mut carrier = request("100.64.0.0/24", json!([]));
+        carrier.routed = true;
+        assert_eq!(routed_targets(&carrier, true), Err(Refusal::NotPrivate));
+        let mut wide = request("10.0.0.0/21", json!([]));
+        wide.routed = true;
+        assert_eq!(routed_targets(&wide, true), Err(Refusal::TooLarge));
+        let mut edge = request("172.31.252.0/22", json!([]));
+        edge.routed = true;
+        assert_eq!(routed_targets(&edge, true).unwrap().len(), 1022);
+        assert_eq!(routed_targets(&edge, false), Err(Refusal::RoutedOff));
+        // A subnet the host is on is swept on the wire, with its MACs, routed or not.
+        let mut own = request("10.0.20.0/24", json!([]));
+        own.routed = true;
+        let (local, _) = targets(&own, &OWN).unwrap();
+        assert_eq!(local, Ipv4Addr::new(10, 0, 20, 2));
+    }
+
+    #[test]
     fn below_active_sends_nothing_at_all() {
         struct Nothing;
         impl Prober for Nothing {
@@ -792,7 +968,7 @@ mod tests {
             ) -> Vec<(Ipv4Addr, Vec<u8>)> {
                 panic!("no multicast below active")
             }
-            fn answered_arp(&self) -> Vec<Ipv4Addr> {
+            fn answered_arp(&self) -> Vec<(Ipv4Addr, String)> {
                 panic!("nothing read below active")
             }
         }
@@ -857,6 +1033,12 @@ mod tests {
             assert_eq!(ports, want_ports, "{}", case["description"]);
             assert_eq!(read.mdns, want["mdns"].as_bool().unwrap());
             assert_eq!(read.ssdp, want["ssdp"].as_bool().unwrap());
+            assert_eq!(
+                read.routed,
+                want["routed"].as_bool().unwrap_or(false),
+                "{}",
+                case["description"]
+            );
         }
         for case in requests["invalid"].as_array().unwrap() {
             assert_eq!(
@@ -886,6 +1068,26 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&ran).unwrap(),
             results["valid"][0]["upload"]
+        );
+        let with_macs = run(
+            &request("10.0.20.0/24", json!([22, 53, 443, 631])),
+            DiscoveryLevel::Active,
+            &OWN,
+            &hosts,
+            &LinkWithArp,
+        );
+        assert_eq!(
+            serde_json::to_value(&with_macs).unwrap(),
+            results["valid"][2]["upload"]
+        );
+        // Asked by name for a subnet it is not on, on a host that does not allow it.
+        let mut by_name = request("10.0.30.0/24", json!([]));
+        by_name.id = "swp_r".into();
+        by_name.routed = true;
+        let off = run(&by_name, DiscoveryLevel::Active, &OWN, &hosts, &Link);
+        assert_eq!(
+            serde_json::to_value(&off).unwrap(),
+            results["valid"][3]["upload"]
         );
         let mut elsewhere = request("10.0.30.0/24", json!([]));
         elsewhere.id = "swp_6".into();

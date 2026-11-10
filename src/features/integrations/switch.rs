@@ -24,6 +24,9 @@ pub const MAX_VLANS: usize = 1024;
 pub const MAX_NEIGHBOURS: usize = 512;
 pub const MAX_MACS: usize = 16_384;
 const MAX_TAGGED: usize = 64;
+/// `SWITCH_MAX_ARP` and `SWITCH_MAX_NETWORKS` in the protocol.
+pub const MAX_ARP: usize = 4096;
+pub const MAX_NETWORKS: usize = 256;
 const TEXT_MAX: usize = 128;
 /// One read stops walking after this: what is read so far is reported.
 const READ_BUDGET: Duration = Duration::from_secs(90);
@@ -42,6 +45,13 @@ const Q_VLAN_EGRESS: [u32; 13] = [1, 3, 6, 1, 2, 1, 17, 7, 1, 4, 2, 1, 4];
 const Q_VLAN_UNTAGGED: [u32; 13] = [1, 3, 6, 1, 2, 1, 17, 7, 1, 4, 2, 1, 5];
 const Q_VLAN_STATIC_NAME: [u32; 13] = [1, 3, 6, 1, 2, 1, 17, 7, 1, 4, 3, 1, 1];
 const Q_PVID: [u32; 13] = [1, 3, 6, 1, 2, 1, 17, 7, 1, 4, 5, 1, 1];
+/// ipNetToPhysicalPhysAddress (IP-MIB, RFC 4293): index (ifIndex, type, address).
+const IP_NET_TO_PHYSICAL: [u32; 10] = [1, 3, 6, 1, 2, 1, 4, 35, 1, 4];
+/// ipNetToMediaPhysAddress, the older table every router still has: index (ifIndex, a.b.c.d).
+const IP_NET_TO_MEDIA: [u32; 10] = [1, 3, 6, 1, 2, 1, 4, 22, 1, 2];
+/// ipAdEntIfIndex and ipAdEntNetMask: the device's own addresses, index a.b.c.d.
+const IP_AD_ENT_IF_INDEX: [u32; 10] = [1, 3, 6, 1, 2, 1, 4, 20, 1, 2];
+const IP_AD_ENT_NET_MASK: [u32; 10] = [1, 3, 6, 1, 2, 1, 4, 20, 1, 3];
 const LLDP_LOC_PORT_ID: [u32; 11] = [1, 0, 8802, 1, 1, 2, 1, 3, 7, 1, 3];
 const LLDP_REM: [u32; 10] = [1, 0, 8802, 1, 1, 2, 1, 4, 1, 1];
 /// softwareLoopback: never a port.
@@ -90,6 +100,22 @@ pub struct Learned {
     pub vlan: Option<u16>,
 }
 
+/// An address the device holds a MAC for: a row of its ARP table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArpEntry {
+    pub address: String,
+    pub mac: String,
+}
+
+/// A network the device has an address in: what it routes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Network {
+    /// Its own address there with the prefix length: `10.0.20.1/24`.
+    pub cidr: String,
+    /// The ifIndex of the interface the address is on.
+    pub port: Option<u32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Report {
     /// sysName.
@@ -100,6 +126,16 @@ pub struct Report {
     pub vlans: Vec<Vlan>,
     pub neighbours: Vec<Neighbour>,
     pub macs: Vec<Learned>,
+    /// A router's or layer-3 switch's ARP table, private addresses only: the
+    /// address of each MAC, on every VLAN it routes. It is how a device on a
+    /// network no server is on gets an address on the map. Left out when the
+    /// device has none (a plain layer-2 switch holds its management
+    /// neighbours at most), so such a report reads as it always did.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub arp: Vec<ArpEntry>,
+    /// The private networks it has an address in, each with its interface.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub networks: Vec<Network>,
 }
 
 /// What reading a switch asks of SNMP.
@@ -297,6 +333,8 @@ pub fn read(mib: &mut dyn Mib) -> Result<Report, Failure> {
 
     let neighbours = read_lldp(&mut r, &ports, &if_of)?;
     let macs = read_fdb(&mut r, &vlans, &if_of)?;
+    let networks = read_networks(&mut r)?;
+    let arp = read_arp(&mut r)?;
 
     Ok(Report {
         name,
@@ -309,7 +347,84 @@ pub fn read(mib: &mut dyn Mib) -> Result<Report, Failure> {
             .collect(),
         neighbours,
         macs,
+        arp,
+        networks,
     })
+}
+
+fn private_v4(arcs: &[u32]) -> Option<std::net::Ipv4Addr> {
+    let [a, b, c, d] = arcs else { return None };
+    let octet = |n: &u32| u8::try_from(*n).ok();
+    let ip = std::net::Ipv4Addr::new(octet(a)?, octet(b)?, octet(c)?, octet(d)?);
+    crate::features::reachability::is_private(&std::net::IpAddr::V4(ip)).then_some(ip)
+}
+
+/// The device's own private IPv4 addresses with their masks (ipAddrTable):
+/// the networks it routes. A mask that is not a run of ones is left out.
+fn read_networks(r: &mut Reader<'_>) -> Result<Vec<Network>, Failure> {
+    let ports: HashMap<Vec<u32>, u32> = r
+        .walk(&IP_AD_ENT_IF_INDEX, MAX_NETWORKS)?
+        .into_iter()
+        .filter_map(|(oid, v)| {
+            let index = index_of(&oid, &IP_AD_ENT_IF_INDEX)?.to_vec();
+            Some((index, u32::try_from(v.as_int()?).ok()?))
+        })
+        .collect();
+    let mut networks: Vec<Network> = r
+        .walk(&IP_AD_ENT_NET_MASK, MAX_NETWORKS)?
+        .into_iter()
+        .filter_map(|(oid, v)| {
+            let index = index_of(&oid, &IP_AD_ENT_NET_MASK)?;
+            let ip = private_v4(index)?;
+            let Value::Ip(mask) = v else { return None };
+            let mask = u32::from_be_bytes(mask);
+            let prefix = mask.leading_ones();
+            // Contiguous, and a network others share: not a /31, /32 or /0.
+            (mask.count_ones() == prefix && (1..=30).contains(&prefix)).then(|| Network {
+                cidr: format!("{ip}/{prefix}"),
+                port: ports.get(index).copied(),
+            })
+        })
+        .collect();
+    networks.sort_by(|a, b| a.cidr.cmp(&b.cidr));
+    networks.truncate(MAX_NETWORKS);
+    Ok(networks)
+}
+
+/// The ARP table: ipNetToPhysicalTable's IPv4 rows, else ipNetToMediaTable.
+/// Private addresses only, as the host's own neighbour table is sent; a
+/// group or all-zero MAC is no device. Each address once.
+fn read_arp(r: &mut Reader<'_>) -> Result<Vec<ArpEntry>, Failure> {
+    fn add(seen: &mut BTreeMap<std::net::Ipv4Addr, String>, address: &[u32], v: &Value) {
+        let mac = v
+            .as_bytes()
+            .filter(|b| b.len() == 6 && b[0] & 1 == 0 && b.iter().any(|x| *x != 0));
+        if let (Some(ip), Some(mac)) = (private_v4(address), mac.and_then(mac_of)) {
+            seen.entry(ip).or_insert(mac);
+        }
+    }
+    let mut seen = BTreeMap::new();
+    for (oid, v) in r.walk(&IP_NET_TO_PHYSICAL, MAX_ARP * 2)? {
+        // (ifIndex, ipv4(1), length 4, a, b, c, d)
+        if let Some([_, 1, 4, address @ ..]) = index_of(&oid, &IP_NET_TO_PHYSICAL) {
+            add(&mut seen, address, &v);
+        }
+    }
+    if seen.is_empty() {
+        for (oid, v) in r.walk(&IP_NET_TO_MEDIA, MAX_ARP)? {
+            if let Some([_, address @ ..]) = index_of(&oid, &IP_NET_TO_MEDIA) {
+                add(&mut seen, address, &v);
+            }
+        }
+    }
+    Ok(seen
+        .into_iter()
+        .take(MAX_ARP)
+        .map(|(ip, mac)| ArpEntry {
+            address: ip.to_string(),
+            mac,
+        })
+        .collect())
 }
 
 /// lldpRemTable, its rows keyed (timeMark, localPortNum, index); the local
@@ -602,6 +717,137 @@ mod tests {
         assert_eq!(json["ports"][0]["speedMbps"], 1000);
         assert_eq!(json["neighbours"][0]["chassisId"], "00:1b:00:00:00:01");
         assert_eq!(json["neighbours"][0]["systemName"], "fw.lan");
+    }
+
+    /// `switch()` as a layer-3 switch: an address in two VLANs and an ARP table.
+    fn router() -> Vec<(Vec<u32>, Value)> {
+        let mut rows = switch();
+        rows.extend([
+            (oid(&IP_AD_ENT_IF_INDEX, &[10, 0, 20, 1]), Value::Integer(2)),
+            (
+                oid(&IP_AD_ENT_NET_MASK, &[10, 0, 20, 1]),
+                Value::Ip([255, 255, 255, 0]),
+            ),
+            (oid(&IP_AD_ENT_IF_INDEX, &[10, 0, 0, 2]), Value::Integer(1)),
+            (
+                oid(&IP_AD_ENT_NET_MASK, &[10, 0, 0, 2]),
+                Value::Ip([255, 255, 255, 0]),
+            ),
+            // Its loopback, a public address and a mask with a hole: none is a network.
+            (
+                oid(&IP_AD_ENT_NET_MASK, &[127, 0, 0, 1]),
+                Value::Ip([255, 0, 0, 0]),
+            ),
+            (
+                oid(&IP_AD_ENT_NET_MASK, &[203, 0, 113, 2]),
+                Value::Ip([255, 255, 255, 248]),
+            ),
+            (
+                oid(&IP_AD_ENT_NET_MASK, &[10, 9, 9, 1]),
+                Value::Ip([255, 0, 255, 0]),
+            ),
+            // ARP: a phone in VLAN 20, the firewall, a public next hop, a multicast MAC.
+            (
+                oid(&IP_NET_TO_MEDIA, &[2, 10, 0, 20, 57]),
+                Value::Bytes(vec![0xa4, 0x83, 0xe7, 1, 2, 3]),
+            ),
+            (
+                oid(&IP_NET_TO_MEDIA, &[1, 10, 0, 0, 1]),
+                Value::Bytes(vec![0, 0x1b, 0, 0, 0, 1]),
+            ),
+            (
+                oid(&IP_NET_TO_MEDIA, &[1, 203, 0, 113, 1]),
+                Value::Bytes(vec![0, 0x1b, 0, 0, 0, 9]),
+            ),
+            (
+                oid(&IP_NET_TO_MEDIA, &[2, 10, 0, 20, 99]),
+                Value::Bytes(vec![1, 0, 0x5e, 0, 0, 1]),
+            ),
+        ]);
+        rows
+    }
+
+    #[test]
+    fn reads_a_routers_networks_and_arp_table() {
+        let report = read_switch(router()).unwrap();
+        assert_eq!(
+            report.networks,
+            [
+                Network {
+                    cidr: "10.0.0.2/24".into(),
+                    port: Some(1)
+                },
+                Network {
+                    cidr: "10.0.20.1/24".into(),
+                    port: Some(2)
+                },
+            ]
+        );
+        assert_eq!(
+            report.arp,
+            [
+                ArpEntry {
+                    address: "10.0.0.1".into(),
+                    mac: "00:1b:00:00:00:01".into()
+                },
+                ArpEntry {
+                    address: "10.0.20.57".into(),
+                    mac: "a4:83:e7:01:02:03".into()
+                },
+            ],
+            "private addresses and real MACs only"
+        );
+    }
+
+    #[test]
+    fn prefers_the_newer_arp_table_and_reads_only_its_ipv4_rows() {
+        let mut rows = router();
+        rows.extend([
+            (
+                oid(&IP_NET_TO_PHYSICAL, &[2, 1, 4, 10, 0, 20, 58]),
+                Value::Bytes(vec![0, 0x17, 0x88, 1, 2, 3]),
+            ),
+            // An IPv6 row: (ifIndex, ipv6(2), length 16, …).
+            (
+                oid(
+                    &IP_NET_TO_PHYSICAL,
+                    &[
+                        2, 2, 16, 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ],
+                ),
+                Value::Bytes(vec![0, 0x17, 0x88, 1, 2, 4]),
+            ),
+        ]);
+        let report = read_switch(rows).unwrap();
+        assert_eq!(
+            report.arp,
+            [ArpEntry {
+                address: "10.0.20.58".into(),
+                mac: "00:17:88:01:02:03".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_plain_switch_reports_neither() {
+        let json = serde_json::to_value(read_switch(switch()).unwrap()).unwrap();
+        assert!(json.get("arp").is_none() && json.get("networks").is_none());
+    }
+
+    #[test]
+    fn writes_a_routers_report_as_the_shared_fixture_holds_it() {
+        let fixtures: serde_json::Value =
+            serde_json::from_str(protocol_fixture!("integration-reports.json")).unwrap();
+        let expected = fixtures["valid"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["upload"]["integrations"][0]["switch"]["arp"].is_array())
+            .map(|f| f["upload"]["integrations"][0]["switch"].clone())
+            .expect("a fixture with an ARP table");
+        let mut report = read_switch(router()).unwrap();
+        report.address = Some("10.0.0.2".into());
+        assert_eq!(serde_json::to_value(report).unwrap(), expected);
     }
 
     #[test]

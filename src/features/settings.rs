@@ -11,7 +11,7 @@ use crate::features::discovery::{DiscoveryLevel, CONF_DISCOVERY};
 use crate::features::integrations::CONF_COLLECTOR;
 use crate::features::network_map::{
     parse_ports, parse_site, CONF_NETWORK_MAP, CONF_NETWORK_MAP_PORTS, CONF_NETWORK_SITE,
-    CONF_PROBE_PUBLIC,
+    CONF_PROBE_PUBLIC, CONF_SWEEP_ROUTED,
 };
 use crate::install::conf::Host;
 
@@ -111,6 +111,14 @@ pub const SETTINGS: &[Setting] = &[
         title: "Public probes",
         about: "Let reachability tests reach public addresses",
         sends: "Reachability tests may reach public addresses too, not only private ones.",
+    },
+    Setting {
+        name: "sweep-routed",
+        key: CONF_SWEEP_ROUTED,
+        kind: Kind::Switch { strict: true },
+        title: "Sweeps beyond this host's subnets",
+        about: "Let a sweep reach a private subnet this host is not on",
+        sends: "At the active level, when a subnet is listed in ConnLog to be swept from this host: an echo and handshakes to well-known ports go through its gateway to every address of that private subnet, a /22 at most. Without it only this host's own subnets are swept.",
     },
     Setting {
         name: "checks",

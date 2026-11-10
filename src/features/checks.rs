@@ -322,8 +322,17 @@ fn allowed(address: IpAddr, allow_private: bool) -> bool {
 }
 
 /// A target as an address: itself, or what its name resolves to.
+///
+/// An IPv4-mapped IPv6 address (`::ffff:127.0.0.1`) is read as the IPv4
+/// address the kernel would connect to. `allowed` judges by family, and the
+/// mapped form of loopback, of a private range or of the metadata address is
+/// none of those as IPv6: it would pass as a public target.
 fn address_of(target: &str, host: &dyn CheckHost) -> Option<IpAddr> {
-    target.parse().ok().or_else(|| host.resolve(target))
+    let address = target.parse().ok().or_else(|| host.resolve(target))?;
+    Some(match address {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(address, IpAddr::V4),
+        v4 => v4,
+    })
 }
 
 fn ping(id: &str, target: &str, allow_private: bool, host: &dyn CheckHost) -> CheckResult {
@@ -769,11 +778,19 @@ impl CheckHost for SystemHost {
             "[::]:0".parse().ok()?
         };
         let socket = UdpSocket::bind(bind).ok()?;
-        socket.set_read_timeout(Some(DNS_TIMEOUT)).ok()?;
         let started = Instant::now();
         socket.send_to(&query, SocketAddr::new(resolver, 53)).ok()?;
         let mut buf = [0u8; 1500];
         loop {
+            // One deadline for the whole answer, not one per datagram: a
+            // resolver (or anything spoofing it) that keeps sending replies
+            // which are not this query's would otherwise hold the checks
+            // thread for good, and every later request is dropped as busy.
+            let left = DNS_TIMEOUT.checked_sub(started.elapsed())?;
+            if left.is_zero() {
+                return None;
+            }
+            socket.set_read_timeout(Some(left)).ok()?;
             let (n, from) = socket.recv_from(&mut buf).ok()?;
             if from.ip() != resolver {
                 continue;
@@ -1054,6 +1071,30 @@ mod tests {
             Some("not-allowed"),
             "loopback, even at passive"
         );
+    }
+
+    #[test]
+    fn an_ipv4_address_written_as_ipv6_is_judged_as_the_ipv4_it_is() {
+        let host = Fake {
+            names: HashMap::from([("rebound.example.com", "::ffff:10.0.0.8".parse().unwrap())]),
+            ..Fake::default()
+        };
+        let req = request(serde_json::json!([
+            { "id": "loop", "kind": "tcp", "target": "::ffff:127.0.0.1", "port": 22 },
+            { "id": "meta", "kind": "tcp", "target": "::ffff:169.254.169.254", "port": 80 },
+            { "id": "lan", "kind": "tcp", "target": "::ffff:192.168.1.20", "port": 22 },
+            { "id": "name", "kind": "ping", "target": "rebound.example.com" }
+        ]));
+        let results = run_once(&req, false, &host);
+        assert!(
+            results
+                .iter()
+                .all(|r| r.outcome == "skipped" && r.reason == Some("not-allowed")),
+            "{results:?}"
+        );
+        assert!(host.asked.borrow().is_empty(), "nothing goes on the wire");
+        // Loopback stays refused where private targets are allowed.
+        assert_eq!(run_once(&req, true, &host)[0].reason, Some("not-allowed"));
     }
 
     #[test]

@@ -3,6 +3,7 @@
 //! as any website's), no redirects, never through a proxy, and a failure
 //! said in one word of `Failure`, never an error's text.
 
+use std::io::Read as _;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,6 +13,10 @@ use serde_json::Value;
 use super::{pinning, Failure};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The largest answer read. A cluster's resource list or a firewall's lease
+/// table is tens to hundreds of kilobytes; 8 MiB is far past any real one.
+const MAX_BODY_BYTES: u64 = 8 * 1024 * 1024;
 
 /// How a request proves who it is.
 pub enum Auth {
@@ -84,7 +89,18 @@ impl Client {
             403 => return Err(Failure::Forbidden),
             _ => return Err(Failure::Status),
         }
-        response.json().map_err(|_| Failure::Invalid)
+        // Bounded read: the device is on the customer's network and may be
+        // anything that answers on that address. A body that keeps coming
+        // within the timeout would otherwise be buffered whole, in the
+        // process that sends the heartbeats.
+        let mut body = Vec::new();
+        std::io::Read::take(response, MAX_BODY_BYTES + 1)
+            .read_to_end(&mut body)
+            .map_err(|_| Failure::Invalid)?;
+        if body.len() as u64 > MAX_BODY_BYTES {
+            return Err(Failure::Invalid);
+        }
+        serde_json::from_slice(&body).map_err(|_| Failure::Invalid)
     }
 }
 

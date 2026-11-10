@@ -39,6 +39,7 @@ pub const CONF_NETWORK_MAP: &str = "CONNLOG_NETWORK_MAP";
 pub const CONF_NETWORK_SITE: &str = "CONNLOG_NETWORK_SITE";
 pub const CONF_NETWORK_MAP_PORTS: &str = "CONNLOG_NETWORK_MAP_PORTS";
 pub const CONF_PROBE_PUBLIC: &str = "CONNLOG_PROBE_PUBLIC";
+pub const CONF_SWEEP_ROUTED: &str = "CONNLOG_SWEEP_ROUTED";
 
 /// `SITE_NAME_MAX` and `INVENTORY_MAX_EXTRA_PORTS` in
 /// `packages/agent-protocol/src/network.ts`.
@@ -56,6 +57,9 @@ pub struct NetworkMapSettings {
     pub extra_ports: Vec<u16>,
     /// CONNLOG_PROBE_PUBLIC: only an explicit true.
     pub probe_public: bool,
+    /// CONNLOG_SWEEP_ROUTED: only an explicit true. A sweep may then reach a
+    /// private subnet the host is not on, when the console asks for one.
+    pub sweep_routed: bool,
 }
 
 impl NetworkMapSettings {
@@ -81,6 +85,7 @@ impl NetworkMapSettings {
             site,
             extra_ports,
             probe_public: config.probe_public == Some(true),
+            sweep_routed: config.sweep_routed == Some(true),
         }
     }
 }
@@ -100,6 +105,7 @@ pub struct ConfChoice {
     pub site: Option<String>,
     pub ports: Option<Vec<u16>>,
     pub probe_public: Option<bool>,
+    pub sweep_routed: Option<bool>,
 }
 
 impl ConfChoice {
@@ -119,6 +125,7 @@ impl ConfChoice {
             site,
             ports: (!ports.is_empty()).then_some(ports),
             probe_public: config.probe_public,
+            sweep_routed: config.sweep_routed,
         })
     }
 
@@ -149,6 +156,9 @@ impl ConfChoice {
             probe_public: self
                 .probe_public
                 .or_else(|| crate::install::conf_bool(conf, CONF_PROBE_PUBLIC)),
+            sweep_routed: self
+                .sweep_routed
+                .or_else(|| crate::install::conf_bool(conf, CONF_SWEEP_ROUTED)),
         }
     }
 
@@ -169,6 +179,9 @@ impl ConfChoice {
         }
         if let Some(public) = self.probe_public {
             lines.push((CONF_PROBE_PUBLIC, public.to_string()));
+        }
+        if let Some(routed) = self.sweep_routed {
+            lines.push((CONF_SWEEP_ROUTED, routed.to_string()));
         }
         lines
     }
@@ -515,6 +528,7 @@ impl NetworkMap {
         // Sweeps (T12.1): their own thread, so a sweep never holds a probe up.
         let (tx, rx) = mpsc::channel();
         let busy = Arc::new(AtomicBool::new(false));
+        let routed = settings.sweep_routed;
         let (flag, prober, asker, ceiling, allowed, url, key, halt) = (
             Arc::clone(&busy),
             Arc::clone(&sources.prober),
@@ -541,9 +555,10 @@ impl NetworkMap {
                     }
                     let level = ceiling.min(allowed.get());
                     let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        sweep::run(
+                        sweep::run_with(
                             &request,
                             level,
+                            routed,
                             &sweep::own_addresses(),
                             prober.as_ref(),
                             asker.as_ref(),
@@ -571,6 +586,11 @@ impl NetworkMap {
             .ok()
             .map(|_| Lane { requests: tx, busy });
 
+        if routed {
+            info!(
+                "Sweeps may reach private subnets this host is not on (CONNLOG_SWEEP_ROUTED=true)"
+            );
+        }
         if allow_public {
             info!("Network map probes may reach public addresses (CONNLOG_PROBE_PUBLIC=true)");
         }
@@ -911,6 +931,7 @@ mod tests {
                 site: Some("dc-1".into()),
                 ports: Some(vec![443]),
                 probe_public: Some(false),
+                sweep_routed: None,
             }
         );
         let changed = ConfChoice {

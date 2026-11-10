@@ -184,6 +184,8 @@ fn offset_in(whole: &[u8], part: &[u8]) -> usize {
 
 struct V3Reply<'a> {
     msg_id: i64,
+    /// The security level the sender claims for this message.
+    flags: u8,
     engine_id: &'a [u8],
     boots: u32,
     time: u32,
@@ -226,6 +228,19 @@ impl V3 {
                 .as_ref()
                 .map(|k| usm::localize(self.auth, k, engine_id)),
         });
+    }
+
+    /// The security level every answer to a request must carry: the level the
+    /// request was sent at. `reply` checks a MAC only where the message says
+    /// it has one, so without this an answer that claims no security at all
+    /// (flags 0, plain text, a guessable message id) would be read as the
+    /// switch's: anyone on the path could write the report.
+    fn required_flags(&self) -> u8 {
+        if self.priv_master.is_some() {
+            FLAG_AUTH | FLAG_PRIV
+        } else {
+            FLAG_AUTH
+        }
     }
 
     /// The probe that asks an engine for its id, boots and time.
@@ -332,6 +347,7 @@ impl V3 {
         let (tag, content) = scoped.next()?;
         Ok(V3Reply {
             msg_id,
+            flags,
             engine_id,
             boots,
             time,
@@ -512,7 +528,13 @@ impl<W: Wire> Client<W> {
                     .map(|p| (p, None)),
                 Mode::V3(v3) => {
                     let reply = v3.reply(datagram).ok()?;
-                    (reply.msg_id == request_id).then(|| {
+                    // A Report may come unauthenticated (an engine that does
+                    // not know the user cannot sign); it carries no data and
+                    // only ends or re-syncs the request. Anything else has to
+                    // be at the level that was asked for.
+                    let level = v3.required_flags();
+                    let trusted = reply.pdu.tag == REPORT || reply.flags & level == level;
+                    (reply.msg_id == request_id && trusted).then(|| {
                         let sync = (reply.engine_id.to_vec(), reply.boots, reply.time);
                         (reply.pdu, Some(sync))
                     })
@@ -591,6 +613,7 @@ pub mod tests {
             Value::Integer(n) => ber::integer(*n),
             Value::Bytes(b) => ber::octets(b),
             Value::Oid(o) => ber::oid(o),
+            Value::Ip(ip) => ber::tlv(ber::IP_ADDRESS, ip),
             Value::Unsigned(n) => {
                 let mut v = ber::integer(i64::try_from(*n).unwrap_or(i64::MAX));
                 v[0] = ber::GAUGE32;
@@ -853,5 +876,76 @@ pub mod tests {
         };
         let mut client = Client::new(agent, &wrong);
         assert_eq!(client.get(&[&IF_DESCR]).err(), Some(Failure::Auth));
+    }
+
+    /// A switch's honest answers, each preceded by one from somebody else on
+    /// the path: the right message id, no security claimed, its own data.
+    struct Forger(FakeAgent);
+
+    impl Wire for Forger {
+        fn send(&mut self, datagram: &[u8]) -> Result<(), Failure> {
+            let before = self.0.answers.len();
+            self.0.send(datagram)?;
+            let mut msg = Reader::new(datagram).sequence().unwrap();
+            msg.integer().unwrap();
+            let msg_id = msg.sequence().unwrap().integer().unwrap();
+            let engine = self.0.v3.as_ref().unwrap().0.clone();
+            let request_engine = Reader::new(msg.octets().unwrap())
+                .sequence()
+                .unwrap()
+                .octets()
+                .unwrap()
+                .to_vec();
+            if request_engine.is_empty() {
+                return Ok(()); // discovery is answered by a Report either way
+            }
+            let forged = ber::tlv(
+                RESPONSE,
+                &[
+                    ber::integer(0),
+                    ber::integer(0),
+                    ber::integer(0),
+                    ber::sequence(&[&ber::sequence(&[
+                        &ber::oid(&[1, 3, 6, 1, 2, 1, 1, 5, 0]),
+                        &ber::octets(b"forged"),
+                    ])]),
+                ]
+                .concat(),
+            );
+            let security = usm_params(
+                b"",
+                &UsmParams {
+                    engine_id: &engine,
+                    boots: 7,
+                    time: 1000,
+                    auth: b"",
+                    salt: b"",
+                },
+            );
+            self.0.answers.insert(
+                before,
+                v3_message(msg_id, 0, &security, &scoped(&engine, &forged)),
+            );
+            Ok(())
+        }
+
+        fn recv(&mut self, deadline: Instant) -> Option<Vec<u8>> {
+            self.0.recv(deadline)
+        }
+    }
+
+    #[test]
+    fn an_answer_that_claims_no_security_is_not_the_switchs() {
+        for privacy in [false, true] {
+            let security = v3_security(privacy);
+            let agent = FakeAgent::v3(sample(), b"\x80\x00\x1f\x88engine", &security);
+            let mut client = Client::new(Forger(agent), &security);
+            let name = client.get(&[&[1, 3, 6, 1, 2, 1, 1, 5, 0]]).unwrap();
+            assert_eq!(
+                name[0].1,
+                Value::Bytes(b"sw-1".to_vec()),
+                "privacy: {privacy}"
+            );
+        }
     }
 }

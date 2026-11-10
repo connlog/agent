@@ -819,5 +819,29 @@ no command, argument or environment ever comes from the platform.
    time taken and, for a shown action, all the output. The platform relays
    output to whoever ran the action and stores none of it.
 
+An action runs on a thread of its own (`ActionRunner` in `main.rs`), one at a
+time in the order claimed, so one that takes its full time limit costs no
+heartbeat. It leads its own process group: a timeout ends the group, and once
+the action has exited its pipes are read for at most two more seconds, so a
+process it left running cannot hold the agent.
+
 `CONNLOG_QUICK_ACTIONS_ENABLED=false` turns every action off; with no actions
 registered there is nothing to poll for.
+
+## What may not stop the heartbeat
+
+The loop's only job is the next heartbeat, so nothing that can block for an
+unbounded time runs on its thread:
+
+- **Quick actions** run on their own thread (above).
+- **Disk totals** are read on their own thread (`DiskReader` in
+  `features/metrics.rs`): a network mount whose server is gone blocks
+  `statvfs`. A heartbeat waits three seconds, then sends the last numbers.
+- **Checks, integrations, the network map and BMC reads** each have a thread;
+  the loop only hands them work.
+- **A watchdog** catches what is left (`platform/watchdog.rs`). On a systemd
+  install the agent asks systemd, in its first message, to restart it if the
+  loop gives no sign of life for 20 minutes; every tick of every wait is one.
+  The unit only carries `NotifyAccess=main`. There is deliberately no
+  `WatchdogSec=`: armed by the unit, a watchdog would end a healthy agent
+  wherever its messages do not arrive.

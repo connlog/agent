@@ -97,6 +97,139 @@
         "refused": "not-on-subnet",
         "found": []
       }
+    },
+    {
+      "description": "The same sweep from a host whose neighbour table holds MACs: the gateway's, and a camera's that answered ARP alone. An answer without one is as before.",
+      "upload": {
+        "version": 1,
+        "id": "swp_1",
+        "subnet": "10.0.20.0/24",
+        "refused": null,
+        "found": [
+          {
+            "address": "10.0.20.1",
+            "icmp": true,
+            "ports": [53, 443],
+            "mdns": [],
+            "ssdp": null,
+            "mac": "3c:ec:ef:00:00:01"
+          },
+          {
+            "address": "10.0.20.9",
+            "icmp": false,
+            "ports": [],
+            "mdns": [],
+            "ssdp": null
+          },
+          {
+            "address": "10.0.20.40",
+            "icmp": true,
+            "ports": [631],
+            "mdns": ["_ipp._tcp", "_printer._tcp"],
+            "ssdp": null
+          },
+          {
+            "address": "10.0.20.50",
+            "icmp": false,
+            "ports": [],
+            "mdns": [],
+            "ssdp": {
+              "server": "Linux/4.9 UPnP/1.0 Bravia/1.0",
+              "types": ["upnp:rootdevice", "urn:schemas-upnp-org:device:MediaRenderer:1"]
+            }
+          },
+          {
+            "address": "10.0.20.60",
+            "icmp": false,
+            "ports": [],
+            "mdns": [],
+            "ssdp": null,
+            "mac": "00:11:32:aa:bb:60"
+          }
+        ]
+      },
+      "read": {
+        "version": 1,
+        "id": "swp_1",
+        "subnet": "10.0.20.0/24",
+        "refused": null,
+        "found": [
+          {
+            "address": "10.0.20.1",
+            "icmp": true,
+            "ports": [53, 443],
+            "mdns": [],
+            "ssdp": null,
+            "mac": "3c:ec:ef:00:00:01"
+          },
+          {
+            "address": "10.0.20.9",
+            "icmp": false,
+            "ports": [],
+            "mdns": [],
+            "ssdp": null
+          },
+          {
+            "address": "10.0.20.40",
+            "icmp": true,
+            "ports": [631],
+            "mdns": ["_ipp._tcp", "_printer._tcp"],
+            "ssdp": null
+          },
+          {
+            "address": "10.0.20.50",
+            "icmp": false,
+            "ports": [],
+            "mdns": [],
+            "ssdp": {
+              "server": "Linux/4.9 UPnP/1.0 Bravia/1.0",
+              "types": ["upnp:rootdevice", "urn:schemas-upnp-org:device:MediaRenderer:1"]
+            }
+          },
+          {
+            "address": "10.0.20.60",
+            "icmp": false,
+            "ports": [],
+            "mdns": [],
+            "ssdp": null,
+            "mac": "00:11:32:aa:bb:60"
+          }
+        ]
+      }
+    },
+    {
+      "description": "A subnet the host is not on, on a host that does not allow sweeps beyond its own: refused.",
+      "upload": {
+        "version": 1,
+        "id": "swp_r",
+        "subnet": "10.0.30.0/24",
+        "refused": "routed-off",
+        "found": []
+      },
+      "read": {
+        "version": 1,
+        "id": "swp_r",
+        "subnet": "10.0.30.0/24",
+        "refused": "routed-off",
+        "found": []
+      }
+    },
+    {
+      "description": "A subnet the host is not on, outside RFC 1918: refused.",
+      "upload": {
+        "version": 1,
+        "id": "swp_r",
+        "subnet": "10.0.30.0/24",
+        "refused": "not-private",
+        "found": []
+      },
+      "read": {
+        "version": 1,
+        "id": "swp_r",
+        "subnet": "10.0.30.0/24",
+        "refused": "not-private",
+        "found": []
+      }
     }
   ],
   "invalid": [
@@ -248,6 +381,25 @@
             "ports": [53, 443],
             "mdns": [],
             "ssdp": null
+          }
+        ]
+      }
+    },
+    {
+      "description": "A MAC that is not lowercase aa:bb:cc:dd:ee:ff.",
+      "upload": {
+        "version": 1,
+        "id": "swp_1",
+        "subnet": "10.0.20.0/24",
+        "refused": null,
+        "found": [
+          {
+            "address": "10.0.20.5",
+            "icmp": true,
+            "ports": [],
+            "mdns": [],
+            "ssdp": null,
+            "mac": "3C:EC:EF:00:00:01"
           }
         ]
       }
