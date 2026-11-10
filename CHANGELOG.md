@@ -6,6 +6,19 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org/) — see
 [`VERSIONING.md`](./VERSIONING.md) for the full policy. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.24.1] — 2026-11-10
+
+### Changed
+
+- **Release only: dependencies updated.** v1.24.0 was tagged and mirrored but
+  not published: the release's `cargo deny` gate failed on a new advisory,
+  `pin-utils` is unmaintained (RUSTSEC-2026-0441), which came in through the
+  HTTP client's dependencies. Every dependency is updated within its
+  compatible range (`cargo update`, the lockfile only; no version in
+  `Cargo.toml` moves), which drops `pin-utils`. 1.24.1 is the same agent
+  under a new version, as a released tag is never moved: everything listed
+  under 1.24.0 ships first here.
+
 ## [1.24.0] — 2026-11-10
 
 ### Added
